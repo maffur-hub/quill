@@ -993,6 +993,20 @@ function planTime(oldText, start, end, value) {
   return finish(oldText, next, caret, caret)
 }
 
+// Insert one emoji glyph at the caret, replacing the selection. The glyph is
+// plain text: markup characters are rejected so a picker entry can never
+// inject a tag or a link. Multi-code-point sequences (ZWJ, variation
+// selectors, skin tones) are ordinary characters and stay intact.
+function planEmoji(oldText, start, end, value) {
+  var glyph = textOf(value).trim()
+  if (glyph === "") return fail("Choose an emoji")
+  if (/[\r\n]/.test(glyph)) return fail("Emoji cannot contain a line break")
+  if (/[<>\[\]`]/.test(glyph)) return fail("Emoji contains invalid characters")
+  var next = oldText.slice(0, start) + glyph + oldText.slice(end)
+  var caret = start + glyph.length
+  return finish(oldText, next, caret, caret)
+}
+
 // Insert a wiki-style note link and leave the title selected so typing
 // replaces it. A non-empty selection is used as the title.
 function planNoteLink(oldText, start, end, value) {
@@ -1183,7 +1197,7 @@ function plan(text, start, end, action, value) {
     || name === "superscript" || name === "subscript" || name === "color"
     || name === "noColour" || name === "noColor" || name === "size"
     || name === "noSize" || name === "link" || name === "date"
-    || name === "time" || name === "noteLink"
+    || name === "time" || name === "noteLink" || name === "emoji"
   if (inlineAction) {
     var safe = clampOutsideTags(source, s, e)
     s = safe.start
@@ -1222,6 +1236,7 @@ function plan(text, start, end, action, value) {
   if (name === "date") return planDate(source, s, e, value)
   if (name === "time") return planTime(source, s, e, value)
   if (name === "noteLink") return planNoteLink(source, s, e, value)
+  if (name === "emoji") return planEmoji(source, s, e, value)
   if (name === "codeblock") return planCodeBlock(source, s, e)
   if (name === "hr") return planHorizontalRule(source, s, e)
   if (name === "table") return planTable(source, s, e, value)

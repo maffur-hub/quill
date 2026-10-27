@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Controls
 import qs.Commons
 import qs.Commons as Commons
 import "ImageSizing.js" as ImageSizing
@@ -129,6 +130,9 @@ Item {
   }
 
   readonly property real tableRowHeight: Style.space(28)
+  readonly property real tableScrollBarHeight: Style.space(6)
+  // Reserved strip between the table viewport and the frame border.
+  readonly property real tableScrollBarSpace: Style.space(7)
 
   function tableWidthsFor(model, available) {
     if (!model) return []
@@ -307,6 +311,8 @@ Item {
           readonly property var tableValues: isTable ? TableEngine.computeTable(modelData.table) : []
           readonly property var tableWidths: isTable ? root.tableWidthsFor(modelData.table, blockItem.width) : []
           readonly property real tableNaturalWidth: isTable ? root.tableWidthFor(blockItem.tableWidths) : 0
+          readonly property bool tableOverflow: isTable
+            && tableNaturalWidth > blockItem.width + 0.5
           readonly property int tableRowCount: isTable && modelData.table ? modelData.table.rows.length + 1 : 0
           readonly property int tableColumnCount: isTable && modelData.table ? modelData.table.header.length : 0
           readonly property bool overrideWidth: isImage && root.overrides[sourceLine] !== undefined
@@ -677,6 +683,7 @@ Item {
             width: blockItem.isTable ? blockItem.width : 0
             height: blockItem.isTable
               ? root.tableRowHeight * blockItem.tableRowCount + 2
+                + (blockItem.tableOverflow ? root.tableScrollBarSpace : 0)
               : 0
             radius: Style.cornerRadius
             color: "transparent"
@@ -684,16 +691,59 @@ Item {
             border.color: Util.alpha(Commons.Color.foreground, 0.12)
             clip: true
 
+            Item {
+              id: tableBarSlot
+              visible: blockItem.tableOverflow
+              x: 1
+              y: tableFrame.height - height - 1
+              width: Math.max(0, tableFrame.width - 2)
+              height: root.tableScrollBarHeight
+            }
+
             Flickable {
               id: tableScroll
               anchors.fill: parent
               anchors.margins: 1
+              anchors.bottomMargin: 1
+                + (blockItem.tableOverflow ? root.tableScrollBarSpace : 0)
               clip: true
               contentWidth: Math.max(width, tableInner.width)
               contentHeight: height
               flickableDirection: Flickable.HorizontalFlick
               boundsBehavior: Flickable.StopAtBounds
               interactive: contentWidth > width
+
+              ScrollBar.horizontal: ScrollBar {
+                id: previewTableBar
+                objectName: "previewTableScrollBar"
+                // The bar lives in the reserved strip below the viewport, so it
+                // never draws over the last row. Reparenting keeps the
+                // Flickable's automatic size/position binding.
+                parent: tableBarSlot
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.bottom: parent.bottom
+                height: root.tableScrollBarHeight
+                orientation: Qt.Horizontal
+                policy: ScrollBar.AsNeeded
+                visible: blockItem.tableOverflow
+                padding: 0
+                focusPolicy: Qt.NoFocus
+
+                contentItem: Rectangle {
+                  implicitHeight: Style.space(3)
+                  radius: height / 2
+                  color: previewTableBar.pressed
+                    ? Commons.Color.accent
+                    : Util.alpha(Commons.Color.foreground, 0.42)
+                  opacity: previewTableBar.pressed || previewTableBar.active ? 1 : 0.72
+                }
+
+                background: Rectangle {
+                  color: Util.alpha(Commons.Color.foreground, 0.05)
+                  radius: height / 2
+                }
+              }
 
               WheelHandler {
                 onWheel: function(event) {

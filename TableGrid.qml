@@ -58,6 +58,11 @@ Item {
   readonly property real headerHeight: Style.space(24)
   readonly property real rowNumberWidth: Style.space(36)
   readonly property real totalWidth: sumWidths(colWidths)
+  readonly property real scrollBarHeight: Style.space(6)
+  // Strip reserved under the cells viewport when the sheet is wider than it.
+  readonly property real scrollBarSpace: Style.space(7)
+  readonly property bool horizontalOverflow: totalWidth
+    > Math.max(1, gridArea.width - rowNumberWidth)
   readonly property bool hasSelection: loadedTable && rowCount > 0
     && selectedRow >= 0 && selectedRow < rowCount && selectedCol >= 0
     && selectedCol < columnCount
@@ -1078,6 +1083,15 @@ Item {
       height: Math.max(0, panelColumn.height - y)
       clip: true
 
+      Item {
+        id: gridBarSlot
+        visible: root.horizontalOverflow
+        x: root.rowNumberWidth + 1
+        y: gridArea.height - height - 1
+        width: Math.max(0, gridArea.width - root.rowNumberWidth - 2)
+        height: root.scrollBarHeight
+      }
+
       Rectangle {
         id: corner
         x: 0
@@ -1159,7 +1173,8 @@ Item {
         x: 0
         y: root.headerHeight
         width: root.rowNumberWidth
-        height: Math.max(0, gridArea.height - root.headerHeight)
+        height: Math.max(0, gridArea.height - root.headerHeight
+          - (root.horizontalOverflow ? root.scrollBarSpace : 0))
         clip: true
 
         Column {
@@ -1203,12 +1218,44 @@ Item {
         x: root.rowNumberWidth
         y: root.headerHeight
         width: Math.max(0, gridArea.width - root.rowNumberWidth)
-        height: Math.max(0, gridArea.height - root.headerHeight)
+        height: Math.max(0, gridArea.height - root.headerHeight
+          - (root.horizontalOverflow ? root.scrollBarSpace : 0))
         clip: true
         contentWidth: Math.max(width, root.totalWidth)
         contentHeight: Math.max(height, root.rowCount * root.rowHeight)
         flickableDirection: Flickable.HorizontalAndVerticalFlick
         boundsBehavior: Flickable.StopAtBounds
+
+        ScrollBar.horizontal: ScrollBar {
+          id: tableGridBar
+          objectName: "tableGridScrollBar"
+          // Below the viewport, in the strip the grid reserves when columns
+          // overflow, so the last visible row is never covered.
+          parent: gridBarSlot
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.bottom: parent.bottom
+          height: root.scrollBarHeight
+          orientation: Qt.Horizontal
+          policy: ScrollBar.AsNeeded
+          visible: root.horizontalOverflow
+          padding: 0
+          focusPolicy: Qt.NoFocus
+
+          contentItem: Rectangle {
+            implicitHeight: Style.space(3)
+            radius: height / 2
+            color: tableGridBar.pressed
+              ? Commons.Color.accent
+              : Util.alpha(Commons.Color.foreground, 0.42)
+            opacity: tableGridBar.pressed || tableGridBar.active ? 1 : 0.72
+          }
+
+          background: Rectangle {
+            color: Util.alpha(Commons.Color.foreground, 0.05)
+            radius: height / 2
+          }
+        }
 
         WheelHandler {
           onWheel: function(event) {

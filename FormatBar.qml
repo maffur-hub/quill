@@ -4,6 +4,7 @@ import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
 import "MarkdownFormat.js" as MarkdownFormat
+import "EmojiData.js" as EmojiData
 
 // Formatting toolbar for the library editor.
 //
@@ -23,6 +24,8 @@ Item {
   property var noteTitles: []
   property string noteLinkQuery: ""
   readonly property var noteLinkMatches: filterNoteTitles(noteLinkQuery)
+  property string emojiQuery: ""
+  readonly property var emojiMatches: EmojiData.filter(root.emojiQuery)
 
   signal action(string name, var value)
 
@@ -54,6 +57,9 @@ Item {
   readonly property var colorPalettePopup: colorPopup
   readonly property var colorPickerPopup: colorPicker
   readonly property var noteLinkPopupRef: noteLinkPopup
+  readonly property Item emojiInput: emojiSearch
+  readonly property var emojiPopupRef: emojiPopup
+  readonly property Item emojiInsertItem: insertEmojiItem
 
   onVisibleChanged: if (!visible) closePopovers()
   onAvailableChanged: if (!available) closePopovers()
@@ -275,6 +281,19 @@ Item {
     return true
   }
 
+  function insertEmoji(glyph) {
+    var value = String(glyph || "")
+    if (value === "") return false
+    root.invoke("emoji", value)
+    emojiPopup.close()
+    return true
+  }
+
+  function insertFirstEmoji() {
+    if (root.emojiMatches.length === 0) return false
+    return root.insertEmoji(root.emojiMatches[0].glyph)
+  }
+
   function placePopup(popup, anchorItem) {
     var point = anchorItem.mapToItem(root, 0, 0)
     popup.x = Math.max(Style.space(4), Math.min(root.width - popup.width - Style.space(4),
@@ -291,6 +310,7 @@ Item {
     headingPopup.close()
     insertPopup.close()
     noteLinkPopup.close()
+    emojiPopup.close()
   }
 
   function openColorPopover() {
@@ -350,6 +370,16 @@ Item {
     noteLinkField.text = ""
     noteLinkPopup.open()
     noteLinkField.forceActiveFocus()
+  }
+
+  function openEmojiPopover() {
+    if (!available) return
+    closePopovers()
+    placePopup(emojiPopup, insertButton)
+    root.emojiQuery = ""
+    emojiSearch.text = ""
+    emojiPopup.open()
+    emojiSearch.forceActiveFocus()
   }
 
   height: Style.space(28)
@@ -1151,6 +1181,15 @@ Item {
         onActivated: root.insertTime()
       }
       MenuButton {
+        id: insertEmojiItem
+        objectName: "formatInsertEmoji"
+        label: "Emoji…"
+        onActivated: {
+          insertPopup.close()
+          root.openEmojiPopover()
+        }
+      }
+      MenuButton {
         objectName: "formatInsertNoteLink"
         label: "Note link…"
         onActivated: {
@@ -1314,6 +1353,101 @@ Item {
           anchors.centerIn: parent
           visible: root.noteLinkMatches.length === 0
           text: "No notes found"
+          textFormat: Text.PlainText
+          color: Util.alpha(Commons.Color.foreground, 0.62)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.bodySmall
+        }
+      }
+    }
+  }
+
+  Popup {
+    id: emojiPopup
+    objectName: "emojiPopup"
+    width: Style.space(280)
+    padding: Style.space(8)
+    focus: true
+    closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+    background: BorderSurface {
+      color: Commons.Color.background
+      borderSpec: Border.controlSpec("normal", Commons.Color.foreground, Commons.Color.accent)
+      radius: Style.cornerRadius
+    }
+
+    contentItem: Column {
+      spacing: Style.space(6)
+
+      TextField {
+        id: emojiSearch
+        objectName: "emojiSearch"
+        width: parent.width
+        placeholderText: "Search emoji…"
+        font.pixelSize: Style.font.bodySmall
+        onTextChanged: root.emojiQuery = text
+        onAccepted: root.insertFirstEmoji()
+        Keys.onPressed: function(event) {
+          if (event.key === Qt.Key_Escape) {
+            event.accepted = true
+            emojiPopup.close()
+          }
+        }
+      }
+
+      Item {
+        width: parent.width
+        height: Style.space(206)
+
+        GridView {
+          id: emojiGrid
+          objectName: "emojiGrid"
+          anchors.fill: parent
+          clip: true
+          cellWidth: width / 8
+          cellHeight: Style.space(30)
+          model: root.emojiMatches
+          boundsBehavior: Flickable.StopAtBounds
+
+          ScrollBar.vertical: ScrollBar {
+            policy: ScrollBar.AsNeeded
+          }
+
+          delegate: Rectangle {
+            id: emojiCell
+            required property var modelData
+            required property int index
+
+            objectName: "formatEmoji" + index
+            width: emojiGrid.cellWidth
+            height: emojiGrid.cellHeight
+            radius: Style.space(3)
+            color: emojiHit.containsMouse
+              ? Style.hoverFillFor(Commons.Color.foreground, Commons.Color.accent)
+              : "transparent"
+
+            Text {
+              anchors.centerIn: parent
+              text: emojiCell.modelData.glyph
+              textFormat: Text.PlainText
+              font.family: Style.font.family
+              font.pixelSize: Style.font.body
+            }
+
+            MouseArea {
+              id: emojiHit
+              objectName: "formatEmojiHit" + emojiCell.index
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.insertEmoji(emojiCell.modelData.glyph)
+            }
+          }
+        }
+
+        Text {
+          anchors.centerIn: parent
+          visible: root.emojiMatches.length === 0
+          text: "No emoji found"
           textFormat: Text.PlainText
           color: Util.alpha(Commons.Color.foreground, 0.62)
           font.family: Style.font.family

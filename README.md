@@ -158,7 +158,7 @@ A slim toolbar sits above the editor in Edit and Split; it is hidden in
 Preview-only and disabled for trashed or read-only notes. It scrolls
 horizontally when the editor is narrow. Groups are undo/redo, inline emphasis,
 highlight/colour/size/super/subscript, a heading menu, lists and blocks,
-links/code, rule/table, an insert menu (date, time, note link) and clear
+links/code, rule/table, an insert menu (date, time, emoji, note link) and clear
 formatting. Buttons never take keyboard focus; after an action the editor
 regains focus and the selection is restored.
 
@@ -173,12 +173,18 @@ also accepts:
 | Superscript / subscript | `<sup>text</sup>` / `<sub>text</sub>` |
 | Heading | `#` … `######`; Normal removes the prefix |
 | Date / time | `YYYY-MM-DD` / `HH:mm` at the caret |
+| Emoji | the chosen glyph at the caret, from a searchable local picker |
 | Note link | `[[Title]]`; the title stays selected |
 | Colour | `<span style="color: rgb(224, 62, 45);">text</span>` |
 | Size | `<span style="font-size: 10px;">…</span>` (S), no span (M), `18px` (L), `22px` (XL) |
 | Lists | `- ` / `1. ` / `- [ ] ` / `> ` |
 | Link | `[label](url)` |
 | Table | GFM pipe table; the picker chooses body rows plus a header row |
+
+**Emoji** opens a compact searchable grid from a curated built-in list; names
+and keywords match case-insensitively, Enter inserts the first result and
+Escape closes the picker. It needs no network or system emoji package, and the
+inserted glyph is ordinary text at the caret.
 
 Colours accept `#RGB`, `#RRGGBB` (with or without `#`) and `rgb(r, g, b)`
 integers, and are stored in the same canonical `rgb(r, g, b)` form Joplin
@@ -300,7 +306,9 @@ Tables render as real tables: bold header on a subtle surface, 1px separators,
 zebra body rows, per-column alignment and right-aligned numbers. Formula cells
 show their computed value with a faint accent tint and a small `ƒ` marker;
 errors use the urgent colour. Wide tables scroll horizontally (Shift+wheel or
-drag); long cells end in an ellipsis. Hover a table to see **Grid**, then click
+drag) and show a slim scroll bar along the bottom whenever the columns overflow;
+the bar sits in reserved space so it never covers the last row. Long cells end
+in an ellipsis. Hover a table to see **Grid**, then click
 anywhere on it to open the editor. Read-only notes show a **Read-only** hint
 instead, and the detached window shows **Open in the library to edit** (tables
 there are rendered, not editable).
@@ -321,6 +329,9 @@ rows, columns, sorting and alignment.
 | `Ctrl+Z` / `Ctrl+Shift+Z` | Grid-local undo / redo (last 50 edits) |
 | Typing | Replaces the selected cell's content |
 | `Shift`+wheel | Scroll a wide sheet horizontally |
+
+Wide sheets also show a slim horizontal scroll bar below the cells, in space
+reserved for it, so the last visible row is never covered.
 
 A formula bar above the grid shows the selected cell reference (`B3`), the raw
 content, and the computed value or error. Edits commit on cell blur, `Enter`,
