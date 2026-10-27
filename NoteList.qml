@@ -57,6 +57,11 @@ BorderSurface {
       .replace(/⟫/g, "</b>")
   }
 
+  function noteSnippetHtml(note) {
+    var value = String(note && note.snippet ? note.snippet : "No additional text")
+    return root.snippetHtml(note && note.fuzzy ? "≈ " + value : value)
+  }
+
   function scrollToSelection() {
     for (var i = 0; i < root.notes.length; i++) {
       if (String(root.notes[i].id) === root.selectedId) {
@@ -228,7 +233,7 @@ BorderSurface {
               width: parent.width
               height: Style.space(16)
               verticalAlignment: Text.AlignVCenter
-              text: root.snippetHtml(String(noteRow.modelData.snippet || "No additional text"))
+              text: root.noteSnippetHtml(noteRow.modelData)
               textFormat: Text.RichText
               color: Util.alpha(Commons.Color.foreground, 0.56)
               font.family: Style.font.family

@@ -39,6 +39,9 @@ MAX_LIST_NOTES = 2000
 MAX_LIST_FOLDERS = 2000
 MAX_STATE_BYTES = 1024 * 1024
 MAX_SEARCH_LIMIT = 500
+FUZZY_TRIGGER = 5      # run the fallback when exact hits are fewer than this
+FUZZY_MIN_TOKEN = 3    # shorter tokens stay plain prefix matches
+FUZZY_TERMS = 4        # expansions kept per token
 VERSION_RETENTION_DEFAULT = 50
 VERSION_RETENTION_MAX = 1000
 VERSION_THROTTLE_DEFAULT = 60.0
@@ -885,6 +888,7 @@ def create_schema(conn: sqlite3.Connection) -> None:
         CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
           id UNINDEXED, title, body, tokenize='unicode61 remove_diacritics 2'
         );
+        CREATE VIRTUAL TABLE IF NOT EXISTS notes_vocab USING fts5vocab(notes_fts, 'row');
         PRAGMA user_version=1;
         """
     )
@@ -1748,6 +1752,119 @@ def command_folder(args) -> dict:
     return result
 
 
+def fold_term(value: str) -> str:
+    """Case- and accent-fold a term the way the unicode61 index tokenizer does."""
+    decomposed = unicodedata.normalize("NFKD", str(value or ""))
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch)).casefold()
+
+
+def osa_distance(left: str, right: str, limit: int) -> int:
+    """Optimal string alignment distance, banded to ``limit``; > limit means "too far"."""
+    if left == right:
+        return 0
+    if abs(len(left) - len(right)) > limit:
+        return limit + 1
+    inf = limit + 1
+    previous_previous = None
+    previous = [j if j <= limit else inf for j in range(len(right) + 1)]
+    for i in range(1, len(left) + 1):
+        current = [inf] * (len(right) + 1)
+        current[0] = i if i <= limit else inf
+        for j in range(max(1, i - limit), min(len(right), i + limit) + 1):
+            cost = 0 if left[i - 1] == right[j - 1] else 1
+            value = min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + cost)
+            if (
+                i > 1
+                and j > 1
+                and previous_previous is not None
+                and left[i - 1] == right[j - 2]
+                and left[i - 2] == right[j - 1]
+            ):
+                value = min(value, previous_previous[j - 2] + 1)
+            current[j] = value
+        previous_previous, previous = previous, current
+    return previous[-1] if previous[-1] <= limit else inf
+
+
+def quote_term(value: str) -> str:
+    """Quote a term for FTS5, doubling embedded quotes."""
+    return '"' + str(value).replace('"', '""') + '"'
+
+
+def vocabulary_matches(conn, folded: str, limit: int, suffix: bool = False) -> list:
+    """Vocabulary terms near ``folded``.
+
+    Terms are fetched through the first character (a range scan over the
+    sorted vocabulary) or, when a first-character typo left that empty,
+    through the last character. Scanning every term costs seconds on a large
+    library; this keeps a typo query in the tens of milliseconds.
+    """
+    matched = []
+    if suffix:
+        if not folded[-1].isalnum():
+            return matched
+        low = max(1, len(folded) - limit)
+        high = len(folded) + limit
+        rows = conn.execute(
+            "SELECT term, doc FROM notes_vocab WHERE term GLOB ? AND length(term) BETWEEN ? AND ?",
+            ("*" + folded[-1], low, high),
+        )
+    else:
+        first = folded[0]
+        rows = conn.execute(
+            "SELECT term, doc FROM notes_vocab WHERE term >= ? AND term < ?",
+            (first, chr(ord(first) + 1)),
+        )
+    for term, doc in rows:
+        term = str(term)
+        # Prefixes of any length count: "sear" must still find "searching".
+        if term.startswith(folded):
+            matched.append((0, -int(doc), term))
+            continue
+        if abs(len(term) - len(folded)) > limit:
+            continue
+        distance = osa_distance(folded, term, limit)
+        if distance <= limit:
+            matched.append((distance, -int(doc), term))
+    return matched
+
+
+def fuzzy_query(raw: str, conn: sqlite3.Connection) -> str:
+    """Expand each query token to close vocabulary terms, joined with AND."""
+    tokens = re.findall(r"[^\s]+", str(raw or ""))[:12]
+    if not tokens:
+        return ""
+    conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS notes_vocab USING fts5vocab(notes_fts, 'row')")
+    docs = int(conn.execute("SELECT COUNT(*) FROM notes WHERE trashed=0").fetchone()[0] or 0)
+    common = max(1, int(docs * 0.6)) if docs else 0
+    parts = []
+    for token in tokens:
+        folded = fold_term(token)
+        if len(folded) < FUZZY_MIN_TOKEN or not folded[0].isalnum():
+            parts.append(quote_term(folded) + "*")
+            continue
+        limit = 1 if len(folded) <= 5 else 2
+        matched = vocabulary_matches(conn, folded, limit)
+        if not matched and len(folded) >= 4:
+            # First-character typo ("wuill" for "quill"): the first-character
+            # bucket cannot see it, so look at terms ending the same way.
+            matched = vocabulary_matches(conn, folded, limit, suffix=True)
+        if not matched:
+            parts.append(quote_term(folded) + "*")
+            continue
+        nearest = min(item[0] for item in matched)
+        matched = [item for item in matched if item[0] == nearest]
+        if nearest > 0:
+            # A typo must not expand into an everyday word that matches most notes.
+            filtered = [item for item in matched if -item[1] <= common]
+            if filtered:
+                matched = filtered
+        matched.sort()
+        chosen = [item[2] for item in matched[:FUZZY_TERMS]]
+        parts.append("(" + " OR ".join(quote_term(term) for term in chosen) + ")")
+    return " AND ".join(parts)
+
+
 def fts_query(raw: str) -> str:
     tokens = re.findall(r"[^\s]+", str(raw or ""))
     tokens = tokens[:12]
@@ -1759,6 +1876,47 @@ def fts_query(raw: str) -> str:
     return " AND ".join(parts)
 
 
+def search_rows(conn: sqlite3.Connection, query: str, limit: int) -> list:
+    try:
+        return conn.execute(
+            """
+            SELECT n.id, n.title,
+                   snippet(notes_fts, 2, '⟪', '⟫', '…', 14) AS snip,
+                   n.folder, n.mtime_ms, n.key, n.pinned, n.size
+            FROM notes_fts JOIN notes n ON n.key=notes_fts.id
+            WHERE notes_fts MATCH ? AND n.trashed=0
+            ORDER BY bm25(notes_fts, 4.0, 1.0), n.mtime_ms DESC
+            LIMIT ?
+            """,
+            (query, limit),
+        ).fetchall()
+    except sqlite3.OperationalError as error:
+        raise StoreError(f"search failed: {error}") from error
+
+
+def search_result(conn: sqlite3.Connection, row, fuzzy: bool) -> dict:
+    identifier, title, snip, folder, mtime_ms, key, pinned, size = row
+    tags = [
+        entry[0]
+        for entry in conn.execute(
+            "SELECT tag FROM tags WHERE note_key=? ORDER BY tag COLLATE NOCASE", (key,)
+        ).fetchall()
+    ]
+    result = {
+        "id": str(identifier),
+        "title": str(title),
+        "snippet": " ".join(str(snip or "").split()),
+        "folder": str(folder),
+        "tags": tags,
+        "modified": int(mtime_ms),
+        "pinned": bool(pinned),
+        "size": int(size),
+    }
+    if fuzzy:
+        result["fuzzy"] = True
+    return result
+
+
 def command_search(args) -> dict:
     ensure_store()
     query = fts_query(args.query)
@@ -1767,45 +1925,31 @@ def command_search(args) -> dict:
         conn = with_index()
         try:
             if not query:
-                return {"results": []}
-            try:
-                rows = conn.execute(
-                    """
-                    SELECT n.id, n.title,
-                           snippet(notes_fts, 2, '⟪', '⟫', '…', 14) AS snip,
-                           n.folder, n.mtime_ms, n.key, n.pinned, n.size
-                    FROM notes_fts JOIN notes n ON n.key=notes_fts.id
-                    WHERE notes_fts MATCH ? AND n.trashed=0
-                    ORDER BY bm25(notes_fts, 4.0, 1.0), n.mtime_ms DESC
-                    LIMIT ?
-                    """,
-                    (query, limit),
-                ).fetchall()
-            except sqlite3.OperationalError as error:
-                raise StoreError(f"search failed: {error}") from error
+                return {"results": [], "fuzzy": False}
+            results_rows = search_rows(conn, query, limit)
+            exact_count = len(results_rows)
+            fuzzy_used = False
+            if exact_count < min(limit, FUZZY_TRIGGER):
+                try:
+                    fallback = fuzzy_query(args.query, conn)
+                    if fallback and fallback != query:
+                        seen = {row[0] for row in results_rows}
+                        extras = [
+                            row for row in search_rows(conn, fallback, limit) if row[0] not in seen
+                        ]
+                        extras = extras[: max(0, limit - len(results_rows))]
+                        if extras:
+                            results_rows = results_rows + extras
+                            fuzzy_used = True
+                except (sqlite3.DatabaseError, StoreError):
+                    # The fallback is best-effort: keep the exact hits.
+                    pass
             results = []
-            for identifier, title, snip, folder, mtime_ms, key, pinned, size in rows:
-                tags = [
-                    row[0]
-                    for row in conn.execute(
-                        "SELECT tag FROM tags WHERE note_key=? ORDER BY tag COLLATE NOCASE", (key,)
-                    ).fetchall()
-                ]
-                results.append(
-                    {
-                        "id": str(identifier),
-                        "title": str(title),
-                        "snippet": " ".join(str(snip or "").split()),
-                        "folder": str(folder),
-                        "tags": tags,
-                        "modified": int(mtime_ms),
-                        "pinned": bool(pinned),
-                        "size": int(size),
-                    }
-                )
+            for index, row in enumerate(results_rows):
+                results.append(search_result(conn, row, fuzzy_used and index >= exact_count))
         finally:
             conn.close()
-    return {"results": results}
+    return {"results": results, "fuzzy": fuzzy_used}
 
 
 def command_tags(_args) -> dict:

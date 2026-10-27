@@ -803,7 +803,7 @@ $S restore-version <id> <snapshot>         # exact bytes; basename or absolute p
 $S folder create "Work/Projects"
 $S folder rename "Work/Projects" "Archive"
 $S folder delete "Archive" [--force]     # --force moves notes to the root
-$S search "prefix query" --limit 50
+$S search "prefix query" --limit 50    # prefix + typo-tolerant
 $S tags
 $S tag-rename old-tag new-tag
 $S backlinks <id>
@@ -841,8 +841,15 @@ links and bare URLs are left untouched.
 The index refreshes incrementally by size + mtime, rebuilds automatically on
 a schema-version change, and is safe to delete. Search uses FTS5 prefix
 matching (`"term"*`) with `snippet()` highlights (`⟪…⟫` markers, rendered bold
-by the note list). The library is capped at 2000 listed notes / folders per
-call and 512 KiB of a note is indexed.
+by the note list). Exact prefix hits come first; when fewer than 5 exact hits
+exist the store retries with typo-tolerant term expansion over the `fts5vocab`
+vocabulary, using optimal-string-alignment distance (1 edit up to 5
+characters, 2 beyond). Expansions into words that appear in more than 60% of
+notes are dropped, and near matches are appended after the exact results.
+Those results carry `"fuzzy": true` and the note list prefixes their snippet
+with `≈`. The fallback costs nothing when a normal search already has hits.
+The library is capped at 2000 listed notes / folders per call and 512 KiB of a
+note is indexed.
 
 ## Importing OmaNano
 
