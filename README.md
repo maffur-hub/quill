@@ -679,3 +679,7 @@ overwrites an existing note. OmaNano's files are never moved or modified.
 - Table formulas are Quill-only display helpers. Joplin shows the literal
   `=…` text, computed values are not exported, and sorting rows does not rewrite
   cell references.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
