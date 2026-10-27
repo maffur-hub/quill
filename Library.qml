@@ -104,6 +104,24 @@ Item {
   property string tableReturnMode: ""
   property bool tableSavePending: false
 
+  // Export. The popup writes the current editor buffer; it never touches the
+  // note file or the Joplin queue.
+  property bool exportOpen: false
+  property string exportFormat: "markdown"
+  property string exportPath: ""
+  property string exportError: ""
+  property bool exporting: false
+  property string exportPendingDest: ""
+  property string exportPendingTemp: ""
+  property string exportPendingTitle: ""
+  property string exportPendingNoteDir: ""
+  property string exportCheckDest: ""
+  property string exportCheckText: ""
+  property string exportCheckFormat: ""
+  readonly property string exportScriptPath: Quickshell.env("QUILL_EXPORT_SCRIPT")
+    || String(Qt.resolvedUrl("scripts/quill-export-html")).replace(/^file:\/\//, "")
+  readonly property var exportPopupRef: exportPopup
+
   readonly property var visibleNotes: filteredNotes()
   readonly property var selectedNote: findAny(selectedId)
   readonly property var folderOptions: buildFolderOptions()
@@ -544,6 +562,25 @@ Item {
       printErrors: false
       onSaved: root.bufferSaved(saveView)
       onSaveFailed: root.bufferFailed(saveView)
+    }
+  }
+
+  // One-shot export writer. Used for the Markdown destination and for the
+  // temporary source file that feeds the HTML renderer.
+  Component {
+    id: exportFileComponent
+
+    FileView {
+      id: exportView
+      property string targetPath: ""
+      property string targetText: ""
+      property string targetMode: ""
+      property string tempPath: ""
+      atomicWrites: true
+      blockAllReads: true
+      printErrors: false
+      onSaved: root.exportFileSaved(exportView)
+      onSaveFailed: function(error) { root.exportFileFailed(exportView, error) }
     }
   }
 
@@ -1094,6 +1131,246 @@ Item {
     return dataRoot + "/notes/" + (folder !== "" ? folder + "/" : "") + String(note.id || "")
   }
 
+  // ---------------------------------------------------------------- export
+  function safeExportName(title) {
+    var name = String(title === undefined || title === null ? "" : title)
+      .replace(/[\/\\:*?"<>|\u0000-\u001f\u007f]/g, "-")
+      .trim()
+    name = name.replace(/[. ]+$/, "")
+    return name === "" ? "Untitled" : name
+  }
+
+  function defaultExportPath(title, format) {
+    var home = Quickshell.env("HOME") || ""
+    return home + "/" + safeExportName(title) + (format === "html" ? ".html" : ".md")
+  }
+
+  function openExport() {
+    if (root.exporting) return
+    if (!root.selectedNote || !root.loaded || root.tooLarge || root.loadingNote) return
+    if (root.draftPending) {
+      root.exportError = "Recover or discard the draft first"
+      root.statusText = root.exportError
+      return
+    }
+    root.exportError = ""
+    root.exportFormat = "markdown"
+    root.exportPath = root.defaultExportPath(root.selectedNote.title, "markdown")
+    root.exportOpen = true
+    if (exportPopup) exportPopup.open()
+    Qt.callLater(function() {
+      if (root.exportOpen && exportPathField) {
+        exportPathField.text = root.exportPath
+        exportPathField.forceActiveFocus()
+        exportPathField.cursorPosition = exportPathField.text.length
+      }
+    })
+  }
+
+  function closeExport() {
+    if (exportPopup) exportPopup.close()
+    root.exportOpen = false
+  }
+
+  function setExportFormat(format) {
+    if (root.exporting) return
+    var next = format === "html" ? "html" : "markdown"
+    if (root.exportFormat === next) return
+    var path = String(root.exportPath || "")
+    if (next === "html" && /\.md$/i.test(path)) path = path.slice(0, -3) + ".html"
+    else if (next === "markdown" && /\.html?$/i.test(path)) path = path.replace(/\.html?$/i, ".md")
+    root.exportFormat = next
+    root.exportPath = path
+    root.exportError = ""
+    if (exportPathField) exportPathField.text = path
+  }
+
+  function normaliseExportPath() {
+    var value = String(root.exportPath || "").trim()
+    if (value === "") return { ok: false, error: "Choose an export path" }
+    var home = Quickshell.env("HOME") || ""
+    if (value === "~") value = home
+    else if (value.indexOf("~/") === 0) value = home + value.slice(1)
+    if (value.charAt(0) !== "/") return { ok: false, error: "Choose an absolute path" }
+    if (value.charAt(value.length - 1) === "/") return { ok: false, error: "Choose a file name, not a folder" }
+    return { ok: true, path: value }
+  }
+
+  // Store ids already include their folder. Prepending notePath()'s folder
+  // again would double-count nested directories.
+  function exportNoteDir() {
+    var base = root.dataRoot + "/notes"
+    var id = String(root.selectedId || "")
+    var slash = id.lastIndexOf("/")
+    if (slash > 0) base += "/" + id.slice(0, slash)
+    return base
+  }
+
+  function performExport() {
+    if (root.exporting) return
+    if (!root.selectedNote || !root.loaded || root.tooLarge || root.loadingNote) {
+      root.exportError = "No note is ready to export"
+      return
+    }
+    if (root.draftPending) {
+      root.exportError = "Recover or discard the draft first"
+      root.statusText = root.exportError
+      return
+    }
+    var target = root.normaliseExportPath()
+    if (!target.ok) {
+      root.exportError = target.error
+      return
+    }
+    root.exportError = ""
+    root.exporting = true
+    var text = String(editor.text)
+    // FileView creates missing parent directories on save, so check first:
+    // an export must never silently invent a folder tree.
+    var slash = target.path.lastIndexOf("/")
+    var parent = slash <= 0 ? "/" : target.path.slice(0, slash)
+    root.exportCheckDest = target.path
+    root.exportCheckText = text
+    root.exportCheckFormat = root.exportFormat
+    exportValidateProcess.command = ["test", "-d", parent]
+    exportValidateProcess.running = true
+  }
+
+  function afterExportPathCheck(exitCode) {
+    var dest = root.exportCheckDest
+    var text = root.exportCheckText
+    var format = root.exportCheckFormat
+    root.exportCheckDest = ""
+    root.exportCheckText = ""
+    root.exportCheckFormat = ""
+    if (exitCode !== 0) {
+      root.exporting = false
+      root.exportError = "Export folder does not exist"
+      root.statusText = root.exportError
+      return
+    }
+    if (format === "html") root.exportHtml(dest, text)
+    else root.exportMarkdown(dest, text)
+  }
+
+  function exportMarkdown(dest, text) {
+    var view = exportFileComponent.createObject(root, { path: dest })
+    if (!view) {
+      root.exporting = false
+      root.exportError = "Could not prepare the export"
+      return
+    }
+    view.targetPath = dest
+    view.targetText = text
+    view.targetMode = "markdown"
+    view.setText(text)
+  }
+
+  function exportHtml(dest, text) {
+    var temp = root.dataRoot + "/.quill-export-" + Date.now() + ".md"
+    var view = exportFileComponent.createObject(root, { path: temp })
+    if (!view) {
+      root.exporting = false
+      root.exportError = "Could not prepare the export"
+      return
+    }
+    view.targetPath = dest
+    view.targetText = text
+    view.targetMode = "html-source"
+    view.tempPath = temp
+    root.exportPendingTitle = root.selectedNote ? String(root.selectedNote.title || "Untitled") : "Untitled"
+    root.exportPendingNoteDir = root.exportNoteDir()
+    view.setText(text)
+  }
+
+  function exportFileSaved(view) {
+    var mode = String(view.targetMode || "")
+    var dest = String(view.targetPath || "")
+    var temp = String(view.tempPath || "")
+    view.destroy()
+    if (mode === "markdown") {
+      root.finishExport(true, dest)
+      return
+    }
+    root.runHtmlExporter(dest, temp)
+  }
+
+  function exportFileFailed(view, error) {
+    var mode = String(view.targetMode || "")
+    var temp = String(view.tempPath || "")
+    view.destroy()
+    if (temp !== "") root.cleanupExportTemp(temp)
+    var message = String(error === undefined ? "" : error).trim()
+    if (message === "") message = "Could not write the export file"
+    root.finishExport(false, mode === "html-source"
+      ? "Could not write the export source: " + message
+      : message)
+  }
+
+  function runHtmlExporter(dest, temp) {
+    root.exportPendingDest = dest
+    root.exportPendingTemp = temp
+    exportChmodProcess.command = ["chmod", "+x", root.exportScriptPath]
+    exportChmodProcess.running = true
+  }
+
+  function startHtmlProcess() {
+    exportProcess.command = [
+      root.exportScriptPath,
+      "--input", root.exportPendingTemp,
+      "--output", root.exportPendingDest,
+      "--title", root.exportPendingTitle,
+      "--note-dir", root.exportPendingNoteDir,
+      "--color", String(Commons.Color.foreground),
+      "--font-px", String(Style.font.body)
+    ]
+    exportProcess.running = true
+  }
+
+  function cleanupExportTemp(temp) {
+    var target = String(temp || "")
+    if (target === "") return
+    if (exportCleanupProcess.running) return
+    exportCleanupProcess.command = ["rm", "-f", "--", target]
+    exportCleanupProcess.running = true
+  }
+
+  function finishExport(ok, detail) {
+    root.exporting = false
+    if (ok) {
+      root.exportError = ""
+      root.exportOpen = false
+      if (exportPopup) exportPopup.close()
+      root.statusText = "Exported to " + String(detail || "")
+    } else {
+      root.exportError = String(detail || "Export failed")
+      root.statusText = root.exportError
+    }
+  }
+
+  function handleHtmlExportExit(exitCode) {
+    var dest = root.exportPendingDest
+    var temp = root.exportPendingTemp
+    var out = String(exportProcess.outputText || "")
+    var err = String(exportProcess.errorText || "")
+    root.exportPendingDest = ""
+    root.exportPendingTemp = ""
+    root.cleanupExportTemp(temp)
+    var payload = null
+    try { payload = JSON.parse(out.trim()) } catch (error) { payload = null }
+    if (exitCode === 0 && payload && payload.ok) {
+      root.finishExport(true, dest)
+      return
+    }
+    var message = payload && payload.error ? String(payload.error) : ""
+    if (message === "") {
+      var lines = err.trim().split("\n")
+      message = lines.length > 0 ? String(lines[lines.length - 1]).trim() : ""
+    }
+    if (message === "") message = "HTML export failed"
+    root.finishExport(false, message.slice(0, 300))
+  }
+
   // .quill-context.json is how the agent knows "this note" and "here". Keep it
   // small: the id/title/folder path plus at most 2000 characters of selection.
   function pushChatContext(force) {
@@ -1308,6 +1585,10 @@ Item {
   }
 
   function handleEscape() {
+    if (root.exportOpen) {
+      root.closeExport()
+      return
+    }
     if (viewMenuOpen) {
       viewMenuOpen = false
       return
@@ -1442,6 +1723,7 @@ Item {
   Shortcut { sequence: "Ctrl+P"; enabled: root.active; onActivated: root.togglePin() }
   Shortcut { sequence: "Ctrl+E"; enabled: root.active; onActivated: root.cycleMode() }
   Shortcut { sequence: "Ctrl+S"; enabled: root.active; onActivated: root.flushSave() }
+  Shortcut { sequence: "Ctrl+Shift+E"; enabled: root.active; onActivated: root.openExport() }
   Shortcut {
     sequence: "Ctrl+T"
     enabled: root.active && root.editorActive
@@ -1486,6 +1768,54 @@ Item {
   // Failures (including a missing tool) are deliberately not surfaced.
   Process {
     id: joplinNotifyProcess
+    stdout: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector { waitForEnd: true }
+  }
+
+  // HTML export: chmod the renderer, run it with the temp Markdown source,
+  // then remove that source. The temporary file lives in dataRoot, never in
+  // notes/, so the library index can never mistake it for a note.
+  Process {
+    id: exportValidateProcess
+    stdout: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: function(exitCode) { root.afterExportPathCheck(exitCode) }
+  }
+
+  Process {
+    id: exportChmodProcess
+    stdout: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: function(exitCode) {
+      if (exitCode !== 0) {
+        var temp = root.exportPendingTemp
+        root.exportPendingDest = ""
+        root.exportPendingTemp = ""
+        root.cleanupExportTemp(temp)
+        root.finishExport(false, "Could not run the HTML export renderer")
+        return
+      }
+      root.startHtmlProcess()
+    }
+  }
+
+  Process {
+    id: exportProcess
+    property string outputText: ""
+    property string errorText: ""
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: exportProcess.outputText = String(text || "")
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: exportProcess.errorText = String(text || "")
+    }
+    onExited: function(exitCode) { root.handleHtmlExportExit(exitCode) }
+  }
+
+  Process {
+    id: exportCleanupProcess
     stdout: StdioCollector { waitForEnd: true }
     stderr: StdioCollector { waitForEnd: true }
   }
@@ -2108,6 +2438,140 @@ Item {
     }
   }
 
+  // ------------------------------------------------------------ export menu
+  // Themed modal. A native dialog would ignore the shell theme (and Qt's
+  // platform dialogs are light), so the format choice, path field and errors
+  // all live in one BorderSurface-backed Popup.
+  Popup {
+    id: exportPopup
+    objectName: "exportPopup"
+    parent: Overlay.overlay
+    anchors.centerIn: Overlay.overlay
+    width: Style.space(360)
+    padding: Style.space(12)
+    modal: true
+    dim: true
+    focus: true
+    closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+    onOpened: {
+      exportPathField.text = root.exportPath
+      exportPathField.forceActiveFocus()
+      exportPathField.cursorPosition = exportPathField.text.length
+    }
+    onClosed: {
+      if (root.exportOpen) root.exportOpen = false
+    }
+    background: BorderSurface {
+      color: Commons.Color.background
+      borderSpec: Border.controlSpec("normal", Commons.Color.foreground, Commons.Color.accent)
+      radius: Style.cornerRadius
+    }
+
+    contentItem: Column {
+      width: exportPopup.availableWidth
+      spacing: Style.space(10)
+
+      Text {
+        width: parent.width
+        text: "Export note"
+        textFormat: Text.PlainText
+        color: Commons.Color.foreground
+        font.family: Style.font.family
+        font.pixelSize: Style.font.title
+        font.bold: true
+      }
+
+      Row {
+        width: parent.width
+        spacing: Style.space(6)
+
+        Button {
+          objectName: "exportMarkdownButton"
+          width: (parent.width - parent.spacing) / 2
+          text: "Markdown"
+          active: root.exportFormat === "markdown"
+          enabled: !root.exporting
+          fontSize: Style.font.bodySmall
+          horizontalPadding: Style.space(8)
+          verticalPadding: Style.space(5)
+          onClicked: root.setExportFormat("markdown")
+        }
+        Button {
+          objectName: "exportHtmlButton"
+          width: (parent.width - parent.spacing) / 2
+          text: "HTML"
+          active: root.exportFormat === "html"
+          enabled: !root.exporting
+          fontSize: Style.font.bodySmall
+          horizontalPadding: Style.space(8)
+          verticalPadding: Style.space(5)
+          onClicked: root.setExportFormat("html")
+        }
+      }
+
+      TextField {
+        id: exportPathField
+        objectName: "exportPathField"
+        width: parent.width
+        placeholderText: "/home/you/Note.md"
+        font.pixelSize: Style.font.bodySmall
+        enabled: !root.exporting
+        onTextEdited: {
+          root.exportPath = text
+          if (root.exportError !== "") root.exportError = ""
+        }
+        onAccepted: root.performExport()
+      }
+
+      Text {
+        id: exportErrorText
+        objectName: "exportErrorText"
+        width: parent.width
+        text: root.exportError !== ""
+          ? root.exportError
+          : "Markdown copies the current buffer verbatim. HTML is one standalone file with embedded images and maths."
+        textFormat: Text.PlainText
+        wrapMode: Text.WordWrap
+        color: root.exportError !== ""
+          ? Commons.Color.urgent
+          : Util.alpha(Commons.Color.foreground, 0.48)
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
+      }
+
+      Row {
+        width: parent.width
+        spacing: Style.space(6)
+
+        Item {
+          width: Math.max(0, parent.width - exportCancelButton.width - exportConfirmButton.width - parent.spacing * 2)
+          height: 1
+        }
+
+        Button {
+          id: exportCancelButton
+          objectName: "exportCancelButton"
+          text: "Cancel"
+          fontSize: Style.font.bodySmall
+          horizontalPadding: Style.space(10)
+          verticalPadding: Style.space(5)
+          onClicked: root.closeExport()
+        }
+        Button {
+          id: exportConfirmButton
+          objectName: "exportConfirmButton"
+          text: root.exporting ? "Exporting…" : "Export"
+          active: true
+          enabled: !root.exporting && String(root.exportPath).trim() !== ""
+          fontSize: Style.font.bodySmall
+          horizontalPadding: Style.space(10)
+          verticalPadding: Style.space(5)
+          onClicked: root.performExport()
+        }
+      }
+    }
+  }
+
   // --------------------------------------------------------- note header
   component NoteHeader: Item {
     id: noteHeaderRoot
@@ -2185,6 +2649,16 @@ Item {
             horizontalPadding: Style.space(7)
             verticalPadding: Style.space(4)
             onClicked: root.togglePin()
+          }
+          Button {
+            objectName: "exportButton"
+            visible: !!root.selectedNote && !root.compactHeader
+            text: "Export"
+            tooltipText: "Export note (Ctrl+Shift+E)"
+            fontSize: Style.font.bodySmall
+            horizontalPadding: Style.space(7)
+            verticalPadding: Style.space(4)
+            onClicked: root.openExport()
           }
           Button {
             visible: !!root.selectedNote && !root.selectedNote.trashed && !root.compactHeader

@@ -1,0 +1,1163 @@
+#!/usr/bin/env node
+"use strict"
+
+// quill-export-html - render one Quill note as a single standalone HTML file.
+//
+//   quill-export-html --input <md> --output <html> --title <title>
+//                     --note-dir <dir> [--color <css-color>] [--font-px <n>]
+//
+// The output embeds all CSS, local images (as data: URIs) and maths (as inline
+// SVG). There are no external stylesheets, scripts or font requests. The
+// Markdown dialect is Quill's subset: GFM blocks plus underline, highlight,
+// wiki links and Quill's colour spans.
+//
+// Success writes the file atomically and prints one JSON object:
+//   {"ok":true,"bytes":1234,"math":2,"images":1,"warnings":0}
+// Failure prints a message to stderr and exits non-zero without touching the
+// output path.
+
+const fs = require("fs")
+const path = require("path")
+const crypto = require("crypto")
+
+const DEFAULT_COLOR = "#1f2328"
+const DEFAULT_FONT_PX = 17
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024
+const MAX_TEX_CHARS = 20000
+
+// MathJax occasionally logs warnings; keep stdout reserved for our single JSON
+// object.
+for (const method of ["log", "info", "warn", "debug"]) {
+  console[method] = (...args) => process.stderr.write(args.join(" ") + "\n")
+}
+
+// ------------------------------------------------------------------ helpers
+
+function fail(message) {
+  const error = new Error(message)
+  error.isUsageError = true
+  throw error
+}
+
+function parseArguments(argv) {
+  const values = {}
+  for (let i = 0; i < argv.length; i++) {
+    const argument = argv[i]
+    if (!argument.startsWith("--")) fail("unexpected argument: " + argument)
+    let key = argument.slice(2)
+    let value
+    const equals = key.indexOf("=")
+    if (equals >= 0) {
+      value = key.slice(equals + 1)
+      key = key.slice(0, equals)
+    } else {
+      value = argv[++i]
+    }
+    if (value === undefined) fail("missing value for --" + key)
+    values[key] = value
+  }
+  return values
+}
+
+function escapeHtml(text) {
+  return String(text === undefined || text === null ? "" : text)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+}
+
+function normaliseColor(value) {
+  const color = String(value === undefined || value === null ? "" : value).trim()
+  if (/^#[0-9a-fA-F]{3,8}$/.test(color)) return color
+  if (/^rgba?\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}(?:\s*,\s*(?:0|1|0?\.\d+))?\s*\)$/.test(color)) return color
+  return DEFAULT_COLOR
+}
+
+function normaliseFontPx(value) {
+  const size = Math.round(Number(value))
+  if (!isFinite(size) || size <= 0) return DEFAULT_FONT_PX
+  return Math.max(6, Math.min(200, size))
+}
+
+function leadingColumns(line) {
+  let columns = 0
+  for (let i = 0; i < line.length; i++) {
+    if (line[i] === " ") columns += 1
+    else if (line[i] === "\t") columns += 4
+    else break
+  }
+  return columns
+}
+
+function removeColumns(line, columns) {
+  let removed = 0
+  let index = 0
+  while (index < line.length && removed < columns) {
+    if (line[index] === " ") { removed += 1; index += 1 }
+    else if (line[index] === "\t") { removed += 4; index += 1 }
+    else break
+  }
+  return line.slice(index)
+}
+
+function isBlank(line) {
+  return /^\s*$/.test(line)
+}
+
+// ------------------------------------------------------------------- maths
+
+let mathEngine = null
+const mathCache = new Map()
+
+function renderEngine() {
+  if (mathEngine) return mathEngine
+  const base = path.join(__dirname, "..", "vendor", "node_modules", "mathjax-full", "js")
+  const { mathjax } = require(path.join(base, "mathjax.js"))
+  const { TeX } = require(path.join(base, "input", "tex.js"))
+  const { SVG } = require(path.join(base, "output", "svg.js"))
+  const { liteAdaptor } = require(path.join(base, "adaptors", "liteAdaptor.js"))
+  const { RegisterHTMLHandler } = require(path.join(base, "handlers", "html.js"))
+  const { AllPackages } = require(path.join(base, "input", "tex", "AllPackages.js"))
+
+  const adaptor = liteAdaptor()
+  RegisterHTMLHandler(adaptor)
+  const tex = new TeX({ packages: AllPackages })
+  const svg = new SVG({ fontCache: "none" })
+  const document = mathjax.document("", { InputJax: tex, OutputJax: svg })
+  mathEngine = { adaptor, document }
+  return mathEngine
+}
+
+// Same conversion as scripts/quill-math: px units, themed fill, no merror
+// background (the stylesheet that draws it is not part of the fragment).
+function convertSvg(html, color, fontPx) {
+  const match = String(html).match(/<svg[\s\S]*?<\/svg>/)
+  if (!match) throw new Error("MathJax produced no SVG")
+  const svg = match[0]
+  const openTag = svg.match(/<svg[^>]*>/)
+  if (!openTag) throw new Error("MathJax produced no SVG root")
+  const ex = fontPx / 2
+  const root = openTag[0]
+    .replace(/\s*style="[^"]*"/, "")
+    .replace(/(width|height)="([0-9.]+)ex"/g, function(attribute, name, value) {
+      return name + '="' + (parseFloat(value) * ex).toFixed(2) + '"'
+    })
+    .replace(/<svg/, '<svg fill="' + color + '"')
+  let output = root + svg.slice(openTag[0].length)
+  output = output.split("currentColor").join(color)
+  output = output.replace(/<rect data-background="true"[^>]*>(<\/rect>)?/g, "")
+  output = output.replace(/<g data-mml-node="merror"/,
+    '<g data-mml-node="merror" fill="#cc0000" stroke="#cc0000"')
+  // The fragment is generated by MathJax, but TeX can inject \href and the
+  // exported file is opened in a browser. Drop active content and external
+  // references; keep only fragment links used inside the SVG.
+  output = output.replace(/<script[\s\S]*?<\/script>/gi, "")
+  output = output.replace(/<foreignObject[\s\S]*?<\/foreignObject>/gi, "")
+  output = output.replace(/<style[\s\S]*?<\/style>/gi, "")
+  output = output.replace(/<a\b[^>]*>/gi, "<g>")
+  output = output.replace(/<\/a>/gi, "</g>")
+  output = output.replace(/\son[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "")
+  output = output.replace(/\s(?:xlink:)?href\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi,
+    function(attribute, doubleQuoted, singleQuoted, bare) {
+      const value = String(doubleQuoted !== undefined ? doubleQuoted
+        : singleQuoted !== undefined ? singleQuoted : bare)
+      return /^\s*#/.test(value) ? attribute : ""
+    })
+  return output
+}
+
+function renderMath(tex, display, context) {
+  const source = String(tex === undefined || tex === null ? "" : tex)
+  const key = (display ? "D|" : "I|") + source
+  if (mathCache.has(key)) {
+    const cached = mathCache.get(key)
+    if (cached.ok) {
+      context.math += 1
+      return cached.html
+    }
+    context.warnings += 1
+    return cached.html
+  }
+  if (source.trim() === "") return ""
+  try {
+    if (source.length > MAX_TEX_CHARS) throw new Error("TeX is too large")
+    const { adaptor, document } = renderEngine()
+    const node = document.convert(source, {
+      display: !!display,
+      em: context.fontPx,
+      ex: context.fontPx / 2,
+      containerWidth: 80 * context.fontPx
+    })
+    const svg = convertSvg(adaptor.outerHTML(node), context.color, context.fontPx)
+    if (svg.indexOf('data-mml-node="merror"') >= 0) throw new Error("MathJax reported invalid TeX")
+    const html = display
+      ? '<div class="math math-display">' + svg + "</div>"
+      : '<span class="math math-inline">' + svg + "</span>"
+    mathCache.set(key, { ok: true, html })
+    context.math += 1
+    return html
+  } catch (error) {
+    context.warnings += 1
+    const fallback = display
+      ? '<div class="math math-error">' + escapeHtml(source) + "</div>"
+      : '<span class="math math-error">' + escapeHtml(source) + "</span>"
+    mathCache.set(key, { ok: false, html: fallback })
+    return fallback
+  }
+}
+
+// ------------------------------------------------------------------ images
+
+const MIME_BY_EXTENSION = {
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".bmp": "image/bmp"
+}
+
+function imageMime(file) {
+  return MIME_BY_EXTENSION[path.extname(file).toLowerCase()] || ""
+}
+
+function localImageSource(target, noteDir, context) {
+  const expanded = target.replace(/^~(?=\/|$)/, process.env.HOME || "")
+  const file = path.isAbsolute(expanded) ? expanded : path.resolve(noteDir, expanded)
+  const mime = imageMime(file)
+  if (!mime) throw new Error("not an image file")
+  let stat
+  try {
+    stat = fs.statSync(file)
+  } catch (error) {
+    throw new Error("image not found")
+  }
+  if (!stat.isFile()) throw new Error("image is not a file")
+  if (stat.size > MAX_IMAGE_BYTES) throw new Error("image is larger than 10 MiB")
+  let data
+  try {
+    data = fs.readFileSync(file)
+  } catch (error) {
+    throw new Error("image is unreadable")
+  }
+  return "data:" + mime + ";base64," + data.toString("base64")
+}
+
+function remoteImageAllowed(url) {
+  return /^https?:\/\//i.test(url)
+}
+
+function parseSizeAttributes(raw) {
+  const output = {}
+  const text = String(raw || "")
+  const pattern = /(?:^|\s)(width|height)\s*=\s*"?([0-9]+)(?:px)?"?/gi
+  let match
+  while ((match = pattern.exec(text))) {
+    const value = Number(match[2])
+    if (isFinite(value) && value > 0) output[match[1].toLowerCase()] = Math.min(value, 100000)
+  }
+  return output
+}
+
+// ------------------------------------------------------------------- links
+
+const PUNCTUATION = "\\`*_{}[]()#+-.!<>|~="
+
+function unescapeDestination(value) {
+  return String(value || "").replace(/\\([\\`*_{}\[\]()#+\-.!<>|~=])/g, "$1")
+}
+
+function safeLinkTarget(raw) {
+  const target = unescapeDestination(String(raw || "").trim())
+  if (target === "") return ""
+  if (/^(javascript|vbscript|data|file):/i.test(target)) return ""
+  if (/^mailto:/i.test(target)) return target
+  if (/^https?:\/\//i.test(target)) return target
+  // Anything else is a relative or unknown scheme. Quill routes are not
+  // valid in a standalone export.
+  return ""
+}
+
+// -------------------------------------------------------------- inline HTML
+
+function findUnescaped(text, needle, from, limit) {
+  let index = from
+  const end = limit === undefined ? text.length : limit
+  while (index < end) {
+    const found = text.indexOf(needle, index)
+    if (found < 0 || found >= end) return -1
+    let backslashes = 0
+    for (let i = found - 1; i >= 0 && text[i] === "\\"; i--) backslashes += 1
+    if (backslashes % 2 === 0) return found
+    index = found + needle.length
+  }
+  return -1
+}
+
+function findMatchingBracket(text, start) {
+  let depth = 0
+  for (let i = start; i < text.length; i++) {
+    if (text[i] === "\\") { i += 1; continue }
+    if (text[i] === "[") depth += 1
+    else if (text[i] === "]") {
+      depth -= 1
+      if (depth === 0) return i
+    }
+  }
+  return -1
+}
+
+function findClosingParen(text, start) {
+  let depth = 0
+  let angle = false
+  for (let i = start; i < text.length; i++) {
+    const character = text[i]
+    if (character === "\\") { i += 1; continue }
+    if (character === "<" && depth === 0 && !angle) { angle = true; continue }
+    if (character === ">" && angle) { angle = false; continue }
+    if (angle) continue
+    if (character === "(") depth += 1
+    else if (character === ")") {
+      if (depth === 0) return i
+      depth -= 1
+    }
+  }
+  return -1
+}
+
+function parseLinkDestination(raw) {
+  let value = String(raw || "").trim()
+  if (value.startsWith("<")) {
+    const close = value.indexOf(">")
+    if (close < 0) return ""
+    return value.slice(1, close)
+  }
+  // Drop an optional "title" suffix.
+  const titled = value.match(/^(\S+)\s+["'(].*$/)
+  if (titled) value = titled[1]
+  return value
+}
+
+function safeColorStyle(styleText) {
+  const declarations = String(styleText || "").split(";")
+  for (const declaration of declarations) {
+    const colon = declaration.indexOf(":")
+    if (colon < 0) continue
+    const property = declaration.slice(0, colon).trim().toLowerCase()
+    if (property !== "color") continue
+    const value = declaration.slice(colon + 1).trim()
+    if (/^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(value)) return value
+    const rgb = value.match(/^rgb\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*\)$/)
+    if (rgb) {
+      const channels = [Number(rgb[1]), Number(rgb[2]), Number(rgb[3])]
+      if (channels.every(channel => channel >= 0 && channel <= 255)) return value
+    }
+    return ""
+  }
+  return ""
+}
+
+function findSpanClose(text, from) {
+  let depth = 1
+  const pattern = /<span\b[^>]*>|<\/span\s*>/gi
+  pattern.lastIndex = from
+  let match
+  while ((match = pattern.exec(text))) {
+    if (match[0][1] === "/") {
+      depth -= 1
+      if (depth === 0) return match.index
+    } else {
+      depth += 1
+    }
+  }
+  return -1
+}
+
+function renderImage(raw, context) {
+  // raw excludes the leading "!".
+  const closeBracket = findMatchingBracket(raw, 1)
+  if (closeBracket < 0 || raw[closeBracket + 1] !== "(") return null
+  const closeParen = findClosingParen(raw, closeBracket + 2)
+  if (closeParen < 0) return null
+  let alt = raw.slice(2, closeBracket)
+  let destination = parseLinkDestination(raw.slice(closeBracket + 2, closeParen))
+  let consumed = closeParen + 1
+
+  // Obsidian width: ![alt|320](path)
+  const obsidian = alt.match(/^(.*)\|([0-9]+)$/)
+  let sizes = {}
+  if (obsidian) {
+    alt = obsidian[1]
+    sizes.width = Math.min(Number(obsidian[2]), 100000)
+  }
+  // Quill/portable size hint: {...} immediately after the image.
+  const sizeMatch = raw.slice(consumed).match(/^\{([^}]*)\}/)
+  if (sizeMatch) {
+    const parsed = parseSizeAttributes(sizeMatch[1])
+    if (parsed.width) sizes.width = parsed.width
+    if (parsed.height) sizes.height = parsed.height
+    consumed += sizeMatch[0].length
+  }
+  if (destination === "") return { html: escapeHtml(alt), consumed }
+  destination = unescapeDestination(destination)
+
+  let source = ""
+  if (remoteImageAllowed(destination)) {
+    source = destination
+  } else if (!/^[a-z][a-z0-9+.-]*:/i.test(destination)) {
+    try {
+      source = localImageSource(destination, context.noteDir, context)
+    } catch (error) {
+      context.warnings += 1
+      return { html: '<span class="missing-image">' + escapeHtml(alt || destination) + "</span>", consumed }
+    }
+  } else {
+    context.warnings += 1
+    return { html: '<span class="missing-image">' + escapeHtml(alt || destination) + "</span>", consumed }
+  }
+  context.images += 1
+  let attributes = ' src="' + escapeHtml(source) + '" alt="' + escapeHtml(alt) + '"'
+  if (sizes.width) attributes += ' width="' + sizes.width + '"'
+  if (sizes.height) attributes += ' height="' + sizes.height + '"'
+  return { html: "<img" + attributes + ">", consumed }
+}
+
+function renderWikiLink(inner) {
+  const pipe = inner.indexOf("|")
+  const alias = pipe >= 0 ? inner.slice(pipe + 1) : ""
+  let target = pipe >= 0 ? inner.slice(0, pipe) : inner
+  const hash = target.indexOf("#")
+  if (hash >= 0) target = target.slice(0, hash)
+  const label = alias !== "" ? alias : target
+  return escapeHtml(label)
+}
+
+function renderInline(text, context) {
+  const source = String(text || "")
+  let output = ""
+  let index = 0
+  let plain = ""
+
+  function flush() {
+    if (plain !== "") {
+      output += escapeHtml(plain)
+      plain = ""
+    }
+  }
+
+  while (index < source.length) {
+    const character = source[index]
+    const rest = source.slice(index)
+
+    // Inline maths with LaTeX delimiters must win over backslash escaping.
+    if (rest.startsWith("\\(")) {
+      const close = findUnescaped(source, "\\)", index + 2)
+      if (close > index + 2) {
+        flush()
+        output += renderMath(source.slice(index + 2, close), false, context)
+        index = close + 2
+        continue
+      }
+    }
+
+    // Backslash escapes.
+    if (character === "\\" && index + 1 < source.length
+      && PUNCTUATION.indexOf(source[index + 1]) >= 0) {
+      plain += source[index + 1]
+      index += 2
+      continue
+    }
+
+    // Code spans: markers inside are never interpreted.
+    if (character === "`") {
+      let run = 0
+      while (source[index + run] === "`") run += 1
+      const marker = "`".repeat(run)
+      const close = source.indexOf(marker, index + run)
+      if (close >= 0) {
+        flush()
+        const code = source.slice(index + run, close).replace(/\n/g, " ")
+        output += "<code>" + escapeHtml(code) + "</code>"
+        index = close + run
+        continue
+      }
+    }
+
+    // Images before links.
+    if (character === "!" && source[index + 1] === "[") {
+      const image = renderImage(rest, context)
+      if (image) {
+        flush()
+        output += image.html
+        index += image.consumed
+        continue
+      }
+    }
+
+    // Wiki links, before normal links.
+    if (rest.startsWith("[[")) {
+      const close = rest.indexOf("]]")
+      if (close >= 0 && rest.slice(2, close).indexOf("\n") < 0) {
+        flush()
+        output += renderWikiLink(rest.slice(2, close))
+        index += close + 2
+        continue
+      }
+    }
+
+    // Normal links.
+    if (character === "[") {
+      const closeBracket = findMatchingBracket(source, index)
+      if (closeBracket > index && source[closeBracket + 1] === "(") {
+        const closeParen = findClosingParen(source, closeBracket + 2)
+        if (closeParen >= 0) {
+          const label = source.slice(index + 1, closeBracket)
+          const target = safeLinkTarget(parseLinkDestination(source.slice(closeBracket + 2, closeParen)))
+          flush()
+          if (target === "") output += renderInline(label, context)
+          else output += '<a href="' + escapeHtml(target) + '" rel="noopener noreferrer">'
+            + renderInline(label, context) + "</a>"
+          index = closeParen + 1
+          continue
+        }
+      }
+    }
+
+    // Raw colour span (Quill's only rich-text span).
+    if (rest.slice(0, 5).toLowerCase() === "<span") {
+      const open = rest.match(/^<span\s+style\s*=\s*"([^"]*)"\s*>/i)
+      if (open) {
+        const color = safeColorStyle(open[1])
+        if (color !== "") {
+          const close = findSpanClose(source, index + open[0].length)
+          if (close >= 0) {
+            flush()
+            output += '<span style="color: ' + escapeHtml(color) + '">'
+              + renderInline(source.slice(index + open[0].length, close), context) + "</span>"
+            index = close + "</span>".length
+            continue
+          }
+        }
+      }
+    }
+
+    // Raw underline and super/subscript tags from the toolbar.
+    const tagMatch = rest.match(/^<(u|sup|sub)>/i)
+    if (tagMatch) {
+      const tag = tagMatch[1].toLowerCase()
+      const close = source.toLowerCase().indexOf("</" + tag + ">", index + tagMatch[0].length)
+      if (close >= 0) {
+        flush()
+        output += "<" + tag + ">" + renderInline(source.slice(index + tagMatch[0].length, close), context)
+          + "</" + tag + ">"
+        index = close + tag.length + 3
+        continue
+      }
+    }
+
+    // Inline maths: $...$ and \(...\).
+    if (character === "$" && source[index + 1] !== "$") {
+      const close = findUnescaped(source, "$", index + 1)
+      if (close > index + 1) {
+        const tex = source.slice(index + 1, close)
+        if (tex.indexOf("\n") < 0 && tex.trim() !== ""
+          && !/^\s/.test(tex) && !/\s$/.test(tex)) {
+          flush()
+          output += renderMath(tex, false, context)
+          index = close + 1
+          continue
+        }
+      }
+    }
+    if (rest.startsWith("\\(")) {
+      const close = findUnescaped(source, "\\)", index + 2)
+      if (close > index + 2) {
+        flush()
+        output += renderMath(source.slice(index + 2, close), false, context)
+        index = close + 2
+        continue
+      }
+    }
+
+    // Emphasis markers.
+    const emphasis = [
+      { marker: "**", open: "<strong>", close: "</strong>" },
+      { marker: "__", open: "<strong>", close: "</strong>" },
+      { marker: "~~", open: "<del>", close: "</del>" },
+      { marker: "==", open: "<mark>", close: "</mark>" },
+      { marker: "*", open: "<em>", close: "</em>" },
+      { marker: "_", open: "<em>", close: "</em>" }
+    ]
+    let matched = false
+    for (const rule of emphasis) {
+      if (!rest.startsWith(rule.marker)) continue
+      // Single underscores must not split words like snake_case.
+      if (rule.marker === "_") {
+        const before = index === 0 ? "" : source[index - 1]
+        if (/[A-Za-z0-9]/.test(before)) continue
+      }
+      const close = findUnescaped(source, rule.marker, index + rule.marker.length)
+      if (close <= index + rule.marker.length) continue
+      const inner = source.slice(index + rule.marker.length, close)
+      if (inner.trim() === "") continue
+      if (rule.marker === "_") {
+        const after = source[close + 1] || ""
+        if (/[A-Za-z0-9]/.test(after)) continue
+      }
+      flush()
+      output += rule.open + renderInline(inner, context) + rule.close
+      index = close + rule.marker.length
+      matched = true
+      break
+    }
+    if (matched) continue
+
+    plain += character
+    index += 1
+  }
+  flush()
+  return output
+}
+
+// --------------------------------------------------------------- block HTML
+
+function headingMatch(line) {
+  const match = line.match(/^ {0,3}(#{1,6})(?:[ \t]+(.*))?$/)
+  if (!match) return null
+  const level = match[1].length
+  let content = match[2] === undefined ? "" : match[2]
+  content = content.replace(/[ \t]+#+[ \t]*$/, "").trim()
+  return { level: level, content: content }
+}
+
+function isHorizontalRule(line) {
+  return /^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$/.test(line)
+}
+
+function markdownMarker(line) {
+  const match = line.match(/^([ \t]*)([-+*]|\d{1,9}[.)])(?:[ \t]+(.*))?$/)
+  if (!match) return null
+  const indent = leadingColumns(match[1])
+  const marker = match[2]
+  return {
+    indent: indent,
+    ordered: /^\d/.test(marker),
+    start: Number(marker.replace(/[.)]$/, "")) || 1,
+    content: match[3] === undefined ? "" : match[3]
+  }
+}
+
+function splitTableRow(line) {
+  let text = line.trim()
+  if (text.startsWith("|")) text = text.slice(1)
+  if (text.endsWith("|") && !text.endsWith("\\|")) text = text.slice(0, -1)
+  const cells = []
+  let buffer = ""
+  let inCode = false
+  for (let i = 0; i < text.length; i++) {
+    const character = text[i]
+    if (character === "\\" && text[i + 1] === "|") {
+      buffer += "|"
+      i += 1
+      continue
+    }
+    if (character === "`") inCode = !inCode
+    if (character === "|" && !inCode) {
+      cells.push(buffer.trim())
+      buffer = ""
+      continue
+    }
+    buffer += character
+  }
+  cells.push(buffer.trim())
+  return cells
+}
+
+function tableDelimiter(line) {
+  if (line.indexOf("|") < 0) return null
+  const cells = splitTableRow(line)
+  if (cells.length === 0) return null
+  const alignments = []
+  for (const cell of cells) {
+    const value = cell.trim()
+    if (!/^:?-+:?$/.test(value)) return null
+    const left = value.startsWith(":")
+    const right = value.endsWith(":")
+    alignments.push(left && right ? "center" : right ? "right" : left ? "left" : "")
+  }
+  return alignments
+}
+
+function isTableStart(lines, index) {
+  if (index + 1 >= lines.length) return false
+  if (lines[index].indexOf("|") < 0) return false
+  return tableDelimiter(lines[index + 1]) !== null
+}
+
+function isFenceStart(line) {
+  return /^ {0,3}(`{3,}|~{3,})/.test(line)
+}
+
+function isBlockStart(lines, index) {
+  const line = lines[index]
+  if (!line) return false
+  if (isFenceStart(line)) return true
+  if (headingMatch(line)) return true
+  if (isHorizontalRule(line)) return true
+  if (/^ {0,3}>/.test(line)) return true
+  if (markdownMarker(line)) return true
+  if (/^ {0,3}(\$\$|\\\[)/.test(line)) return true
+  if (isTableStart(lines, index)) return true
+  return false
+}
+
+function renderCodeFence(lines, index) {
+  const open = lines[index].match(/^ {0,3}(`{3,}|~{3,})(.*)$/)
+  const fence = open[1]
+  const marker = fence[0]
+  const info = String(open[2] || "").trim()
+  const language = (info.split(/\s+/)[0] || "").replace(/[^A-Za-z0-9+#._-]/g, "")
+  const body = []
+  let i = index + 1
+  while (i < lines.length) {
+    const close = lines[i].match(/^ {0,3}(`{3,}|~{3,})[ \t]*$/)
+    if (close && close[1][0] === marker && close[1].length >= fence.length) {
+      i += 1
+      break
+    }
+    body.push(lines[i])
+    i += 1
+  }
+  const className = language === "" ? "" : ' class="language-' + escapeHtml(language) + '"'
+  return {
+    html: "<pre><code" + className + ">" + escapeHtml(body.join("\n")) + "</code></pre>",
+    next: i
+  }
+}
+
+function displayMathStart(line) {
+  const trimmed = line.trim()
+  if (trimmed.startsWith("$$")) {
+    const rest = trimmed.slice(2)
+    if (rest.endsWith("$$") && rest.length >= 2) return { kind: "inline", tex: rest.slice(0, -2) }
+    return { kind: "fence", open: "$$", close: "$$", first: rest }
+  }
+  if (trimmed.startsWith("\\[")) {
+    const rest = trimmed.slice(2)
+    if (rest.endsWith("\\]") && rest.length >= 2) return { kind: "inline", tex: rest.slice(0, -2) }
+    return { kind: "fence", open: "\\[", close: "\\]", first: rest }
+  }
+  return null
+}
+
+function renderDisplayMath(lines, index, context) {
+  const start = displayMathStart(lines[index])
+  if (start.kind === "inline") {
+    return { html: renderMath(start.tex, true, context), next: index + 1 }
+  }
+  const body = []
+  if (start.first.trim() !== "") body.push(start.first)
+  let i = index + 1
+  while (i < lines.length) {
+    const trimmed = lines[i].trim()
+    if (start.close === "$$") {
+      if (trimmed.endsWith("$$")) {
+        const content = trimmed.slice(0, -2)
+        if (content.trim() !== "") body.push(content)
+        i += 1
+        break
+      }
+    } else if (trimmed.endsWith("\\]")) {
+      const content = trimmed.slice(0, -2)
+      if (content.trim() !== "") body.push(content)
+      i += 1
+      break
+    }
+    body.push(lines[i])
+    i += 1
+  }
+  return { html: renderMath(body.join("\n"), true, context), next: i }
+}
+
+function renderList(lines, index, context) {
+  const first = markdownMarker(lines[index])
+  if (!first) return null
+  const baseIndent = first.indent
+  const ordered = first.ordered
+  const startNumber = first.start
+  const items = []
+  let i = index
+
+  while (i < lines.length) {
+    const line = lines[i]
+    if (isBlank(line)) {
+      let next = i + 1
+      while (next < lines.length && isBlank(lines[next])) next += 1
+      if (next >= lines.length) break
+      const nextMarker = markdownMarker(lines[next])
+      const nextIndent = leadingColumns(lines[next])
+      if (nextMarker && nextIndent === baseIndent) { i = next; continue }
+      if (nextIndent > baseIndent) {
+        if (items.length > 0) items[items.length - 1].body.push("")
+        i = next
+        continue
+      }
+      break
+    }
+    const marker = markdownMarker(line)
+    if (marker) {
+      if (marker.indent < baseIndent) break
+      if (marker.indent === baseIndent) {
+        if (marker.ordered !== ordered) break
+        items.push({ body: [marker.content] })
+        i += 1
+        continue
+      }
+      if (items.length === 0) break
+      items[items.length - 1].body.push(line)
+      i += 1
+      continue
+    }
+    const indent = leadingColumns(line)
+    if (indent > baseIndent) {
+      if (items.length === 0) break
+      items[items.length - 1].body.push(line)
+      i += 1
+      continue
+    }
+    if (items.length > 0 && !isBlockStart(lines, i)) {
+      items[items.length - 1].body.push(line)
+      i += 1
+      continue
+    }
+    break
+  }
+
+  let hasTask = false
+  const rendered = []
+  for (const item of items) {
+    const body = item.body.slice()
+    let task = null
+    const taskMatch = body[0].match(/^\[([ xX])\][ \t]+(.*)$/)
+    if (taskMatch) {
+      task = taskMatch[1].toLowerCase() === "x"
+      body[0] = taskMatch[2]
+      hasTask = true
+    }
+    let minimum = Infinity
+    for (let lineIndex = 1; lineIndex < body.length; lineIndex++) {
+      if (isBlank(body[lineIndex])) continue
+      minimum = Math.min(minimum, leadingColumns(body[lineIndex]))
+    }
+    if (!isFinite(minimum)) minimum = 0
+    const normalised = [body[0]]
+    for (let lineIndex = 1; lineIndex < body.length; lineIndex++) {
+      normalised.push(isBlank(body[lineIndex]) ? "" : removeColumns(body[lineIndex], minimum))
+    }
+
+    let inner = renderBlocks(normalised, context)
+    const paragraphs = inner.match(/^<p>([\s\S]*?)<\/p>/)
+    if (paragraphs) inner = paragraphs[1] + inner.slice(paragraphs[0].length)
+    if (inner === "" && task === null) inner = ""
+    const checkbox = task === null ? ""
+      : '<input type="checkbox" disabled' + (task ? " checked" : "") + "> "
+    rendered.push('<li' + (task === null ? "" : ' class="task-list-item"') + ">"
+      + checkbox + inner + "</li>")
+  }
+
+  const tag = ordered ? "ol" : "ul"
+  const attributes = (ordered && startNumber !== 1 ? ' start="' + startNumber + '"' : "")
+    + (hasTask ? ' class="task-list"' : "")
+  return { html: "<" + tag + attributes + ">" + rendered.join("") + "</" + tag + ">", next: i }
+}
+
+function renderTable(lines, index, context) {
+  const header = splitTableRow(lines[index])
+  const alignments = tableDelimiter(lines[index + 1]) || []
+  while (alignments.length < header.length) alignments.push("")
+  const cell = function(tag, content, alignment) {
+    const style = alignment ? ' style="text-align: ' + alignment + '"' : ""
+    return "<" + tag + style + ">" + renderInline(content, context) + "</" + tag + ">"
+  }
+  let head = "<tr>"
+  for (let c = 0; c < header.length; c++) head += cell("th", header[c], alignments[c])
+  head += "</tr>"
+
+  const rows = []
+  let i = index + 2
+  while (i < lines.length && !isBlank(lines[i]) && lines[i].indexOf("|") >= 0) {
+    const values = splitTableRow(lines[i])
+    while (values.length < header.length) values.push("")
+    let row = "<tr>"
+    for (let c = 0; c < header.length; c++) row += cell("td", values[c], alignments[c])
+    row += "</tr>"
+    rows.push(row)
+    i += 1
+  }
+  return {
+    html: "<table><thead>" + head + "</thead><tbody>" + rows.join("") + "</tbody></table>",
+    next: i
+  }
+}
+
+function renderBlockquote(lines, index, context) {
+  const body = []
+  let i = index
+  while (i < lines.length) {
+    const match = lines[i].match(/^ {0,3}>[ \t]?(.*)$/)
+    if (!match) {
+      if (isBlank(lines[i])) break
+      break
+    }
+    body.push(match[1])
+    i += 1
+  }
+  return { html: "<blockquote>" + renderBlocks(body, context) + "</blockquote>", next: i }
+}
+
+function renderBlocks(lines, context) {
+  let output = ""
+  let index = 0
+  while (index < lines.length) {
+    const line = lines[index]
+    if (isBlank(line)) { index += 1; continue }
+
+    if (isFenceStart(line)) {
+      const result = renderCodeFence(lines, index)
+      output += result.html
+      index = result.next
+      continue
+    }
+
+    if (/^ {0,3}(\$\$|\\\[)/.test(line)) {
+      const result = renderDisplayMath(lines, index, context)
+      output += result.html
+      index = result.next
+      continue
+    }
+
+    const heading = headingMatch(line)
+    if (heading) {
+      output += "<h" + heading.level + ">" + renderInline(heading.content, context) + "</h" + heading.level + ">"
+      index += 1
+      continue
+    }
+
+    if (isHorizontalRule(line)) {
+      output += "<hr>"
+      index += 1
+      continue
+    }
+
+    if (isTableStart(lines, index)) {
+      const result = renderTable(lines, index, context)
+      output += result.html
+      index = result.next
+      continue
+    }
+
+    if (/^ {0,3}>/.test(line)) {
+      const result = renderBlockquote(lines, index, context)
+      output += result.html
+      index = result.next
+      continue
+    }
+
+    if (markdownMarker(line)) {
+      const result = renderList(lines, index, context)
+      if (result) {
+        output += result.html
+        index = result.next
+        continue
+      }
+    }
+
+    // Paragraph: collect until a blank line or the start of another block.
+    const body = [line]
+    index += 1
+    while (index < lines.length && !isBlank(lines[index]) && !isBlockStart(lines, index)) {
+      body.push(lines[index])
+      index += 1
+    }
+    output += "<p>" + renderInline(body.join("\n"), context) + "</p>"
+  }
+  return output
+}
+
+// ----------------------------------------------------------------- document
+
+function stylesheet() {
+  return `:root { color-scheme: light; }
+* { box-sizing: border-box; }
+html { background: #ffffff; }
+body {
+  margin: 0;
+  background: #ffffff;
+  color: #1f2328;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  font-size: 17px;
+  line-height: 1.65;
+  -webkit-text-size-adjust: 100%;
+}
+main.note { max-width: 760px; margin: 0 auto; padding: 48px 24px 80px; }
+h1, h2, h3, h4, h5, h6 { line-height: 1.25; margin: 1.6em 0 0.6em; font-weight: 600; }
+h1 { font-size: 2em; border-bottom: 1px solid #d8dee4; padding-bottom: 0.3em; }
+h2 { font-size: 1.5em; border-bottom: 1px solid #d8dee4; padding-bottom: 0.3em; }
+h3 { font-size: 1.25em; }
+h4 { font-size: 1em; }
+h5 { font-size: 0.9em; }
+h6 { font-size: 0.85em; color: #57606a; }
+p { margin: 0 0 1em; }
+a { color: #0969da; text-decoration: none; }
+a:hover { text-decoration: underline; }
+code {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.9em;
+  background: #f6f8fa;
+  padding: 0.15em 0.35em;
+  border-radius: 4px;
+}
+pre {
+  background: #f6f8fa;
+  border-radius: 6px;
+  padding: 12px 14px;
+  overflow: auto;
+  line-height: 1.5;
+}
+pre code { background: none; padding: 0; font-size: 0.88em; }
+blockquote {
+  margin: 1.2em 0;
+  padding: 0 1em;
+  color: #57606a;
+  border-left: 4px solid #d0d7de;
+}
+blockquote > :last-child { margin-bottom: 0; }
+hr { border: 0; border-top: 1px solid #d8dee4; margin: 2em 0; }
+ul, ol { margin: 0 0 1em; padding-left: 1.6em; }
+li { margin: 0.25em 0; }
+li > p { margin: 0.25em 0; }
+ul.task-list { list-style: none; padding-left: 1.2em; }
+li.task-list-item { list-style: none; }
+input[type="checkbox"] { margin: 0 0.45em 0 0; vertical-align: middle; }
+table { border-collapse: collapse; margin: 1.2em 0; display: block; overflow: auto; max-width: 100%; }
+th, td { border: 1px solid #d0d7de; padding: 6px 12px; }
+th { background: #f6f8fa; font-weight: 600; }
+img { max-width: 100%; height: auto; }
+.math svg { display: inline-block; vertical-align: middle; max-width: 100%; }
+.math-display { margin: 1.3em 0; text-align: center; overflow-x: auto; }
+.math-error { color: #cf222e; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.9em; }
+.missing-image {
+  display: inline-block;
+  padding: 0.15em 0.5em;
+  border: 1px dashed #cf222e;
+  border-radius: 4px;
+  color: #cf222e;
+  font-size: 0.9em;
+}
+mark { background: #fff3a3; color: inherit; padding: 0 0.1em; }
+del { color: #57606a; }
+`
+}
+
+function renderDocument(markdown, title, options, context) {
+  const lines = String(markdown).replace(/\r\n?/g, "\n").replace(/^\uFEFF/, "").split("\n")
+  const body = renderBlocks(lines, context)
+  return "<!doctype html>\n"
+    + '<html lang="en">\n'
+    + "<head>\n"
+    + '<meta charset="utf-8">\n'
+    + '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+    + "<title>" + escapeHtml(title) + "</title>\n"
+    + "<style>\n" + stylesheet() + "</style>\n"
+    + "</head>\n"
+    + '<body>\n<main class="note">\n' + body + "\n</main>\n</body>\n</html>\n"
+}
+
+function writeAtomic(file, contents) {
+  const directory = path.dirname(file)
+  const temporary = path.join(directory, "." + path.basename(file)
+    + ".tmp-" + process.pid + "-" + crypto.randomBytes(4).toString("hex"))
+  try {
+    fs.writeFileSync(temporary, contents, "utf8")
+    fs.renameSync(temporary, file)
+  } catch (error) {
+    try { fs.unlinkSync(temporary) } catch (cleanupError) { /* already gone */ }
+    throw error
+  }
+}
+
+function main() {
+  let options
+  try {
+    options = parseArguments(process.argv.slice(2))
+  } catch (error) {
+    process.stderr.write("quill-export-html: " + error.message + "\n")
+    process.exitCode = 2
+    return
+  }
+
+  const input = String(options.input || "")
+  const output = String(options.output || "")
+  const title = String(options.title === undefined ? "" : options.title)
+  const noteDir = String(options["note-dir"] || "")
+  const color = normaliseColor(options.color)
+  const fontPx = normaliseFontPx(options["font-px"])
+
+  try {
+    if (input === "") fail("--input is required")
+    if (output === "") fail("--output is required")
+    let inputStat
+    try {
+      inputStat = fs.statSync(input)
+      fs.accessSync(input, fs.constants.R_OK)
+    } catch (error) {
+      fail("cannot read input: " + input)
+    }
+    if (!inputStat.isFile()) fail("input is not a file: " + input)
+
+    const outputDirectory = path.dirname(path.resolve(output))
+    let directoryStat
+    try {
+      directoryStat = fs.statSync(outputDirectory)
+    } catch (error) {
+      fail("output directory does not exist: " + outputDirectory)
+    }
+    if (!directoryStat.isDirectory()) fail("output directory is not a directory: " + outputDirectory)
+    try {
+      const outputStat = fs.statSync(output)
+      if (outputStat.isDirectory()) fail("output path is a directory: " + output)
+    } catch (error) {
+      if (error.isUsageError) throw error
+      // A missing output file is the normal case.
+    }
+
+    const resolvedNoteDir = noteDir === "" ? path.dirname(path.resolve(input)) : path.resolve(noteDir)
+    const markdown = fs.readFileSync(input, "utf8")
+    const context = {
+      color: color,
+      fontPx: fontPx,
+      noteDir: resolvedNoteDir,
+      math: 0,
+      images: 0,
+      warnings: 0
+    }
+    const html = renderDocument(markdown, title, options, context)
+    writeAtomic(path.resolve(output), html)
+
+    const result = {
+      ok: true,
+      bytes: Buffer.byteLength(html, "utf8"),
+      math: context.math,
+      images: context.images,
+      warnings: context.warnings
+    }
+    process.stdout.write(JSON.stringify(result) + "\n")
+  } catch (error) {
+    const message = error && error.message ? error.message : String(error)
+    process.stderr.write("quill-export-html: " + message + "\n")
+    process.exitCode = 1
+  }
+}
+
+main()

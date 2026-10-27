@@ -42,6 +42,7 @@ backlinks. Deleting `index.db` is safe; it is rebuilt automatically.
   scripts/quill-agent  Node JSONL bridge to the OpenCode service (chat)
   scripts/quill-paste-image  clipboard image → attachment store helper
   scripts/quill-math   offline TeX → themed SVG renderer (JSON in / JSON out)
+  scripts/quill-export-html  Markdown → one standalone HTML file (images + SVG maths)
   scripts/quill-window launcher for Detached.qml (stages it for `qs -p`)
   vendor/              vendored MathJax 3.2.2 (Apache-2.0), see vendor/README.md
   tools/               Joplin mirror scripts + systemd units (reference copies)
@@ -122,6 +123,7 @@ Draft writes never wake the Joplin sync. Only the normal note save does.
 | `Ctrl+E` | Cycle Edit → Split → Preview |
 | `Ctrl+T` | Insert a 3×3 table at the caret and open the grid |
 | `Ctrl+S` | Flush the 600 ms autosave now |
+| `Ctrl+Shift+E` | Export the current buffer as Markdown or HTML |
 | `Ctrl+B` / `Ctrl+I` | Bold / italic |
 | `Ctrl+U` / `Ctrl+Shift+X` | Underline / strikethrough |
 | `Ctrl+Shift+H` | Highlight (==text==) |
@@ -557,6 +559,24 @@ mirrors the Markdown text only, so a synced note keeps the local absolute
 attachment path instead of a Joplin resource. Uploading attachments is a
 follow-up; export/sync currently assumes the Quill data directory is available
 locally.
+
+## Export
+
+The **Export** button in the note header (or `Ctrl+Shift+E`) opens a themed
+dialog for the current editor buffer:
+
+- **Markdown** writes exactly what is in the editor, byte for byte, to the
+  chosen path. The default is `~/<note title>.md`.
+- **HTML** writes one standalone file with embedded CSS, local images as
+  base64 `data:` URIs and maths as inline SVG. Remote `http(s)` images stay
+  remote; missing, non-image or larger-than-10-MiB files become an inline
+  "missing image" note instead of breaking the export.
+
+The dialog validates absolute paths, expands a leading `~/`, and never creates
+parent directories. Export reads the live buffer, so unsaved edits are
+included, but it does not save the note, create a Joplin note, or wake the
+Joplin sync. `scripts/quill-export-html` is the self-contained renderer used by
+the HTML option; it uses the vendored MathJax tree and needs no install step.
 
 ## Joplin sync
 
