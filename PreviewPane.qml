@@ -847,6 +847,7 @@ Item {
 
             Item {
               id: tableBarSlot
+              objectName: "previewTableBarSlot"
               visible: blockItem.tableOverflow
               x: 1
               y: tableFrame.height - height - 1
@@ -1019,12 +1020,16 @@ Item {
               }
             }
 
-            // Clicking anywhere on the table opens the grid. Dragging still
-            // reaches the horizontal Flickable because this area does not
-            // prevent stealing.
+            // Clicking anywhere on the table opens the grid. Stop above the
+            // reserved scroll-bar strip: this MouseArea is declared last, so
+            // without the margin it swallows every press on the bar and opens
+            // the grid instead of scrolling.
             MouseArea {
               id: tableMouse
+              objectName: "previewTableMouse"
               anchors.fill: parent
+              anchors.bottomMargin: 1
+                + (blockItem.tableOverflow ? root.tableScrollBarSpace : 0)
               hoverEnabled: true
               acceptedButtons: Qt.LeftButton
               cursorShape: root.editable && root.tableEditing
