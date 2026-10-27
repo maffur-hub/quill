@@ -78,6 +78,7 @@ function isMutatingArgs(args) {
   if (!args || typeof args.length !== "number" || args.length === 0) return false
   var command = stringValue(args[0])
   if (command === "folder") return true
+  if (command === "draft") return stringValue(args[1]) === "discard"
   if (command === "attachment") return stringValue(args[1]) !== "list"
   var mutating = {
     "write": 1,

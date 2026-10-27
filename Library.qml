@@ -60,6 +60,13 @@ Item {
   property string saveState: "Ready"
   property string statusText: "Ready"
 
+  // Crash-draft recovery. While a differing adjacent draft exists, the stored
+  // note stays on screen and editing is disabled until Recover or Discard.
+  property bool draftPending: false
+  property string draftText: ""
+  property int draftModified: 0
+  property string draftNoteId: ""
+
   property string mode: "split"
   property bool modeChosen: false
   property var backlinks: []
@@ -335,7 +342,18 @@ Item {
     pendingDetach = false
     if (next === selectedId && (loaded || loadingNote)) return
     if (tableOpen) closeTable(false)
+    // Keep the outgoing buffer safe even if the store write fails or the
+    // process goes away mid-save.
+    draftTimer.stop()
+    root.writeDraft()
     flushSave()
+    // Leaving the note abandons the banner but never the draft file: the next
+    // open offers it again. Reset here so the prompt can never target the
+    // previously selected note while the new one loads.
+    draftPending = false
+    draftText = ""
+    draftModified = 0
+    draftNoteId = ""
     selectedId = next
     scheduleChatContext()
     if (!next) {
@@ -347,6 +365,11 @@ Item {
 
   function clearEditor() {
     if (tableOpen) closeTable(false)
+    draftTimer.stop()
+    draftPending = false
+    draftText = ""
+    draftModified = 0
+    draftNoteId = ""
     suppressDirty = true
     editor.text = ""
     editor.cursorPosition = 0
@@ -415,6 +438,19 @@ Item {
         root.statusText = root.tooLarge
           ? "Note is larger than " + Math.ceil(Number(result.maxBytes || 1048576) / 1048576) + " MiB"
           : root.categoryLabel
+        if (result.draft && root.writesAllowed) {
+          root.draftPending = true
+          root.draftText = String(result.draft.content || "")
+          root.draftModified = Number(result.draft.modified || 0)
+          root.draftNoteId = requestedId
+          root.saveState = "Draft found"
+          root.statusText = "Unsaved draft found"
+        } else {
+          root.draftPending = false
+          root.draftText = ""
+          root.draftModified = 0
+          root.draftNoteId = ""
+        }
         if (root.loaded) {
           root.requestPreview()
           root.requestBacklinks()
@@ -433,6 +469,63 @@ Item {
         root.loadingNote = false
         root.loaded = false
         root.statusText = message
+      }
+    })
+  }
+
+  // ------------------------------------------------------------ draft saving
+  // Adjacent to the note and invisible to rglob("*.md"). Store ids already
+  // include folders, so never use notePath(note) here: it would prepend the
+  // folder twice for nested notes.
+  function draftPath(id) {
+    return root.dataRoot + "/notes/" + String(id || "") + ".draft"
+  }
+
+  function writeDraft() {
+    if (!root.writesAllowed || !root.loaded || root.tooLarge || root.loadingNote) return
+    if (!root.selectedNote || root.selectedNote.trashed) return
+    if (root.draftPending || !root.dirty || root.selectedId === "") return
+    draftWriter.enqueue(root.draftPath(root.selectedId), String(editor.text))
+  }
+
+  function recoverDraft() {
+    if (!root.draftPending || root.selectedId !== root.draftNoteId) return
+    draftTimer.stop()
+    var text = root.draftText
+    root.suppressDirty = true
+    editor.text = text
+    editor.cursorPosition = text.length
+    root.suppressDirty = false
+    root.draftPending = false
+    root.draftText = ""
+    root.draftModified = 0
+    root.draftNoteId = ""
+    root.dirty = true
+    root.editVersion += 1
+    root.saveState = "Unsaved"
+    root.statusText = "Draft recovered"
+    saveTimer.stop()
+    root.flushSave()
+  }
+
+  function discardDraft() {
+    if (!root.draftPending || root.selectedId !== root.draftNoteId) return
+    var id = root.draftNoteId
+    if (id === "") return
+    root.enqueue({
+      args: ["draft", "discard", id],
+      silent: true,
+      onSuccess: function(result) {
+        if (root.selectedId !== id) return
+        root.draftPending = false
+        root.draftText = ""
+        root.draftModified = 0
+        root.draftNoteId = ""
+        root.saveState = "Ready"
+        root.statusText = "Draft discarded"
+      },
+      onError: function(message) {
+        root.statusText = "Could not discard draft: " + message
       }
     })
   }
@@ -521,6 +614,11 @@ Item {
     if (noteId === selectedId) {
       loadedModified = Number(result.modified || Date.now())
       if (editVersion === version) {
+        // The store removed the equal adjacent draft. Stop a debounce that
+        // would recreate it, and forget queued writes for this path. A newer
+        // edit keeps its draft: only this exact saved version cleans up.
+        draftTimer.stop()
+        draftWriter.drop(root.draftPath(noteId))
         dirty = false
         saveState = "Saved " + Qt.formatTime(new Date(loadedModified), "HH:mm")
         if (root.tableSavePending) {
@@ -591,6 +689,7 @@ Item {
     editVersion += 1
     saveState = "Unsaved"
     saveTimer.restart()
+    draftTimer.restart()
   }
 
   function countWords(value) {
@@ -1291,6 +1390,16 @@ Item {
     }
   }
 
+  DraftWriter {
+    id: draftWriter
+    objectName: "draftWriter"
+    onFailed: function(path, error) {
+      if (root.dirty && !root.draftPending) root.statusText = "Could not save draft"
+    }
+  }
+
+  Timer { id: draftTimer; interval: 150; onTriggered: root.writeDraft() }
+
   function runSearch() {
     var query = searchText.trim()
     if (!query) {
@@ -1595,6 +1704,14 @@ Item {
             color: Util.alpha(Commons.Color.foreground, 0.1)
           }
 
+          DraftBanner {
+            width: parent.width
+            visible: root.draftPending
+            draftModified: root.draftModified
+            onRecoverRequested: root.recoverDraft()
+            onDiscardRequested: root.discardDraft()
+          }
+
           FormatBar {
             id: formatBar
             // Full pane width: the surrounding column has 11 px margins for
@@ -1604,7 +1721,7 @@ Item {
             x: -Style.space(11)
             visible: root.mode !== "preview"
             available: root.loaded && !root.tooLarge && !!root.selectedNote
-              && !root.selectedNote.trashed
+              && !root.selectedNote.trashed && !root.draftPending
             canUndo: editor ? editor.canUndo : false
             canRedo: editor ? editor.canRedo : false
             linkValue: editor ? editor.currentLinkURL() : ""
@@ -1643,7 +1760,8 @@ Item {
                 storePath: root.storePath
                 enabled: root.loaded && !root.tooLarge && !root.loadingNote
                   && !!root.selectedNote && !root.selectedNote.trashed
-                readOnly: root.selectedNote ? !!root.selectedNote.trashed : true
+                  && !root.draftPending
+                readOnly: (root.selectedNote ? !!root.selectedNote.trashed : true) || root.draftPending
                 selectByMouse: true
                 wrapMode: TextEdit.Wrap
                 onCursorRectangleChanged: editorScroll.ensureVisible(cursorRectangle)
@@ -1694,7 +1812,7 @@ Item {
                 hasNote: !!root.selectedNote
                 tooLarge: root.tooLarge
                 editable: root.loaded && !root.tooLarge && !!root.selectedNote
-                  && !root.selectedNote.trashed
+                  && !root.selectedNote.trashed && !root.draftPending
                 lineOffset: root.previewLineOffset
                 onLinkActivated: function(link) { root.openLink(link) }
                 onImageResized: function(line, width) { root.setImageWidth(line, width) }
@@ -1711,7 +1829,7 @@ Item {
                 visible: root.tableOpen
                 sourceText: editor.text
                 editable: root.loaded && !root.tooLarge && !!root.selectedNote
-                  && !root.selectedNote.trashed
+                  && !root.selectedNote.trashed && !root.draftPending
                 onCommitRequested: function(newLines) { root.applyTableWrite(newLines) }
                 onStatusMessage: function(message) { root.statusText = message }
                 onClosed: {

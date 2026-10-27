@@ -51,6 +51,11 @@ ShellRoot {
   property int previewLineOffset: 0
   property string statusText: "Loading note…"
 
+  // Crash-draft recovery, mirroring Library.qml for a single note.
+  property bool draftPending: false
+  property string draftText: ""
+  property int draftModified: 0
+
   Component.onCompleted: {
     // The per-launch production opt-in is part of allowRealData's binding
     // above, so a harness cannot inherit it accidentally.
@@ -101,17 +106,69 @@ ShellRoot {
     loaded = !tooLarge
     dirty = false
     statusText = tooLarge ? "This note is too large to edit safely" : "Saved"
+    if (result.draft && root.writesAllowed) {
+      draftPending = true
+      draftText = String(result.draft.content || "")
+      draftModified = Number(result.draft.modified || 0)
+      statusText = "Draft found"
+    } else {
+      draftPending = false
+      draftText = ""
+      draftModified = 0
+    }
     if (loaded) {
       requestPreview()
-      Qt.callLater(function() { editor.forceActiveFocus() })
+      if (!draftPending) Qt.callLater(function() { editor.forceActiveFocus() })
     }
   }
 
   function markDirty() {
-    if (suppressDirty || loading || !loaded || tooLarge) return
+    if (suppressDirty || loading || !loaded || tooLarge || draftPending) return
     dirty = true
     statusText = "Unsaved"
     saveTimer.restart()
+    draftTimer.restart()
+  }
+
+  // ------------------------------------------------------------------ drafts
+  function draftPath() {
+    return root.dataRoot + "/notes/" + root.noteId + ".draft"
+  }
+
+  function writeDraft() {
+    if (!root.writesAllowed || !root.loaded || root.tooLarge || !root.dirty) return
+    if (root.draftPending || root.noteId === "") return
+    draftWriter.enqueue(root.draftPath(), String(editor.text))
+  }
+
+  function recoverDraft() {
+    if (!root.draftPending || root.noteId === "") return
+    draftTimer.stop()
+    var text = root.draftText
+    root.suppressDirty = true
+    editor.text = text
+    editor.cursorPosition = text.length
+    root.suppressDirty = false
+    root.draftPending = false
+    root.draftText = ""
+    root.draftModified = 0
+    root.dirty = true
+    root.statusText = "Draft recovered"
+    // Save now through the normal path: the store then removes the equal
+    // adjacent draft (or keeps a newer one if one appeared meanwhile).
+    saveTimer.stop()
+    root.save()
+  }
+
+  function discardDraft() {
+    if (!root.draftPending || root.noteId === "") return
+    if (!root.writesAllowed) {
+      root.statusText = WritableGuard.refusalMessage()
+      return
+    }
+    root.statusText = "Discarding draft…"
+    discardProcess.command = [root.storePath, "draft", "discard", root.noteId]
+    discardProcess.running = true
   }
 
   function save() {
@@ -168,6 +225,8 @@ ShellRoot {
     savedOnce = true
     notifyJoplinSync()
     if (editor.text === writeProcess.savedText) {
+      draftTimer.stop()
+      draftWriter.drop(root.draftPath())
       dirty = false
       statusText = "Saved " + Qt.formatTime(new Date(), "HH:mm")
       requestPreview()
@@ -237,9 +296,12 @@ ShellRoot {
   function closeWindow() {
     saveTimer.stop()
     if (!loaded || tooLarge || !dirty) {
+      // A pending draft stays on disk for the next open.
       Qt.quit()
       return
     }
+    draftTimer.stop()
+    root.writeDraft()
     quitAfterSave = true
     save()
     // A failed save must not leave an invisible process behind.
@@ -262,6 +324,16 @@ ShellRoot {
     interval: 2500
     onTriggered: { if (!root.saving) Qt.quit() }
   }
+
+  DraftWriter {
+    id: draftWriter
+    objectName: "draftWriter"
+    onFailed: function(path, error) {
+      if (root.dirty && !root.draftPending) root.statusText = "Could not save draft"
+    }
+  }
+
+  Timer { id: draftTimer; interval: 150; onTriggered: root.writeDraft() }
 
   Process {
     id: loadProcess
@@ -291,6 +363,27 @@ ShellRoot {
     stderr: StdioCollector { id: writeError; waitForEnd: true }
     onExited: function(exitCode) {
       root.afterWrite(exitCode, String(writeError.text || ""))
+    }
+  }
+
+  Process {
+    id: discardProcess
+    stdout: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector { id: discardError; waitForEnd: true }
+    onExited: function(exitCode) {
+      if (exitCode === 0) {
+        root.draftPending = false
+        root.draftText = ""
+        root.draftModified = 0
+        root.statusText = "Draft discarded"
+      } else {
+        var text = String(discardError.text || "").trim()
+        try {
+          var payload = JSON.parse(text)
+          if (payload && payload.error) text = String(payload.error)
+        } catch (error) { /* plain text error */ }
+        root.statusText = "Could not discard draft" + (text !== "" ? ": " + text : "")
+      }
     }
   }
 
@@ -383,6 +476,14 @@ ShellRoot {
         color: Util.alpha(Commons.Color.foreground, 0.14)
       }
 
+      DraftBanner {
+        width: parent.width
+        visible: root.draftPending
+        draftModified: root.draftModified
+        onRecoverRequested: root.recoverDraft()
+        onDiscardRequested: root.discardDraft()
+      }
+
       Row {
         width: parent.width
         height: parent.height - y
@@ -415,7 +516,7 @@ ShellRoot {
               width: editorScroll.width
               height: Math.max(editorScroll.height, implicitHeight)
               storePath: root.storePath
-              enabled: root.loaded && !root.tooLarge
+              enabled: root.loaded && !root.tooLarge && !root.draftPending
               selectByMouse: true
               wrapMode: TextEdit.Wrap
               onCursorRectangleChanged: editorScroll.ensureVisible(cursorRectangle)
@@ -455,7 +556,7 @@ ShellRoot {
             dirty: root.dirty
             hasNote: root.loaded
             tooLarge: root.tooLarge
-            editable: root.loaded && !root.tooLarge
+            editable: root.loaded && !root.tooLarge && !root.draftPending
             tableEditing: false
             lineOffset: root.previewLineOffset
             onLinkActivated: function(link) { Qt.openUrlExternally(link) }

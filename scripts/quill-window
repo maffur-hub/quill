@@ -34,7 +34,7 @@ export QUILL_STORE_PATH="${QUILL_STORE_PATH:-$script_dir/quill-store}"
 export QUILL_ALLOW_REAL_DATA=1
 
 mkdir -p "$stage"
-for file in Detached.qml MarkdownEditor.qml PreviewPane.qml MathService.qml ImageSizing.js TableEngine.js MathSyntax.js MathText.js MarkdownFormat.js WritableGuard.js; do
+for file in Detached.qml MarkdownEditor.qml DraftBanner.qml DraftWriter.qml PreviewPane.qml MathService.qml ImageSizing.js TableEngine.js MathSyntax.js MathText.js MarkdownFormat.js WritableGuard.js; do
   if ! cmp -s "$plugin_dir/$file" "$stage/$file"; then
     cp "$plugin_dir/$file" "$stage/$file"
   fi

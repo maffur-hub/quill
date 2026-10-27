@@ -22,6 +22,8 @@ backlinks. Deleting `index.db` is safe; it is rebuilt automatically.
   ChatMessage.qml      one chat row: Markdown, maths, tool output
   FormatBar.qml        editor formatting toolbar + colour/link/table popovers
   ContextMenuItem.qml  one themed row for the editor's right-click menu
+  DraftBanner.qml      recover/discard prompt for an adjacent crash draft
+  DraftWriter.qml      serialized atomic writer for adjacent crash drafts
   MarkdownFormat.js    pure formatting edit planner (shared, node-testable)
   Detached.qml         one note in its own Quickshell window (Ctrl+Return)
   Sidebar.qml          saved views, tag counts, folder tree
@@ -74,11 +76,40 @@ an atomic temp-file + rename. The original newline style (LF or CRLF) is kept
 on every save. Notes over 1 MiB are shown read-only ("too large") rather than
 risking a partial write.
 
+While a note is dirty, Quill also writes a debounced (150 ms) copy to
+`<note path>.draft`, for example `notes/Work/plan.md.draft`. The suffix is
+invisible to the `*.md` note scan and to the index. A normal save removes the
+draft when it matches the saved body; a newer draft is kept. If Quill exits or
+crashes before the save lands, the next open shows the stored note with a
+**Recover**/**Discard** banner (see **Crash drafts** below).
+
 Titles come from frontmatter `title:`, otherwise the first non-empty line with
 heading/list markers and `` ` `` `*` `_` `~` stripped, capped at 120 chars.
 Tags come from frontmatter `tags:` and inline `#tag` outside code fences and
 inline code. `[[Target]]`, `[[Target|Alias]]` and `[[Target#Heading]]` resolve
 case-insensitively by title, then filename stem.
+
+## Crash drafts
+
+Edits are saved to the note after 600 ms, and a separate draft is written
+150 ms after typing stops. The two are independent: if the shell is killed,
+the machine loses power, or the note write keeps failing, the draft survives
+next to the note.
+
+On open, `quill-store read` reports a draft only when its newline-normalised
+text differs from the stored note, the note is not in Trash, and the note is
+not too large to edit. The library and detached window then show the **stored**
+note with editing (and the format bar) disabled, plus a banner such as
+"Unsaved draft from Oct 27, 14:05":
+
+- **Recover** replaces the editor with the draft, marks it dirty and saves it
+  through the normal path immediately. The store then removes the draft it
+  just saved.
+- **Discard** deletes the adjacent draft and re-enables editing.
+- Switching notes, closing the library or closing the detached window leaves a
+  pending draft on disk; the banner returns next time the note is opened.
+
+Draft writes never wake the Joplin sync. Only the normal note save does.
 
 ## Shortcuts
 
@@ -656,6 +687,7 @@ $S list [--trashed]
 $S read <id> [--trashed]
 printf '# Hello\n' | $S write <id> --stdin
 printf '# Hello\n' | $S write <id> --create --stdin   # create a missing mapped id
+$S draft discard <id>                      # delete <note>.draft, keep the note
 $S create [--folder F] [--title T] [--content-stdin]
 $S rename <id> --title "New title"
 $S move <id> --folder "Work/Projects"
@@ -687,6 +719,13 @@ is validated, given its parent folders, newline-normalised to LF and indexed
 (no snapshot, because there is no previous content). If the file already
 exists, `--create` changes nothing about today's snapshot and newline-preserving
 write path.
+
+`read` adds `draft: {content, modified}` only when an adjacent `.draft` exists,
+differs from the stored body (newline style aside), and the note is neither
+trashed nor too large. `write` removes that draft when its normalised text
+equals the bytes just saved; a newer draft is kept. `draft discard <id>`
+removes the adjacent draft and returns `{"id": ..., "discarded": true|false}`.
+Draft commands are mutations for the `QUILL_E2E` live-root guard.
 
 `preview` strips the YAML frontmatter block (its title and tags are already
 shown in the UI), then converts wiki links to
@@ -724,7 +763,14 @@ overwrites an existing note. OmaNano's files are never moved or modified.
   types inside that folder. The UI only offers the non-forced form.
 - Preview updates after autosave (600 ms) or `Ctrl+S`, because rendering is
   deliberately done from the backend's saved view of the note.
+- Crash drafts follow the note's current path. Renaming, moving or trashing a
+  note does not move an existing `.draft`, so recovery is offered again only if
+  the note returns to the same path before the draft is removed.
+- The library and a detached window can both edit the same note. Draft files
+  are last-writer-wins; close one window before switching to the other if both
+  have the note dirty.
 - Markdown rendering is Qt's GitHub-dialect `Text.MarkdownText`; exotic
+
   extensions (footnotes, definition lists, raw HTML) are not previewed. A text
   block containing inline maths is rendered as RichText instead, so those
   extensions are unavailable in that particular block (see **Maths → Limits**).

@@ -501,6 +501,32 @@ def read_note_bytes(path: Path, cap: int | None = None) -> bytes:
         return handle.read(limit + 1)
 
 
+def draft_path(note: Path) -> Path:
+    """Crash draft adjacent to a note: <note path>.draft.
+
+    The suffix keeps drafts out of `rglob("*.md")`, so the index and the note
+    list never see them.
+    """
+    return note.with_name(note.name + ".draft")
+
+
+def read_draft(note: Path) -> tuple[str, int] | None:
+    """Read a crash draft, or None when absent/unreadable/too large."""
+    draft = draft_path(note)
+    try:
+        if not draft.is_file():
+            return None
+        stat = draft.stat()
+        if stat.st_size > MAX_NOTE_BYTES:
+            return None
+        payload = read_note_bytes(draft)
+    except OSError:
+        return None
+    if len(payload) > MAX_NOTE_BYTES:
+        return None
+    return payload.decode("utf-8", errors="replace"), int(stat.st_mtime * 1000)
+
+
 # --------------------------------------------------------------------------
 # markdown parsing
 
@@ -1017,7 +1043,8 @@ def command_list(args) -> dict:
 
 def command_read(args) -> dict:
     ensure_store()
-    path = note_path(args.id, trashed=getattr(args, "trashed", False))
+    trashed = bool(getattr(args, "trashed", False))
+    path = note_path(args.id, trashed=trashed)
     if not path.is_file():
         raise StoreError(f"note not found: {args.id}")
     stat = path.stat()
@@ -1041,14 +1068,28 @@ def command_read(args) -> dict:
             "modified": int(stat.st_mtime * 1000),
             "maxBytes": MAX_NOTE_BYTES,
         }
-    return {
+    content = payload.decode("utf-8", errors="replace")
+    result = {
         "id": identifier,
-        "content": payload.decode("utf-8", errors="replace"),
+        "content": content,
         "tooLarge": False,
         "size": int(stat.st_size),
         "modified": int(stat.st_mtime * 1000),
         "maxBytes": MAX_NOTE_BYTES,
     }
+    # A crash draft is only interesting for a live note. Trashed notes never
+    # advertise one, and an equal draft (newline style aside) is invisible.
+    if not trashed:
+        draft = read_draft(path)
+        if draft is not None:
+            draft_text, draft_modified = draft
+            newline = detect_newline(content)
+            if normalize_newlines(draft_text, newline) != content:
+                result["draft"] = {
+                    "content": draft_text,
+                    "modified": draft_modified,
+                }
+    return result
 
 
 def command_write(args) -> dict:
@@ -1080,7 +1121,9 @@ def command_write(args) -> dict:
         content = payload.decode("utf-8")
     except UnicodeDecodeError as error:
         raise StoreError("note content is not valid UTF-8") from error
+    draft_deleted = False
     with locked():
+        newline = "\n"
         if path.is_file():
             try:
                 previous_raw = path.read_bytes()
@@ -1096,8 +1139,20 @@ def command_write(args) -> dict:
             # Explicit mapped id (restore path): there is no previous content
             # to snapshot, so newline normalisation starts from LF.
             path.parent.mkdir(parents=True, exist_ok=True)
-            updated = normalize_newlines(content, "\n").encode("utf-8")
+            content = normalize_newlines(content, "\n")
+            updated = content.encode("utf-8")
         atomic_write(path, updated)
+        # The save is the source of truth now. Delete the adjacent draft only
+        # when it holds exactly these bytes (newline style aside): a newer
+        # draft written during the save must survive for the next open.
+        try:
+            draft = read_draft(path)
+            if draft is not None and normalize_newlines(draft[0], newline) == content:
+                draft_path(path).unlink()
+                draft_deleted = True
+        except OSError:
+            # Draft cleanup is best-effort; it must never fail the note write.
+            pass
         stat = path.stat()
         conn = index_connect()
         try:
@@ -1107,7 +1162,30 @@ def command_write(args) -> dict:
         finally:
             conn.close()
         prune_versions(identifier)
-    return {"id": identifier, "modified": int(stat.st_mtime * 1000), "size": int(stat.st_size)}
+    return {
+        "id": identifier,
+        "modified": int(stat.st_mtime * 1000),
+        "size": int(stat.st_size),
+        "draftDeleted": draft_deleted,
+    }
+
+
+def command_draft(args) -> dict:
+    ensure_store()
+    identifier = safe_relative(args.id)
+    path = note_path(identifier)
+    discarded = False
+    with locked():
+        draft = draft_path(path)
+        try:
+            if draft.is_file() or draft.is_symlink():
+                draft.unlink()
+                discarded = True
+        except FileNotFoundError:
+            discarded = False
+        except OSError as error:
+            raise StoreError(f"could not discard the draft: {error}") from error
+    return {"id": identifier, "discarded": discarded}
 
 
 def command_create(args) -> dict:
@@ -2115,6 +2193,8 @@ def command_is_mutating(args) -> bool:
     command = str(getattr(args, "command", "") or "")
     if command == "folder":
         return True
+    if command == "draft":
+        return str(getattr(args, "draft_action", "") or "") == "discard"
     if command == "attachment":
         return str(getattr(args, "attachment_command", "") or "") in {"save", "gc"}
     return command in MUTATING_COMMANDS
@@ -2158,6 +2238,12 @@ def build_parser() -> argparse.ArgumentParser:
     write.add_argument("--create", action="store_true",
                        help="create the note at this exact id when it is missing")
     write.set_defaults(func=command_write)
+
+    draft = sub.add_parser("draft")
+    draft_sub = draft.add_subparsers(dest="draft_action", required=True)
+    draft_discard = draft_sub.add_parser("discard")
+    draft_discard.add_argument("id")
+    draft_discard.set_defaults(func=command_draft)
 
     create = sub.add_parser("create")
     create.add_argument("--folder", default="")
