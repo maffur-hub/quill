@@ -21,7 +21,7 @@ backlinks. Deleting `index.db` is safe; it is rebuilt automatically.
   ChatDock.qml         right-hand chat dock (sessions, tools, composer)
   ChatMessage.qml      one chat row: Markdown, maths, tool output
   FormatBar.qml        editor formatting toolbar + colour/link/table popovers
-  ContextMenuItem.qml  one themed row for the editor's right-click menu
+  ContextMenuItem.qml  one themed row for Quill's menus
   DraftBanner.qml      recover/discard prompt for an adjacent crash draft
   DraftWriter.qml      serialized atomic writer for adjacent crash drafts
   MarkdownFormat.js    pure formatting edit planner (shared, node-testable)
@@ -215,9 +215,11 @@ links/code, rule/table, an insert menu (date, time, emoji, attach file, note
 link) and clear formatting. Buttons never take keyboard focus; after an action
 the editor regains focus and the selection is restored.
 
-Right-clicking the editor opens a themed context menu with undo/redo,
-clipboard actions, select all, the inline formatting actions and date/time
-insertion; it works in both the Library and detached note windows.
+Right-clicking the editor opens a compact horizontal icon strip centred above
+the pointer (it flips below the click near the top edge). It carries
+undo/redo, the clipboard actions, select all, the inline formatting actions
+and date/time insertion; each icon has a tooltip. It works in both the
+Library and detached note windows.
 
 The toolbar writes ordinary Markdown plus a tiny HTML whitelist that Joplin
 also accepts:

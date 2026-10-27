@@ -47,9 +47,11 @@ TextArea {
   readonly property string attachHome: Quickshell.env("HOME") || "/"
   readonly property bool attachCanConfirm: root.attachPath.trim() !== ""
 
-  // Replaces the stock white Qt text menu. Exposed for the e2e harness.
+  // Replaces the stock white Qt text menu with a compact icon strip. The
+  // attached menu stays null; right-click is handled in onPressed so the strip
+  // can be centred over the click rather than dropped at the pointer.
   readonly property var contextMenuRef: editorMenu
-  T.ContextMenu.menu: editorMenu
+  T.ContextMenu.menu: null
 
   // A replacement edit becomes one native remove plus one native insert. Keep
   // the operation count so the toolbar's Undo/Redo can replay the whole
@@ -1130,25 +1132,29 @@ TextArea {
     }
   }
 
-  // Themed replacement for Qt's stock Undo/Redo/Cut/Copy/Paste/Delete menu.
-  // Formatting actions reuse the same pure planner as the toolbar, so both
-  // hosts (Library and Detached) get identical edits with no Library signals.
-  Menu {
+  // A compact horizontal action strip in place of the stock vertical text
+  // menu. Right-click centres it over the pointer and lifts it above the
+  // click, flipping below when there is no room at the top of the editor.
+  Popup {
     id: editorMenu
     objectName: "editorContextMenu"
-    width: Style.space(200)
+    width: menuRow.implicitWidth + leftPadding + rightPadding
+    height: menuRow.implicitHeight + topPadding + bottomPadding
     padding: Style.space(4)
     popupType: Qt.platform.pluginName !== "wayland" ? Popup.Window : Popup.Item
-    palette.window: Commons.Color.menu.background
-    palette.windowText: Commons.Color.menu.text
-    palette.text: Commons.Color.menu.text
-    palette.buttonText: Commons.Color.menu.text
-    palette.light: Commons.Color.menu.selectedBackground
-    palette.midlight: Util.alpha(Commons.Color.foreground, 0.12)
-    palette.mid: Util.alpha(Commons.Color.foreground, 0.16)
-    palette.dark: Commons.Color.menu.border
-    palette.shadow: "#000000"
+    focus: true
+    closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
     onClosed: root.forceActiveFocus()
+
+    function showAt(px, py) {
+      var gap = Style.space(6)
+      var nx = Math.max(0, Math.min(root.width - width, px - width / 2))
+      var ny = py - height - gap
+      if (ny < 0) ny = Math.min(Math.max(0, root.height - height), py + gap)
+      x = nx
+      y = ny
+      open()
+    }
 
     background: BorderSurface {
       color: Commons.Color.menu.background
@@ -1157,104 +1163,167 @@ TextArea {
       radius: Style.cornerRadius
     }
 
-    ContextMenuItem {
-      text: "Undo"
-      enabled: !root.readOnly && root.canUndo
-      onTriggered: root.undoFormat()
-    }
-    ContextMenuItem {
-      text: "Redo"
-      enabled: !root.readOnly && root.canRedo
-      onTriggered: root.redoFormat()
-    }
+    contentItem: Row {
+      id: menuRow
+      spacing: Style.space(1)
 
-    MenuSeparator {}
-
-    ContextMenuItem {
-      text: "Cut"
-      enabled: !root.readOnly && root.selectedText.length > 0
-      onTriggered: root.cut()
-    }
-    ContextMenuItem {
-      text: "Copy"
-      enabled: root.selectedText.length > 0
-      onTriggered: root.copy()
-    }
-    ContextMenuItem {
-      text: "Paste"
-      enabled: !root.readOnly && !root.pastingImage
-      onTriggered: root.beginImagePaste()
-    }
-    ContextMenuItem {
-      text: "Delete"
-      enabled: !root.readOnly && root.selectedText.length > 0
-      onTriggered: {
-        root.remove(Math.min(root.selectionStart, root.selectionEnd),
-          Math.max(root.selectionStart, root.selectionEnd))
-        root.forceActiveFocus()
+      MenuAction {
+        glyph: "\uf0e2"
+        tip: "Undo (Ctrl+Z)"
+        enabled: !root.readOnly && root.canUndo
+        onActivated: {
+          root.undoFormat()
+          editorMenu.close()
+        }
       }
-    }
-
-    MenuSeparator {}
-
-    ContextMenuItem {
-      text: "Select all"
-      enabled: root.text.length > 0
-      onTriggered: {
-        root.selectAll()
-        root.forceActiveFocus()
+      MenuAction {
+        glyph: "\uf01e"
+        tip: "Redo (Ctrl+Shift+Z)"
+        enabled: !root.readOnly && root.canRedo
+        onActivated: {
+          root.redoFormat()
+          editorMenu.close()
+        }
       }
-    }
 
-    MenuSeparator {}
+      MenuDivider {}
 
-    ContextMenuItem {
-      text: "Bold"
-      enabled: !root.readOnly
-      onTriggered: root.applyFormat("bold")
-    }
-    ContextMenuItem {
-      text: "Italic"
-      enabled: !root.readOnly
-      onTriggered: root.applyFormat("italic")
-    }
-    ContextMenuItem {
-      text: "Underline"
-      enabled: !root.readOnly
-      onTriggered: root.applyFormat("underline")
-    }
-    ContextMenuItem {
-      text: "Strikethrough"
-      enabled: !root.readOnly
-      onTriggered: root.applyFormat("strike")
-    }
-    ContextMenuItem {
-      text: "Highlight"
-      enabled: !root.readOnly
-      onTriggered: root.applyFormat("highlight")
-    }
-    ContextMenuItem {
-      text: "Inline code"
-      enabled: !root.readOnly
-      onTriggered: root.applyFormat("code")
-    }
-    ContextMenuItem {
-      text: "Clear formatting"
-      enabled: !root.readOnly
-      onTriggered: root.applyFormat("clear")
-    }
+      MenuAction {
+        glyph: "\uf0c4"
+        tip: "Cut"
+        enabled: !root.readOnly && root.selectedText.length > 0
+        onActivated: {
+          root.cut()
+          editorMenu.close()
+        }
+      }
+      MenuAction {
+        glyph: "\uf0c5"
+        tip: "Copy"
+        enabled: root.selectedText.length > 0
+        onActivated: {
+          root.copy()
+          editorMenu.close()
+        }
+      }
+      MenuAction {
+        glyph: "\uf0ea"
+        tip: "Paste"
+        enabled: !root.readOnly && !root.pastingImage
+        onActivated: {
+          root.beginImagePaste()
+          editorMenu.close()
+        }
+      }
+      MenuAction {
+        glyph: "\uf014"
+        tip: "Delete"
+        enabled: !root.readOnly && root.selectedText.length > 0
+        onActivated: {
+          root.remove(Math.min(root.selectionStart, root.selectionEnd),
+            Math.max(root.selectionStart, root.selectionEnd))
+          editorMenu.close()
+        }
+      }
 
-    MenuSeparator {}
+      MenuDivider {}
 
-    ContextMenuItem {
-      text: "Insert date"
-      enabled: !root.readOnly
-      onTriggered: root.insertDate()
-    }
-    ContextMenuItem {
-      text: "Insert time"
-      enabled: !root.readOnly
-      onTriggered: root.insertTime()
+      MenuAction {
+        glyph: "\uf046"
+        tip: "Select all"
+        enabled: root.text.length > 0
+        onActivated: {
+          root.selectAll()
+          editorMenu.close()
+        }
+      }
+
+      MenuDivider {}
+
+      MenuAction {
+        glyph: "\uf032"
+        tip: "Bold (Ctrl+B)"
+        enabled: !root.readOnly
+        onActivated: {
+          root.applyFormat("bold")
+          editorMenu.close()
+        }
+      }
+      MenuAction {
+        glyph: "\uf033"
+        tip: "Italic (Ctrl+I)"
+        enabled: !root.readOnly
+        onActivated: {
+          root.applyFormat("italic")
+          editorMenu.close()
+        }
+      }
+      MenuAction {
+        glyph: "\uf0cd"
+        tip: "Underline (Ctrl+U)"
+        enabled: !root.readOnly
+        onActivated: {
+          root.applyFormat("underline")
+          editorMenu.close()
+        }
+      }
+      MenuAction {
+        glyph: "\uf0cc"
+        tip: "Strikethrough (Ctrl+Shift+X)"
+        enabled: !root.readOnly
+        onActivated: {
+          root.applyFormat("strike")
+          editorMenu.close()
+        }
+      }
+      MenuAction {
+        glyph: "\uf1fc"
+        tip: "Highlight (Ctrl+Shift+H)"
+        enabled: !root.readOnly
+        onActivated: {
+          root.applyFormat("highlight")
+          editorMenu.close()
+        }
+      }
+      MenuAction {
+        glyph: "\uf121"
+        tip: "Inline code"
+        enabled: !root.readOnly
+        onActivated: {
+          root.applyFormat("code")
+          editorMenu.close()
+        }
+      }
+      MenuAction {
+        glyph: "\uf12d"
+        tip: "Clear formatting"
+        enabled: !root.readOnly
+        onActivated: {
+          root.applyFormat("clear")
+          editorMenu.close()
+        }
+      }
+
+      MenuDivider {}
+
+      MenuAction {
+        glyph: "\uf073"
+        tip: "Insert date"
+        enabled: !root.readOnly
+        onActivated: {
+          root.insertDate()
+          editorMenu.close()
+        }
+      }
+      MenuAction {
+        glyph: "\uf017"
+        tip: "Insert time"
+        enabled: !root.readOnly
+        onActivated: {
+          root.insertTime()
+          editorMenu.close()
+        }
+      }
     }
   }
 
@@ -1357,6 +1426,45 @@ TextArea {
       event.accepted = true
       if (root.readOnly || root.pastingImage) return
       root.beginImagePaste()
+    }
+  }
+
+  onPressed: function(mouse) {
+    if (mouse.button === Qt.RightButton) editorMenu.showAt(mouse.x, mouse.y)
+  }
+
+  // One icon button in the right-click strip. The glyphs are Nerd Font icons
+  // (the shell's monospace alias resolves to JetBrainsMono Nerd Font), so the
+  // strip stays legible at 22 px without text labels; tooltips name each one.
+  component MenuAction: Button {
+    id: menuAction
+    property string glyph: ""
+    property string tip: ""
+    signal activated()
+
+    text: ""
+    iconText: glyph
+    iconSize: Style.font.bodySmall
+    width: Style.space(22)
+    height: Style.space(22)
+    horizontalPadding: 0
+    verticalPadding: 0
+    focusable: false
+    tooltipText: tip
+    foreground: Commons.Color.menu.text
+    opacity: enabled ? 1 : 0.35
+    onClicked: menuAction.activated()
+  }
+
+  component MenuDivider: Item {
+    width: Style.space(5)
+    height: Style.space(22)
+
+    Rectangle {
+      anchors.centerIn: parent
+      width: 1
+      height: Style.space(13)
+      color: Util.alpha(Commons.Color.foreground, 0.16)
     }
   }
 }

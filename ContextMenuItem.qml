@@ -3,7 +3,7 @@ import QtQuick.Controls
 import qs.Commons
 import qs.Commons as Commons
 
-// One row in Quill's themed editor context menu.
+// One row in Quill's themed menus.
 //
 // Qt's Basic Menu delegate is a plain MenuItem with a light background; styling
 // the declared items keeps Qt's hover, keyboard and triggered behaviour while
