@@ -6,6 +6,7 @@ import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
 import "ImageSizing.js" as ImageSizing
+import "MarkdownFormat.js" as MarkdownFormat
 import "TableEngine.js" as TableEngine
 import "WritableGuard.js" as WritableGuard
 
@@ -654,6 +655,19 @@ Item {
     if (!isFinite(index) || index < 0 || index >= lines.length) return
     var updated = ImageSizing.clearSize(lines[index])
     if (updated === null) return
+    replaceEditorLine(index, updated)
+  }
+
+  // --------------------------------------------------- task checkboxes
+  // Flip the box on one line. The caret is left alone; the normal dirty and
+  // autosave path saves the note and syncs it to Joplin as usual.
+  function toggleTaskAt(line) {
+    if (!loaded || tooLarge || !selectedNote || selectedNote.trashed) return
+    var index = Math.round(Number(line))
+    var lines = String(editor.text).split("\n")
+    if (!isFinite(index) || index < 0 || index >= lines.length) return
+    var updated = MarkdownFormat.toggleTaskLine(lines[index])
+    if (updated === null || updated === lines[index]) return
     replaceEditorLine(index, updated)
   }
 
@@ -1685,6 +1699,7 @@ Item {
                 onLinkActivated: function(link) { root.openLink(link) }
                 onImageResized: function(line, width) { root.setImageWidth(line, width) }
                 onImageReset: function(line) { root.clearImageSize(line) }
+                onTaskToggled: function(line) { root.toggleTaskAt(line) }
                 onTableActivated: function(startLine, endLine) {
                   root.openTableAt(startLine, endLine)
                 }

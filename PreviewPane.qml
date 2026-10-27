@@ -6,6 +6,7 @@ import "ImageSizing.js" as ImageSizing
 import "TableEngine.js" as TableEngine
 import "MathSyntax.js" as MathSyntax
 import "MathText.js" as MathText
+import "MarkdownFormat.js" as MarkdownFormat
 
 // Rendered Markdown preview. Qt's GitHub-dialect Markdown renderer handles
 // the text; Quill rewrites wiki links and inline tags into quill:// links in
@@ -45,6 +46,8 @@ Item {
   signal imageResized(int line, int width)
   signal imageReset(int line)
   signal tableActivated(int startLine, int endLine)
+  // line is an absolute note line: task block line + lineOffset.
+  signal taskToggled(int line)
 
   readonly property var blocks: buildBlocks(markdown)
 
@@ -55,16 +58,22 @@ Item {
   property int pendingLine: -1
   property int pendingWidth: -1
 
+  // Optimistic checkbox state keyed by absolute note line. Cleared whenever
+  // markdown changes so a stale flip can never outlive a fresh render.
+  property var taskOverrides: ({})
+
   function maxContentWidth() {
     return Math.max(60, Math.floor(flick.width) - 2)
   }
 
-  // Split markdown into text / image / table / maths blocks. Display maths is
-  // found first so a $$ line is never mistaken for an image or a table.
-  // Tables are found by the shared engine, so pipe rows never leak into a
-  // MarkdownText block.
+  // Split markdown into text / image / table / maths / task blocks. Display
+  // maths is found first so a $$ line is never mistaken for an image or a
+  // table. Tables are found by the shared engine, so pipe rows never leak into
+  // a MarkdownText block. Task lines are grouped while consecutive and are
+  // ignored inside fenced code blocks.
   function buildBlocks(value) {
     var lines = String(value === undefined || value === null ? "" : value).split("\n")
+    var fenced = markFences(lines)
     var tables = TableEngine.findTables(lines)
     var tableAt = {}
     for (var t = 0; t < tables.length; t++) tableAt[tables[t].startLine] = tables[t]
@@ -74,6 +83,7 @@ Item {
 
     var result = []
     var buffer = []
+    var tasks = []
 
     function flushText() {
       if (buffer.length === 0) return
@@ -83,11 +93,18 @@ Item {
       result.push({ kind: "text", text: joined })
     }
 
+    function flushTasks() {
+      if (tasks.length === 0) return
+      result.push({ kind: "tasks", items: tasks })
+      tasks = []
+    }
+
     var i = 0
     while (i < lines.length) {
       var math = mathAt[i]
       if (math) {
         flushText()
+        flushTasks()
         result.push({
           kind: "math",
           tex: math.tex,
@@ -100,6 +117,7 @@ Item {
       var table = tableAt[i]
       if (table) {
         flushText()
+        flushTasks()
         result.push({
           kind: "table",
           table: table,
@@ -112,6 +130,7 @@ Item {
       var image = ImageSizing.splitLine(lines[i])
       if (image) {
         flushText()
+        flushTasks()
         result.push({
           kind: "image",
           source: image.source,
@@ -122,11 +141,48 @@ Item {
         i += 1
         continue
       }
+      var task = fenced[i] ? null : MarkdownFormat.parseTaskLine(lines[i])
+      if (task) {
+        flushText()
+        tasks.push({
+          checked: task.checked,
+          content: task.content,
+          indent: task.indent,
+          line: i
+        })
+        i += 1
+        continue
+      }
+      flushTasks()
       buffer.push(lines[i])
       i += 1
     }
     flushText()
+    flushTasks()
     return result
+  }
+
+  // Mark every line that belongs to a fenced code block, including the
+  // opening and closing fences. Tilde and backtick fences only close against a
+  // fence of the same character and at least the same length.
+  function markFences(lines) {
+    var mask = []
+    var fence = ""
+    for (var i = 0; i < lines.length; i++) {
+      var trimmed = String(lines[i] === undefined ? "" : lines[i]).replace(/^[ \t]+/, "")
+      var match = /^(`{3,}|~{3,})/.exec(trimmed)
+      if (fence === "") {
+        mask[i] = !!match
+        if (match) fence = match[1]
+        continue
+      }
+      mask[i] = true
+      if (match && match[1].charAt(0) === fence.charAt(0)
+          && match[1].length >= fence.length) {
+        fence = ""
+      }
+    }
+    return mask
   }
 
   readonly property real tableRowHeight: Style.space(28)
@@ -243,6 +299,7 @@ Item {
   }
 
   onMarkdownChanged: {
+    root.taskOverrides = ({})
     if (root.dragging) return
     root.overrides = ({})
     root.pendingLine = -1
@@ -297,12 +354,14 @@ Item {
           width: flick.width
           height: blockItem.isTable ? tableFrame.height
             : blockItem.isImage ? imageFrame.height
-            : blockItem.isMath ? mathFrame.height : textBlock.implicitHeight
+            : blockItem.isMath ? mathFrame.height
+            : blockItem.isTasks ? tasksColumn.implicitHeight : textBlock.implicitHeight
 
           readonly property bool isImage: modelData.kind === "image"
           readonly property bool isTable: modelData.kind === "table"
           readonly property bool isMath: modelData.kind === "math"
-          readonly property bool isText: !isImage && !isTable && !isMath
+          readonly property bool isTasks: modelData.kind === "tasks"
+          readonly property bool isText: !isImage && !isTable && !isMath && !isTasks
           readonly property bool interactive: root.editable && isImage
           readonly property var size: isImage ? modelData.size : null
           readonly property bool hasSize: !!(blockItem.size && blockItem.size.hasSize)
@@ -392,6 +451,101 @@ Item {
             font.pixelSize: Style.font.body
             lineHeight: 1.15
             onLinkActivated: function(link) { root.linkActivated(link) }
+          }
+
+          // ------------------------------------------------------- tasks
+          // Consecutive task lines share one block. Only the checkbox hit
+          // area toggles; the text keeps normal Markdown link handling.
+          Column {
+            id: tasksColumn
+            objectName: "previewTasks"
+            visible: blockItem.isTasks
+            width: blockItem.isTasks ? blockItem.width : 0
+            spacing: Style.space(3)
+
+            Repeater {
+              model: blockItem.isTasks ? modelData.items : []
+
+              delegate: Item {
+                id: taskRow
+                objectName: "previewTaskRow"
+                width: tasksColumn.width
+                height: Math.max(taskLabel.implicitHeight, Style.space(15))
+
+                readonly property real indent: Math.min(8,
+                  Math.floor(Number(modelData.indent) / 2)) * Style.space(10)
+                readonly property int noteLine: Number(modelData.line) + root.lineOffset
+                readonly property bool checked: {
+                  var value = root.taskOverrides[noteLine]
+                  return value === undefined ? !!modelData.checked : !!value
+                }
+                readonly property real boxSize: Style.space(13)
+                readonly property real boxY: Math.max(0,
+                  (Math.max(boxSize, Math.ceil(Style.font.body * 1.15)) - boxSize) / 2)
+
+                Rectangle {
+                  id: taskBox
+                  objectName: "previewTaskBox"
+                  x: taskRow.indent
+                  y: taskRow.boxY
+                  width: taskRow.boxSize
+                  height: taskRow.boxSize
+                  radius: Style.space(3)
+                  color: taskRow.checked ? Commons.Color.accent : "transparent"
+                  border.width: 1
+                  border.color: taskRow.checked
+                    ? Commons.Color.accent
+                    : Util.alpha(Commons.Color.foreground,
+                        root.editable && taskToggle.containsMouse ? 0.75 : 0.4)
+
+                  Text {
+                    anchors.centerIn: parent
+                    visible: taskRow.checked
+                    text: "✓"
+                    textFormat: Text.PlainText
+                    color: Commons.Color.background
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.caption
+                  }
+                }
+
+                Text {
+                  id: taskLabel
+                  objectName: "previewTaskLabel"
+                  x: taskRow.indent + taskRow.boxSize + Style.space(8)
+                  width: Math.max(0, taskRow.width - x)
+                  text: blockItem.isTasks ? String(modelData.content || "") : ""
+                  textFormat: Text.MarkdownText
+                  wrapMode: Text.Wrap
+                  color: Commons.Color.foreground
+                  linkColor: Commons.Color.accent
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.body
+                  lineHeight: 1.15
+                  onLinkActivated: function(link) { root.linkActivated(link) }
+                }
+
+                MouseArea {
+                  id: taskToggle
+                  objectName: "previewTaskToggle"
+                  x: taskRow.indent + (taskRow.boxSize - Style.space(18)) / 2
+                  y: taskRow.boxY + (taskRow.boxSize - Style.space(18)) / 2
+                  width: Style.space(18)
+                  height: Style.space(18)
+                  hoverEnabled: true
+                  acceptedButtons: Qt.LeftButton
+                  cursorShape: root.editable ? Qt.PointingHandCursor : Qt.ArrowCursor
+                  onClicked: {
+                    if (!root.editable || !blockItem.isTasks) return
+                    var next = {}
+                    for (var key in root.taskOverrides) next[key] = root.taskOverrides[key]
+                    next[taskRow.noteLine] = !taskRow.checked
+                    root.taskOverrides = next
+                    root.taskToggled(taskRow.noteLine)
+                  }
+                }
+              }
+            }
           }
 
           Rectangle {

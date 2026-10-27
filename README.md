@@ -313,6 +313,12 @@ anywhere on it to open the editor. Read-only notes show a **Read-only** hint
 instead, and the detached window shows **Open in the library to edit** (tables
 there are rendered, not editable).
 
+Task lines (`- [ ] buy milk`, `* [x] done`, `+ [ ] nested`) render as themed
+checkboxes in the preview. Clicking a checkbox flips `[ ]` ↔ `[x]` in the note
+and the normal autosave mirrors the change to Joplin; read-only notes show the
+state without accepting clicks, and task-looking lines inside fenced code
+blocks stay as plain code.
+
 ### Grid
 
 `Ctrl+T` in the editor inserts a 3×3 table and opens the grid; clicking a table

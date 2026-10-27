@@ -6,6 +6,7 @@ import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
 import "ImageSizing.js" as ImageSizing
+import "MarkdownFormat.js" as MarkdownFormat
 import "WritableGuard.js" as WritableGuard
 
 // A single Quill note in its own small Quickshell process. The library's
@@ -220,6 +221,16 @@ ShellRoot {
     if (!isFinite(index) || index < 0 || index >= lines.length) return
     var updated = ImageSizing.clearSize(lines[index])
     if (updated === null) return
+    replaceEditorLine(index, updated)
+  }
+
+  function toggleTaskAt(line) {
+    if (!loaded || tooLarge) return
+    var index = Math.round(Number(line))
+    var lines = String(editor.text).split("\n")
+    if (!isFinite(index) || index < 0 || index >= lines.length) return
+    var updated = MarkdownFormat.toggleTaskLine(lines[index])
+    if (updated === null || updated === lines[index]) return
     replaceEditorLine(index, updated)
   }
 
@@ -450,6 +461,7 @@ ShellRoot {
             onLinkActivated: function(link) { Qt.openUrlExternally(link) }
             onImageResized: function(line, width) { root.setImageWidth(line, width) }
             onImageReset: function(line) { root.clearImageSize(line) }
+            onTaskToggled: function(line) { root.toggleTaskAt(line) }
           }
         }
       }

@@ -23,6 +23,43 @@ function clamp(value, low, high) {
   return Math.max(low, Math.min(high, value))
 }
 
+// ------------------------------------------------------------ task lines
+// A task line is a bullet whose first token is an unchecked or checked box:
+//   - [ ] buy milk
+//   * [x] done
+//   + [ ] (empty content is allowed)
+// The preview uses parseTaskLine to draw a checkbox and toggleTaskLine to
+// rewrite only the box character, so everything else stays byte-identical.
+
+function parseTaskLine(line) {
+  var value = textOf(line)
+  var match = /^([ \t]*)([-*+])\s+\[([ xX])\]\s?(.*)$/.exec(value)
+  if (!match) return null
+  var lead = match[1]
+  var indent = 0
+  for (var i = 0; i < lead.length; i++) {
+    indent += lead.charAt(i) === "\t" ? 4 : 1
+  }
+  return {
+    indent: indent,
+    checked: match[3] === "x" || match[3] === "X",
+    content: match[4]
+  }
+}
+
+function toggleTaskLine(line) {
+  var parsed = parseTaskLine(line)
+  if (!parsed) return null
+  var value = textOf(line)
+  // Locate the box character without rebuilding the line: the marker,
+  // spacing and trailing content must survive exactly as written.
+  var match = /^([ \t]*)([-*+])(\s+)\[([ xX])\]/.exec(value)
+  if (!match) return null
+  var box = match[1].length + match[2].length + match[3].length + 1
+  var next = parsed.checked ? " " : "x"
+  return value.slice(0, box) + next + value.slice(box + 1)
+}
+
 function normaliseSelection(text, start, end) {
   var length = text.length
   var from = clamp(Math.floor(Number(start) || 0), 0, length)
