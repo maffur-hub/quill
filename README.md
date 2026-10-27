@@ -62,7 +62,8 @@ See `tools/README.md` for install steps.
 ```
 notes/       Markdown files; subfolders are folders
 trash/       same layout, for trashed notes
-attachments/ pasted images, content-addressed (created on first paste)
+attachments/ pasted images and attached files, content-addressed
+             (created on first paste or attach)
 backups/versions/  local note snapshots (newest 50 per note)
 backups/joplin/    remote Joplin bodies saved before replacement/trash
                    (newest 50 per Joplin note; see Joplin sync)
@@ -210,9 +211,9 @@ A slim toolbar sits above the editor in Edit and Split; it is hidden in
 Preview-only and disabled for trashed or read-only notes. It scrolls
 horizontally when the editor is narrow. Groups are undo/redo, inline emphasis,
 highlight/colour/size/super/subscript, a heading menu, lists and blocks,
-links/code, rule/table, an insert menu (date, time, emoji, note link) and clear
-formatting. Buttons never take keyboard focus; after an action the editor
-regains focus and the selection is restored.
+links/code, rule/table, an insert menu (date, time, emoji, attach file, note
+link) and clear formatting. Buttons never take keyboard focus; after an action
+the editor regains focus and the selection is restored.
 
 Right-clicking the editor opens a themed context menu with undo/redo,
 clipboard actions, select all, the inline formatting actions and date/time
@@ -533,8 +534,10 @@ $S attachment list                        # path, size, mtime, referenced
 $S attachment gc [--dry-run]              # delete only unreferenced files
 ```
 
-Only PNG, JPEG, GIF, WebP and BMP are accepted, up to 20 MiB. `gc` never deletes
-a file mentioned by any note, including trashed notes, and skips symlinks.
+Only PNG, JPEG, GIF, WebP and BMP are accepted from the clipboard, up to
+20 MiB; `attachment save` accepts any regular file (see **Attachments**). `gc`
+never deletes a file mentioned by any note, including trashed notes, and skips
+symlinks.
 
 ### Image sizing
 
@@ -572,11 +575,72 @@ The Joplin mirror strips a trailing `{...width/height...}` suffix from image
 tags before uploading, so Joplin users see the image without Quill's preview
 hint.
 
-**These images are not uploaded as Joplin resources yet.** `quill-joplin-sync`
-mirrors the Markdown text only, so a synced note keeps the local absolute
-attachment path instead of a Joplin resource. Uploading attachments is a
-follow-up; export/sync currently assumes the Quill data directory is available
-locally.
+Pasted images are ordinary attachments, so the next sync uploads them as Joplin
+resources (see **Attachments → Joplin**). The preview and HTML export still
+read the file from the Quill data directory.
+
+## Attachments
+
+**Attach file…** in the editor's Insert (⊕) menu copies a file into the library
+and links it from the current note. The picker is a themed in-app browser, not a
+system file dialog: click a folder to open it, use **↑ Up** to go back, tick
+**Hidden files** to show dotfiles, type in **Filter…** to narrow the list, or
+type a path in the field at the bottom — Enter there opens a directory or
+attaches a file. A single click on a file selects it; double-click it, or press
+**Attach**, to attach. The picker is not offered for trashed or read-only
+notes, or while a crash-draft banner is up. The status bar confirms
+**File attached** or shows the store's error message.
+
+The store copies the bytes to `<data>/attachments/<sha256>.<ext>` (mode 0644,
+20 MiB maximum) and links that copy. Nothing is linked in place, so the original
+can be moved or deleted afterwards without breaking the note, and the note stays
+ordinary Markdown. Identical bytes are stored once, in one note or many. Images
+are recognised by their magic bytes and get one of `.png`, `.jpg`, `.gif`,
+`.webp` or `.bmp`; any other regular file keeps its own lowercased suffix when
+that is 1–10 letters or digits, and otherwise gets `.bin`.
+
+An attached image is written as `![alt](/abs/path.png)` and any other file as
+`[alt](/abs/path.pdf)`, with angle brackets only when the path contains a space
+or parenthesis. The link is inserted on its own line at the caret; clicking it
+in the preview opens the file with the system default application. Alt text
+comes from `--name`, with square and round brackets and control characters
+stripped; without it, images fall back to `image` and other files to the source
+name without its suffix. The picker passes the chosen file's name as the alt.
+
+```bash
+S=~/.config/omarchy/plugins/matt.quill/scripts/quill-store
+$S attachment save --file PATH [--name ALT]
+$S attachment list                        # path, size, mtime, referenced
+$S attachment gc [--dry-run]              # delete only unreferenced files
+```
+
+`attachment save` prints one JSON object with `id`, `path`, `markdown`, `kind`
+(`image` or `file`), `name` (the stored basename), `size`, `mime` and `deduped`.
+It accepts any regular file; empty files, directories, FIFOs and files over
+20 MiB are refused. `attachment list` reports whether each file is referenced by
+a note. `attachment gc` deletes only unreferenced files: anything mentioned by a
+note, including a trashed note, is kept, and `--dry-run` only reports.
+
+### Joplin
+
+On the next sync, each attachment a note references is uploaded once as a
+Joplin resource and the mirrored body is rewritten to Joplin's `:/<id>` form,
+for example `![shot](:/r1a2b3c)`. The id is cached in the sync state under
+`resources`, keyed by the content-addressed filename, so later edits reuse it,
+notes sharing a file share one resource, and a resource purged in Joplin is
+uploaded again. A note mirrored before this feature gets its attachments on its
+next sync, because the rewrite changes its body once.
+
+Only files inside `attachments/` are uploaded. A link to anywhere else, or a
+symlink that resolves outside the directory, is left as written; a referenced
+file that has gone missing warns once and stays a local path in the mirrored
+body. `--dry-run` uploads nothing and writes no state; with `--verbose` it
+reports `would upload resource: <name>`.
+
+Attachments are never deleted from Joplin: resources are shared objects, and
+`--prune` still only trashes notes. `quill-joplin-restore` stays GET-only and
+leaves `:/<id>` links exactly as Joplin wrote them, so a restored note points at
+Joplin's store rather than the local `attachments/` file.
 
 ## Export
 
@@ -604,7 +668,8 @@ Joplin notebook called **Quill**. It is a thin wrapper around the proven
 note is created per file, Quill's subfolders become nested notebooks, and the
 relpath → note-id mapping lives in `~/.local/share/quill-joplin/state.json`.
 Joplin's copy is only written to; an edit made in Joplin is skipped as a
-conflict unless you pass `--force`.
+conflict unless you pass `--force`. Attachments referenced by a note are
+uploaded as Joplin resources (see **Attachments → Joplin**).
 
 Before the mirror replaces a Joplin note — and before `--prune` trashes one —
 it fetches and saves the remote body under
@@ -698,9 +763,10 @@ and path defaults for discoverability. It is **not read** by the shared sync
 tool: the flags in `quill-joplin-sync` are the source of truth. The wrapper's
 environment overrides are `QUILL_JOPLIN_NOTES_DIR`, `QUILL_JOPLIN_STATE`,
 `QUILL_JOPLIN_NOTEBOOK`, `QUILL_JOPLIN_API_URL`, `QUILL_JOPLIN_BACKUP_DIR`,
-`QUILL_JOPLIN_QUEUE_DIR`, `QUILL_JOPLIN_QUEUE_BACKOFF` and
-`QUILL_JOPLIN_QUEUE_MAX_ATTEMPTS`; Quill's QML side also honours
-`QUILL_JOPLIN_SYNC_PATH` and `QUILL_JOPLIN_AUTOSYNC` (see above).
+`QUILL_JOPLIN_ATTACHMENTS_DIR`, `QUILL_JOPLIN_QUEUE_DIR`,
+`QUILL_JOPLIN_QUEUE_BACKOFF` and `QUILL_JOPLIN_QUEUE_MAX_ATTEMPTS`; Quill's QML
+side also honours `QUILL_JOPLIN_SYNC_PATH` and `QUILL_JOPLIN_AUTOSYNC` (see
+above). `tools/README.md` describes the attachment store override.
 
 One quirk comes from the shared tool and is deliberately not patched there:
 
@@ -744,7 +810,7 @@ $S backlinks <id>
 $S preview <id>                           # wiki/tag links become quill:// URLs
 $S import-omanano
 $S index --rebuild
-$S attachment save --file IMG | --stdin [--name ALT]
+$S attachment save --file PATH | --stdin [--name ALT]
 $S attachment list
 $S attachment gc [--dry-run]
 $S stats

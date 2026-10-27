@@ -30,12 +30,19 @@
 # keeping the newest 50 revisions per note. A failed backup aborts that change.
 # Pass --backup-dir DIR to use another location.
 #
+# Local attachments are uploaded to Joplin once per content-addressed filename
+# and the note's Markdown is rewritten to Joplin's :/<resource id> form, so the
+# same image is reused across notes. Set QUILL_JOPLIN_ATTACHMENTS_DIR to point
+# at another attachment store. Joplin resources are never deleted by this
+# wrapper (they are shared objects; --prune only trashes notes).
+#
 # Environment overrides:
 #   QUILL_JOPLIN_NOTES_DIR        default ~/.local/share/quill/notes
 #   QUILL_JOPLIN_STATE            default ~/.local/share/quill-joplin/state.json
 #   QUILL_JOPLIN_NOTEBOOK         default Quill
 #   QUILL_JOPLIN_API_URL          default http://127.0.0.1:41184
 #   QUILL_JOPLIN_BACKUP_DIR       default ~/.local/share/quill/backups/joplin
+#   QUILL_JOPLIN_ATTACHMENTS_DIR  default ~/.local/share/quill/attachments
 #   QUILL_JOPLIN_QUEUE_DIR        default ~/.local/share/quill-joplin/queue
 #   QUILL_JOPLIN_QUEUE_BACKOFF    default "10 30 60 120 300 600 900" (seconds;
 #                                 the last value repeats)
@@ -54,6 +61,7 @@ state="${QUILL_JOPLIN_STATE:-$HOME/.local/share/quill-joplin/state.json}"
 notebook="${QUILL_JOPLIN_NOTEBOOK:-Quill}"
 api_url="${QUILL_JOPLIN_API_URL:-http://127.0.0.1:41184}"
 backup_dir="${QUILL_JOPLIN_BACKUP_DIR:-$HOME/.local/share/quill/backups/joplin}"
+attachments_dir="${QUILL_JOPLIN_ATTACHMENTS_DIR:-$HOME/.local/share/quill/attachments}"
 queue_dir="${QUILL_JOPLIN_QUEUE_DIR:-$HOME/.local/share/quill-joplin/queue}"
 backoff_spec="${QUILL_JOPLIN_QUEUE_BACKOFF:-10 30 60 120 300 600 900}"
 max_attempts="${QUILL_JOPLIN_QUEUE_MAX_ATTEMPTS:-8}"
@@ -178,6 +186,7 @@ function run_sync() {
     --state "$state" \
     --notebook "$notebook" \
     --api-url "$api_url" \
+    --attachments-dir "$attachments_dir" \
     "${backup_args[@]}" \
     "$@"
   local status=$?

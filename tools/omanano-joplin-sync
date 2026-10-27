@@ -10,13 +10,20 @@ Titles normally come from the first usable line (OmaNano's algorithm). Quill
 notes may open with a YAML frontmatter block: its top-level ``title:`` wins,
 and the block is stripped from the body sent to Joplin.
 
+With ``--attachments-dir DIR`` (off by default, so OmaNano is unchanged),
+local link/image destinations under DIR are uploaded as Joplin resources and
+rewritten to ``:/<resource id>``. Resource ids are cached in the state file
+and reused; pruned notes never delete shared resources.
+
 Exit codes: 0 = ok, 1 = real failure, 3 = Joplin unreachable (Joplin not running).
 """
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
+import mimetypes
 import os
 import re
 import sys
@@ -46,6 +53,10 @@ DEFAULT_CONFIG = {"notebook": "OmaNano", "mirror_folders": True, "api_url": DEFA
 # from the body only when it directly follows a Markdown image tag.
 IMAGE_SIZE_RE = re.compile(
     r"(!\[[^\]]*\]\([^)]*\))[ \t]*\{[^{}]*(?:width|height)\s*=\s*\d+(?:px)?[^{}]*\}")
+# Markdown link/image destinations, angle-bracket form implied by the spec.
+RESOURCE_LINK_RE = re.compile(r"(!?\[[^\]]*\]\()(<[^>]*>|[^)\s]+)(\))")
+RESOURCE_SCHEMES = ("#", "mailto:")
+RESOURCE_PREFIX = "attachments/"
 
 class ConfigError(Exception):
     """Bad user configuration or environment."""
@@ -219,8 +230,11 @@ def load_token(cfg):
     return str(settings["api.token"])
 
 def load_state(path, reporter):
-    """Mappings only; Joplin remains authoritative if this file is lost."""
-    state = {"version": 1, "folders": {}, "notes": {}}
+    """Mappings only; Joplin remains authoritative if this file is lost.
+
+    Unknown top-level keys are preserved so other tools can share the file.
+    """
+    state = {"version": 1, "folders": {}, "notes": {}, "resources": {}}
     if not path.exists():
         return state
     try:
@@ -230,12 +244,16 @@ def load_state(path, reporter):
     except (OSError, ValueError) as exc:
         reporter.warn(f"warning: ignoring unreadable state {path}: {exc}")
         return state
+    state = dict(data)
     state["folders"] = data["folders"] if isinstance(data.get("folders"), dict) else {}
     state["notes"] = data["notes"] if isinstance(data.get("notes"), dict) else {}
+    state["resources"] = (data["resources"]
+                          if isinstance(data.get("resources"), dict) else {})
     return state
 
 def save_state(path, state):
     """Atomic write: temp file in the same dir, fsync, rename, mode 0600."""
+    state.setdefault("resources", {})
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         os.chmod(path.parent, 0o700)
@@ -374,12 +392,17 @@ def backup_joplin_body(note, backup_dir, retention=BACKUP_RETENTION):
 
 class Syncer:
     def __init__(self, api, state, state_path, cfg, notes_dir, reporter, *,
-                 dry_run, force, prune, backup_dir=None):
+                 dry_run, force, prune, backup_dir=None, attachments_dir=None):
         self.api, self.state, self.state_path = api, state, state_path
         self.cfg, self.notes_dir, self.reporter = cfg, notes_dir, reporter
         self.dry_run, self.force, self.prune = dry_run, force, prune   # explicit mode
         self.backup_dir = Path(backup_dir).expanduser() if backup_dir else None
+        self.attachments_dir = (Path(attachments_dir).expanduser().resolve()
+                                if attachments_dir else None)
         self.folders, self.notes = state["folders"], state["notes"]
+        self.resources = state.setdefault("resources", {})   # name -> {id,mime,size}
+        self.validated_resources = set()  # ids confirmed to exist this run
+        self.resource_warned = set()      # names already warned about
         self.folder_index = {}          # (parent_id, title) -> folder id
         self.note_index = None          # source_url -> note (lazy scan)
         self.root_id, self.dirty = "", False
@@ -468,6 +491,98 @@ class Syncer:
             self.reporter.warn(f"warning: {message}; left it in place")
             return False
         return True
+    # -- attachments (opt-in) -------------------------------------------
+    def resource_target(self, dest):
+        """Resolve a Markdown destination to a file inside --attachments-dir.
+
+        Returns a usable Path, or None to leave the destination untouched.
+        Scheme URLs, anchors and Joplin ``:/id`` links are never candidates.
+        """
+        if dest.startswith("<") and dest.endswith(">"):
+            dest = dest[1:-1].strip()
+        if (not dest or dest.startswith(RESOURCE_SCHEMES)
+                or "://" in dest or dest.startswith(":/")):
+            return None
+        if dest.startswith(RESOURCE_PREFIX):
+            target = self.attachments_dir / dest[len(RESOURCE_PREFIX):]
+        elif os.path.isabs(dest):
+            target = Path(dest).expanduser()
+        else:
+            return None
+        real = Path(os.path.realpath(str(target)))
+        root = Path(os.path.realpath(str(self.attachments_dir)))
+        try:
+            real.relative_to(root)   # symlinks may not escape the store
+        except ValueError:
+            key = "escape:" + dest
+            if key not in self.resource_warned:
+                self.resource_warned.add(key)
+                self.reporter.warn(
+                    f"warning: attachment outside {self.attachments_dir} skipped: {dest}")
+            return None
+        if not real.is_file():
+            name = real.name or dest
+            if name not in self.resource_warned:
+                self.resource_warned.add(name)
+                self.reporter.warn(f"warning: attachment not found: {name}")
+            return None
+        return real
+
+    def resource_id(self, path):
+        """Joplin resource id for one local file, uploading it when needed."""
+        name = path.name
+        cached = self.resources.get(name) or {}
+        if self.dry_run:
+            if not cached.get("id"):
+                self.reporter.detail(f"would upload resource: {name}")
+            return f"dry-run-{name}"
+        if cached.get("id") and name in self.validated_resources:
+            return cached["id"]
+        if cached.get("id"):
+            # Resources can be purged in Joplin; trust the id only if it exists.
+            try:
+                found = self.api.request(
+                    "GET", f"/resources/{cached['id']}", {"fields": "id"})
+            except JoplinError as exc:
+                if exc.code != 404:
+                    raise
+                found = None
+            if found is not None and found.get("id"):
+                self.validated_resources.add(name)
+                return cached["id"]
+            self.reporter.detail(f"resource missing in Joplin; re-uploading: {name}")
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            self.reporter.warn(f"warning: cannot read attachment {name}: {exc}")
+            return None
+        mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        result = self.api.request("POST", "/resources", body={
+            "title": name, "mime": mime,
+            "body": base64.b64encode(data).decode("ascii")})
+        resource_id = result.get("id")
+        if not resource_id:
+            raise JoplinError(f"POST /resources returned no id for {name}")
+        self.resources[name] = {"id": resource_id, "mime": mime, "size": len(data)}
+        self.validated_resources.add(name)
+        self.dirty = True
+        self.reporter.detail(f"resource uploaded: {name} (:/{resource_id})")
+        return resource_id
+
+    def rewrite_attachments(self, body):
+        """Point local attachment links at their Joplin resource ids."""
+        if self.attachments_dir is None:
+            return body
+        def replace(match):
+            path = self.resource_target(match.group(2))
+            if path is None:
+                return match.group(0)
+            resource_id = self.resource_id(path)
+            if resource_id is None:
+                return match.group(0)
+            return f"{match.group(1)}:/{resource_id}{match.group(3)}"
+        return RESOURCE_LINK_RE.sub(replace, body)
+
     def create(self, rel, title, body, parent_id, digest):
         self.counts["created"] += 1
         self.reporter.detail(f"created: {rel}  ({title})")
@@ -478,6 +593,7 @@ class Syncer:
         if not result.get("id"):
             raise JoplinError(f"POST /notes returned no id for {rel}")
         self.notes[rel] = {"id": result["id"], "hash": digest, "title": title,
+                           "body_hash": hashlib.sha256(body.encode("utf-8")).hexdigest(),
                            "parent_id": parent_id, "updated_time": result.get("updated_time")}
         self.dirty = True
     def update(self, rel, entry, title, body, parent_id, digest):
@@ -491,6 +607,7 @@ class Syncer:
         updated_time = result.get("updated_time") or (
             self.remote_meta(entry["id"]) or {}).get("updated_time")
         entry.update({"hash": digest, "title": title, "parent_id": parent_id,
+                      "body_hash": hashlib.sha256(body.encode("utf-8")).hexdigest(),
                       "updated_time": updated_time})
         self.dirty = True
     def sync_file(self, rel, path):
@@ -506,11 +623,14 @@ class Syncer:
             return self.skip(rel, "not valid UTF-8")
         frontmatter, note_body = split_frontmatter(body)
         note_body = strip_image_sizes(note_body)
+        rewritten_body = self.rewrite_attachments(note_body)
+        rewrite_changed = rewritten_body != note_body
+        body = rewritten_body
         title = ((frontmatter_title(frontmatter) if frontmatter is not None else "")
-                 or derive_title(note_body))
-        body = note_body
+                 or derive_title(body))
         # Hash the file as written: a frontmatter-only edit must still update.
         digest = hashlib.sha256(raw).hexdigest()
+        body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
         folder_rel = rel.rsplit("/", 1)[0] if "/" in rel else ""
         parent_id = self.ensure_folder(folder_rel)
 
@@ -527,8 +647,15 @@ class Syncer:
         if entry is None:
             return self.create(rel, title, body, parent_id, digest)
 
-        if (entry.get("hash") == digest and entry.get("title") == title
-                and entry.get("parent_id") == parent_id):
+        same_source = (entry.get("hash") == digest and entry.get("title") == title
+                       and entry.get("parent_id") == parent_id)
+        if same_source and entry.get("body_hash") == body_hash:
+            self.counts["unchanged"] += 1
+            return
+        if same_source and "body_hash" not in entry and not rewrite_changed:
+            # Migration: the body is unchanged, so just record its hash.
+            entry["body_hash"] = body_hash
+            self.dirty = True
             self.counts["unchanged"] += 1
             return
         if not self.force:
@@ -602,6 +729,8 @@ def parse_args(argv):
                        "--api-url": "Joplin Data API base URL", "--token": "Joplin API token",
                        "--notes-dir": "OmaNano notes directory",
                        "--state": "state file path",
+                       "--attachments-dir": "upload attachments found under this directory"
+                                           " (default: off; local paths are left as text)",
                        "--backup-dir": "save remote bodies before replacing/trashing"
                                        " (default: off; env OMANANO_JOPLIN_BACKUP_DIR)"}.items():
         p.add_argument(flag, help=text)
@@ -630,6 +759,7 @@ def main(argv=None):
         token = args.token or os.environ.get("OMANANO_JOPLIN_TOKEN") or load_token(cfg)
         backup_dir = (args.backup_dir or os.environ.get("OMANANO_JOPLIN_BACKUP_DIR")
                       or "").strip()
+        attachments_dir = (args.attachments_dir or "").strip()
     except ConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_ERROR
@@ -643,7 +773,8 @@ def main(argv=None):
         syncer = Syncer(api, load_state(state_path, reporter), state_path, cfg,
                         notes_dir, reporter, dry_run=args.dry_run,
                         force=args.force, prune=args.prune,
-                        backup_dir=backup_dir or None)
+                        backup_dir=backup_dir or None,
+                        attachments_dir=attachments_dir or None)
         counts = syncer.run()
     except ConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
