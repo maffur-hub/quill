@@ -1,8 +1,10 @@
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Templates as T
 import Quickshell.Io
 import qs.Commons
 import qs.Commons as Commons
+import qs.Ui
 import "MarkdownFormat.js" as MarkdownFormat
 
 // Markdown editor with a syntax-highlighted underlay.
@@ -25,6 +27,10 @@ TextArea {
   property bool pastingImage: false
   property string pasteOutput: ""
   property string pasteError: ""
+
+  // Replaces the stock white Qt text menu. Exposed for the e2e harness.
+  readonly property var contextMenuRef: editorMenu
+  T.ContextMenu.menu: editorMenu
 
   // A replacement edit becomes one native remove plus one native insert. Keep
   // the operation count so the toolbar's Undo/Redo can replay the whole
@@ -466,6 +472,31 @@ TextArea {
     root.formatUndoPending = false
   }
 
+  // Date/time are computed at menu click time. MarkdownFormat.planDate accepts
+  // YYYY-MM-DD and planTime HH:MM, matching the toolbar's insert menu.
+  function pad2(value) {
+    return (value < 10 ? "0" : "") + value
+  }
+
+  function isoDate(date) {
+    return date.getFullYear() + "-" + root.pad2(date.getMonth() + 1) + "-"
+      + root.pad2(date.getDate())
+  }
+
+  function isoTime(date) {
+    return root.pad2(date.getHours()) + ":" + root.pad2(date.getMinutes())
+  }
+
+  function insertDate() {
+    root.applyFormat("date", root.isoDate(new Date()))
+    root.forceActiveFocus()
+  }
+
+  function insertTime() {
+    root.applyFormat("time", root.isoTime(new Date()))
+    root.forceActiveFocus()
+  }
+
   function insertPastedImage(markdown) {
     var position = Math.max(0, Math.min(cursorPosition, text.length))
     // Put the image on its own line, then leave the caret on a fresh line so
@@ -571,6 +602,134 @@ TextArea {
       pasteProcess.running = false
       root.pasteAsText()
       root.pasteFailed("Image paste timed out")
+    }
+  }
+
+  // Themed replacement for Qt's stock Undo/Redo/Cut/Copy/Paste/Delete menu.
+  // Formatting actions reuse the same pure planner as the toolbar, so both
+  // hosts (Library and Detached) get identical edits with no Library signals.
+  Menu {
+    id: editorMenu
+    objectName: "editorContextMenu"
+    width: Style.space(200)
+    padding: Style.space(4)
+    popupType: Qt.platform.pluginName !== "wayland" ? Popup.Window : Popup.Item
+    palette.window: Commons.Color.menu.background
+    palette.windowText: Commons.Color.menu.text
+    palette.text: Commons.Color.menu.text
+    palette.buttonText: Commons.Color.menu.text
+    palette.light: Commons.Color.menu.selectedBackground
+    palette.midlight: Util.alpha(Commons.Color.foreground, 0.12)
+    palette.mid: Util.alpha(Commons.Color.foreground, 0.16)
+    palette.dark: Commons.Color.menu.border
+    palette.shadow: "#000000"
+    onClosed: root.forceActiveFocus()
+
+    background: BorderSurface {
+      color: Commons.Color.menu.background
+      borderSpec: Border.controlSpec("normal", Commons.Color.menu.border,
+        Commons.Color.accent)
+      radius: Style.cornerRadius
+    }
+
+    ContextMenuItem {
+      text: "Undo"
+      enabled: !root.readOnly && root.canUndo
+      onTriggered: root.undoFormat()
+    }
+    ContextMenuItem {
+      text: "Redo"
+      enabled: !root.readOnly && root.canRedo
+      onTriggered: root.redoFormat()
+    }
+
+    MenuSeparator {}
+
+    ContextMenuItem {
+      text: "Cut"
+      enabled: !root.readOnly && root.selectedText.length > 0
+      onTriggered: root.cut()
+    }
+    ContextMenuItem {
+      text: "Copy"
+      enabled: root.selectedText.length > 0
+      onTriggered: root.copy()
+    }
+    ContextMenuItem {
+      text: "Paste"
+      enabled: !root.readOnly && !root.pastingImage
+      onTriggered: root.beginImagePaste()
+    }
+    ContextMenuItem {
+      text: "Delete"
+      enabled: !root.readOnly && root.selectedText.length > 0
+      onTriggered: {
+        root.remove(Math.min(root.selectionStart, root.selectionEnd),
+          Math.max(root.selectionStart, root.selectionEnd))
+        root.forceActiveFocus()
+      }
+    }
+
+    MenuSeparator {}
+
+    ContextMenuItem {
+      text: "Select all"
+      enabled: root.text.length > 0
+      onTriggered: {
+        root.selectAll()
+        root.forceActiveFocus()
+      }
+    }
+
+    MenuSeparator {}
+
+    ContextMenuItem {
+      text: "Bold"
+      enabled: !root.readOnly
+      onTriggered: root.applyFormat("bold")
+    }
+    ContextMenuItem {
+      text: "Italic"
+      enabled: !root.readOnly
+      onTriggered: root.applyFormat("italic")
+    }
+    ContextMenuItem {
+      text: "Underline"
+      enabled: !root.readOnly
+      onTriggered: root.applyFormat("underline")
+    }
+    ContextMenuItem {
+      text: "Strikethrough"
+      enabled: !root.readOnly
+      onTriggered: root.applyFormat("strike")
+    }
+    ContextMenuItem {
+      text: "Highlight"
+      enabled: !root.readOnly
+      onTriggered: root.applyFormat("highlight")
+    }
+    ContextMenuItem {
+      text: "Inline code"
+      enabled: !root.readOnly
+      onTriggered: root.applyFormat("code")
+    }
+    ContextMenuItem {
+      text: "Clear formatting"
+      enabled: !root.readOnly
+      onTriggered: root.applyFormat("clear")
+    }
+
+    MenuSeparator {}
+
+    ContextMenuItem {
+      text: "Insert date"
+      enabled: !root.readOnly
+      onTriggered: root.insertDate()
+    }
+    ContextMenuItem {
+      text: "Insert time"
+      enabled: !root.readOnly
+      onTriggered: root.insertTime()
     }
   }
 
