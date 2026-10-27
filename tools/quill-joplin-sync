@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# quill-joplin-sync - mirror Quill's Markdown notes into a Joplin notebook.
+#
+# The actual mirroring is done by the shared omanano-joplin-sync tool; this
+# wrapper only pins Quill's paths, notebook name and API URL. Command-line
+# flags are the source of truth. ~/.config/quill-joplin/config.json mirrors
+# these defaults for discoverability only: the shared script does not read it.
+#
+# Usage:
+#   quill-joplin-sync                 # sync now (Joplin must be running)
+#   quill-joplin-sync --dry-run       # show what would change, write nothing
+#   quill-joplin-sync --verbose       # per-note detail
+#   quill-joplin-sync --json          # machine-readable summary
+#   quill-joplin-sync --prune         # also trash Joplin notes deleted locally
+#
+# Before replacing a Joplin note (or trashing one with --prune), the shared
+# tool saves the remote body under
+#   ~/.local/share/quill/backups/joplin/<joplin-note-id>/
+# keeping the newest 50 revisions per note. A failed backup aborts that change.
+# Pass --backup-dir DIR to use another location.
+#
+# Environment overrides:
+#   QUILL_JOPLIN_NOTES_DIR   default ~/.local/share/quill/notes
+#   QUILL_JOPLIN_STATE       default ~/.local/share/quill-joplin/state.json
+#   QUILL_JOPLIN_NOTEBOOK    default Quill
+#   QUILL_JOPLIN_API_URL     default http://127.0.0.1:41184
+#   QUILL_JOPLIN_BACKUP_DIR  default ~/.local/share/quill/backups/joplin
+#
+# Exit status is the shared sync tool's: 0 ok, 1 failure, 3 Joplin unreachable.
+# Tag mirroring (quill-joplin-tags) runs afterwards, is best-effort, and never
+# changes that status.
+set -uo pipefail
+
+sync_tool="${QUILL_JOPLIN_SYNC_TOOL:-$HOME/.local/bin/omanano-joplin-sync}"
+tags_tool="${QUILL_JOPLIN_TAGS_TOOL:-$HOME/.local/bin/quill-joplin-tags}"
+notes_dir="${QUILL_JOPLIN_NOTES_DIR:-$HOME/.local/share/quill/notes}"
+state="${QUILL_JOPLIN_STATE:-$HOME/.local/share/quill-joplin/state.json}"
+notebook="${QUILL_JOPLIN_NOTEBOOK:-Quill}"
+api_url="${QUILL_JOPLIN_API_URL:-http://127.0.0.1:41184}"
+backup_dir="${QUILL_JOPLIN_BACKUP_DIR:-$HOME/.local/share/quill/backups/joplin}"
+
+if [[ ! -x "$sync_tool" ]]; then
+  echo "error: sync tool not found or not executable: $sync_tool" >&2
+  exit 1
+fi
+
+# Preserve an explicit --backup-dir (either spelling) from the caller.
+backup_args=()
+caller_backup=0
+for arg in "$@"; do
+  case "$arg" in
+    --backup-dir|--backup-dir=*) caller_backup=1 ;;
+  esac
+done
+if (( caller_backup == 0 )); then
+  backup_args=(--backup-dir "$backup_dir")
+fi
+
+"$sync_tool" \
+  --notes-dir "$notes_dir" \
+  --state "$state" \
+  --notebook "$notebook" \
+  --api-url "$api_url" \
+  "${backup_args[@]}" \
+  "$@"
+status=$?
+
+# Tags are a follow-up pass, only after a sync that actually wrote to Joplin.
+# A dry run made no changes, and a failed/unreachable sync has nothing to tag.
+dry_run=0
+for arg in "$@"; do
+  [[ "$arg" == "--dry-run" ]] && dry_run=1
+done
+
+if (( status == 0 && dry_run == 0 )) && [[ -x "$tags_tool" ]]; then
+  # Forward only the options the tag helper understands. --api-url/--token may
+  # appear after the wrapper's own defaults (argparse: last one wins).
+  tag_args=(--notes-dir "$notes_dir" --state "$state" --api-url "$api_url")
+  args=("$@")
+  for ((i = 0; i < ${#args[@]}; i++)); do
+    case "${args[i]}" in
+      --api-url|--token)
+        if (( i + 1 < ${#args[@]} )); then
+          tag_args+=("${args[i]}" "${args[i + 1]}")
+          ((i++))
+        fi
+        ;;
+      --quiet|--json)
+        tag_args+=("${args[i]}")
+        ;;
+    esac
+  done
+  "$tags_tool" "${tag_args[@]}" >/dev/null 2>&1 || true
+fi
+
+exit "$status"

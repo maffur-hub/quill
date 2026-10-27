@@ -1,0 +1,672 @@
+#!/usr/bin/env python3
+"""omanano-joplin-sync - one-way mirror of OmaNano Markdown notes into Joplin.
+
+One Joplin note per OmaNano ``*.md`` file (also shared by Quill), in a dedicated
+notebook mirroring the notes' subdirectories. Local files are the source of
+truth; Joplin is only written to, except that a note edited in Joplin is not
+overwritten unless --force.
+
+Titles normally come from the first usable line (OmaNano's algorithm). Quill
+notes may open with a YAML frontmatter block: its top-level ``title:`` wins,
+and the block is stripped from the body sent to Joplin.
+
+Exit codes: 0 = ok, 1 = real failure, 3 = Joplin unreachable (Joplin not running).
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+EXIT_OK, EXIT_ERROR, EXIT_NO_JOPLIN = 0, 1, 3
+DEFAULT_API = "http://127.0.0.1:41184"
+DEFAULT_NOTES_DIR = "~/.local/share/omanano/notes"
+DEFAULT_STATE = "~/.local/share/omanano-joplin/state.json"
+CONFIG_PATH = Path("~/.config/omanano-joplin/config.json").expanduser()
+JOPLIN_SETTINGS = Path("~/.config/joplin-desktop/settings.json").expanduser()
+TIMEOUT = 8                        # seconds per HTTP request
+CONFLICT_WINDOW_MS = 2000          # tolerated clock drift
+MAX_BODY_BYTES = 4 * 1024 * 1024   # practical Joplin note size limit
+BACKUP_RETENTION = 50              # newest remote-body backups kept per note
+SOURCE_PREFIX = "omanano://"
+NOT_FOUND_HINT = ("Joplin is not running, or Options → Web Clipper → Enable web clipper service is off")
+DEFAULT_CONFIG = {"notebook": "OmaNano", "mirror_folders": True, "api_url": DEFAULT_API,
+                  "notes_dir": DEFAULT_NOTES_DIR}
+# Quill can pin an image's preview width: ![alt](path){width=320}. Joplin does
+# not understand that suffix and would show it as literal text, so strip it
+# from the body only when it directly follows a Markdown image tag.
+IMAGE_SIZE_RE = re.compile(
+    r"(!\[[^\]]*\]\([^)]*\))[ \t]*\{[^{}]*(?:width|height)\s*=\s*\d+(?:px)?[^{}]*\}")
+
+class ConfigError(Exception):
+    """Bad user configuration or environment."""
+
+class JoplinError(Exception):
+    """Unexpected API response (4xx, or a 5xx that failed twice)."""
+    def __init__(self, message, code=0):
+        super().__init__(message)
+        self.code = code
+
+class Reporter:
+    """Quiet/verbose/JSON aware output; stdout stays cron-friendly."""
+    def __init__(self, quiet=False, verbose=False, as_json=False):
+        self.quiet, self.verbose, self.as_json = quiet, verbose, as_json
+        self.warnings = []
+    def detail(self, msg):
+        if self.verbose and not self.quiet and not self.as_json: print(msg)
+    def warn(self, msg):
+        self.warnings.append(msg)
+        if not self.as_json and not self.quiet:
+            print(msg, file=sys.stderr)
+
+class Joplin:
+    """Tiny Joplin Data API client (token in query string, as Joplin requires)."""
+    def __init__(self, base, token):
+        self.base, self.token = base.rstrip("/"), token   # token never logged
+    def _url(self, path, params=None):
+        query = dict(params or {})
+        query["token"] = self.token
+        return f"{self.base}{path}?{urllib.parse.urlencode(query)}"
+    def request(self, method, path, params=None, body=None):
+        payload = json.dumps(body).encode("utf-8") if body is not None else None
+        for attempt in (1, 2):   # retry once on 5xx / connection reset
+            req = urllib.request.Request(
+                self._url(path, params), data=payload, method=method,
+                headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+                    raw = resp.read()
+                    return json.loads(raw) if raw else {}
+            except urllib.error.HTTPError as exc:
+                text = exc.read().decode("utf-8", "replace")[:300]
+                if exc.code >= 500 and attempt == 1:
+                    time.sleep(0.5); continue
+                raise JoplinError(
+                    f"HTTP {exc.code} on {method} {path}: {text}", exc.code) from exc
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                if attempt == 1:
+                    time.sleep(0.5); continue
+                raise JoplinError(f"{method} {path}: {exc}") from exc
+        raise JoplinError(f"{method} {path}: retry failed")
+    def ping(self):
+        """True only when the clipper service answers 200 on /ping."""
+        try:
+            with urllib.request.urlopen(self._url("/ping"), timeout=TIMEOUT) as resp:
+                return resp.status == 200
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError):
+            return False
+    def get_all(self, path, params=None):
+        """Read every page of a collection endpoint."""
+        items, page = [], 1
+        while True:
+            query = dict(params or {}, page=page, limit=100)
+            chunk = self.request("GET", path, query)
+            items.extend(chunk.get("items") or [])
+            if not chunk.get("has_more") or page >= 100:
+                return items   # Joplin caps page size at 100
+            page += 1
+
+def derive_title(body):
+    """Replicate OmaNano's title derivation from the first usable line.
+
+    Fallback only when a note has no frontmatter ``title:`` (see
+    split_frontmatter); files without frontmatter always come here.
+    """
+    for line in body.splitlines():
+        text = line.strip()
+        if not text or text == "---":
+            continue
+        text = re.sub(r"^#{1,6}\s+", "", text)                  # heading
+        text = re.sub(r"^[-*+]\s+(?:\[[ xX]\]\s*)?", "", text)  # list/task
+        text = re.sub(r"[`*_~]", "", text).strip()              # inline markup
+        if text:
+            return text[:120]
+    return "Untitled"
+
+def strip_image_sizes(body):
+    """Drop Quill's {width=...}/{height=...} hint from Markdown image tags."""
+    return IMAGE_SIZE_RE.sub(r"\1", body)
+
+def split_frontmatter(text):
+    """Split a leading YAML frontmatter block off a note.
+
+    The block starts on the first non-blank line with exactly ``---`` and ends
+    at a line that is exactly ``---`` or ``...``. Returns ``(frontmatter,
+    body)``; when there is no block, returns ``(None, text)`` unchanged.
+    """
+    pos = 1 if text.startswith("\ufeff") else 0
+    while True:                                   # skip leading blank lines
+        end = text.find("\n", pos)
+        if end < 0:
+            return None, text
+        if text[pos:end].rstrip("\r").strip():
+            break
+        pos = end + 1
+    if text[pos:end].rstrip("\r") != "---":
+        return None, text
+    content_start = end + 1                       # first line inside the block
+    scan = content_start
+    while True:
+        end = text.find("\n", scan)
+        line = text[scan:end if end >= 0 else len(text)].rstrip("\r")
+        if line in ("---", "..."):
+            body = text[end + 1:] if end >= 0 else ""
+            if body.startswith("\r\n"):
+                body = body[2:]
+            elif body.startswith("\n"):
+                body = body[1:]                   # the blank line after the block
+            return text[content_start:scan], body
+        if end < 0:
+            return None, text                     # unterminated: not frontmatter
+        scan = end + 1
+
+def frontmatter_title(frontmatter):
+    """Top-level ``title:`` value from a frontmatter block ('' when absent)."""
+    for line in frontmatter.splitlines():
+        if line[:1].isspace():                    # nested/indented key
+            continue
+        match = re.match(r"title\s*:\s*(.*?)\s*$", line)
+        if not match:
+            continue
+        value = match.group(1).strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1].strip()
+        if value:
+            return value[:120]
+    return ""
+
+def load_config():
+    """Read config, creating it with defaults on first use."""
+    if not CONFIG_PATH.exists():
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_PATH.write_text(json.dumps(DEFAULT_CONFIG, indent=2) + "\n",
+                               encoding="utf-8")
+        return dict(DEFAULT_CONFIG)
+    try:
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigError(f"cannot read {CONFIG_PATH}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ConfigError(f"{CONFIG_PATH} must contain a JSON object")
+    cfg = dict(DEFAULT_CONFIG, **{k: v for k, v in data.items() if v is not None})
+    if not isinstance(cfg.get("notebook"), str) or not cfg["notebook"].strip():
+        raise ConfigError("config: 'notebook' must be a non-empty string")
+    if not isinstance(cfg.get("mirror_folders"), bool):
+        raise ConfigError("config: 'mirror_folders' must be true or false")
+    return cfg
+
+def load_token(cfg):
+    """Token from config or Joplin's settings.json (never hardcoded)."""
+    if cfg.get("api_token"):
+        return str(cfg["api_token"])   # explicit override, e.g. a second Joplin profile
+    try:
+        settings = json.loads(JOPLIN_SETTINGS.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigError(f"no API token: pass --token, set OMANANO_JOPLIN_TOKEN, "
+                          f"or check {JOPLIN_SETTINGS} ({exc})") from exc
+    if not settings.get("api.token"):
+        raise ConfigError(f"no API token in {JOPLIN_SETTINGS} (Options → Web Clipper); "
+                          "pass --token or set OMANANO_JOPLIN_TOKEN")
+    return str(settings["api.token"])
+
+def load_state(path, reporter):
+    """Mappings only; Joplin remains authoritative if this file is lost."""
+    state = {"version": 1, "folders": {}, "notes": {}}
+    if not path.exists():
+        return state
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("not a JSON object")
+    except (OSError, ValueError) as exc:
+        reporter.warn(f"warning: ignoring unreadable state {path}: {exc}")
+        return state
+    state["folders"] = data["folders"] if isinstance(data.get("folders"), dict) else {}
+    state["notes"] = data["notes"] if isinstance(data.get("notes"), dict) else {}
+    return state
+
+def save_state(path, state):
+    """Atomic write: temp file in the same dir, fsync, rename, mode 0600."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path.parent, 0o700)
+    except OSError:
+        pass
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".state-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(state, indent=2, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, str(path))   # rename is atomic on the same filesystem
+    except BaseException:
+        try: os.unlink(tmp)
+        except OSError: pass
+        raise
+
+# --------------------------------------------------------------------------
+# Joplin-side backups
+#
+# Before this tool replaces or trashes a Joplin note it saves the remote body
+# it is about to lose. Backups are one Markdown file per revision, grouped by
+# Joplin note id, with a small frontmatter header so the *remote* body and
+# metadata survive independently of Quill's local state. The API token is never
+# part of a backup or a filename.
+
+BACKUP_HEADER_RE = re.compile(r"\A---\n(.*?)\n---\n", re.DOTALL)
+BACKUP_SHA_RE = re.compile(r"^body_sha256:\s*([0-9a-f]{64})\s*$", re.MULTILINE)
+
+def _backup_slug(title):
+    """Filename-safe, human-readable title fragment (never empty)."""
+    value = re.sub(r"[^A-Za-z0-9._-]+", "-", str(title or "")).strip("-._")
+    return value[:60] or "untitled"
+
+def _backup_note_dir(backup_dir, note_id):
+    """Per-note directory, with the id sanitised so it cannot traverse."""
+    ident = re.sub(r"[^A-Za-z0-9._-]+", "_", str(note_id or "")).strip("._")
+    if not ident:
+        raise ValueError("Joplin note id is empty or invalid")
+    return Path(backup_dir).expanduser() / ident
+
+def _backup_sha(path):
+    """Full body hash recorded in an existing backup header, if any."""
+    try:
+        with path.open("rb") as handle:
+            head = handle.read(8192).decode("utf-8", "replace")
+    except OSError:
+        return None
+    match = BACKUP_HEADER_RE.match(head)
+    if not match:
+        return None
+    found = BACKUP_SHA_RE.search(match.group(1))
+    return found.group(1) if found else None
+
+def _backup_files(directory):
+    if not directory.is_dir():
+        return []
+    files = []
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if entry.name.endswith(".md") and entry.is_file(follow_symlinks=False):
+                    files.append(Path(entry.path))
+    except OSError:
+        return []
+    # UTC timestamp prefix sorts lexicographically; the suffix breaks ties.
+    files.sort(key=lambda path: path.name)
+    return files
+
+def backup_joplin_body(note, backup_dir, retention=BACKUP_RETENTION):
+    """Save one remote Joplin note before it is replaced or trashed.
+
+    `note` must have id/title/body/parent_id/updated_time from GET /notes/{id}.
+    Returns the new Path, or None when an identical body is already backed up.
+    Any filesystem failure propagates: the caller must treat that as fatal.
+    """
+    note_id = str(note.get("id") or "")
+    if not note_id:
+        raise ValueError("remote note has no id")
+    body = note.get("body")
+    if body is None:
+        raise ValueError(f"remote note {note_id} has no body")
+    raw = str(body).encode("utf-8")
+    digest = hashlib.sha256(raw).hexdigest()
+    directory = _backup_note_dir(backup_dir, note_id)
+    existing = _backup_files(directory)
+
+    # Identical remote body already saved: retention has nothing to add.
+    for path in existing:
+        if _backup_sha(path) == digest:
+            return None
+
+    title = str(note.get("title") or "")
+    parent_id = str(note.get("parent_id") or "")
+    updated_time = note.get("updated_time")
+    header = (
+        "---\n"
+        f"joplin_id: {json.dumps(note_id)}\n"
+        f"title: {json.dumps(title, ensure_ascii=False)}\n"
+        f"parent_id: {json.dumps(parent_id)}\n"
+        f"updated_time: {json.dumps(updated_time)}\n"
+        f"body_sha256: {digest}\n"
+        "---\n"
+    ).encode("utf-8")
+
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    base = f"{stamp}-{_backup_slug(title)}-{digest[:8]}"
+    target = directory / f"{base}.md"
+    counter = 1
+    while target.exists():
+        target = directory / f"{base}-{counter}.md"
+        counter += 1
+    fd, tmp = tempfile.mkstemp(dir=str(directory), prefix=".backup-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(header)
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, str(target))
+    except BaseException:
+        try: os.unlink(tmp)
+        except OSError: pass
+        raise
+
+    # Retention is filename order (the UTC stamp is the leading component).
+    files = _backup_files(directory)
+    for path in (files[:-retention] if retention > 0 else files):
+        try:
+            path.unlink()
+        except OSError:
+            pass   # a leftover old backup must not undo a successful write
+    return target
+
+class Syncer:
+    def __init__(self, api, state, state_path, cfg, notes_dir, reporter, *,
+                 dry_run, force, prune, backup_dir=None):
+        self.api, self.state, self.state_path = api, state, state_path
+        self.cfg, self.notes_dir, self.reporter = cfg, notes_dir, reporter
+        self.dry_run, self.force, self.prune = dry_run, force, prune   # explicit mode
+        self.backup_dir = Path(backup_dir).expanduser() if backup_dir else None
+        self.folders, self.notes = state["folders"], state["notes"]
+        self.folder_index = {}          # (parent_id, title) -> folder id
+        self.note_index = None          # source_url -> note (lazy scan)
+        self.root_id, self.dirty = "", False
+        self.counts = {"created": 0, "updated": 0, "unchanged": 0,
+                       "conflicted": 0, "missing": 0, "skipped": 0, "pruned": 0}
+
+    # -- notebooks -------------------------------------------------------
+    def load_folder_index(self):
+        """One listing lets us reconcile by (parent, title) instead of duplicating."""
+        for folder in self.api.get_all("/folders", {"fields": "id,title,parent_id"}):
+            key = (folder.get("parent_id") or "", folder.get("title") or "")
+            self.folder_index.setdefault(key, folder["id"])
+    def ensure_root(self):
+        title = self.cfg["notebook"].strip()
+        folder_id = self.folder_index.get(("", title))
+        if folder_id is None:
+            if self.dry_run:
+                folder_id = "dry-run-root"
+            else:
+                folder_id = self.api.request(
+                    "POST", "/folders", body={"title": title})["id"]
+                self.folder_index[("", title)] = folder_id
+                self.reporter.detail(f"notebook created: {title}")
+        self.dirty = self.dirty or self.folders.get("") != folder_id
+        self.root_id = self.folders[""] = folder_id
+    def ensure_folder(self, rel):
+        """Return (creating if needed) the notebook id for a relative folder."""
+        if not self.cfg["mirror_folders"] or not rel:
+            return self.root_id
+        if rel in self.folders:
+            return self.folders[rel]
+        parent, parts = self.root_id, []
+        for part in rel.split("/"):
+            parts.append(part)
+            key = "/".join(parts)
+            folder_id = self.folders.get(key) or self.folder_index.get((parent, part))
+            if folder_id is None:   # first run with this folder, or a new subfolder
+                if self.dry_run:
+                    folder_id = f"dry-run-folder-{key}"
+                else:
+                    folder_id = self.api.request("POST", "/folders", body={
+                        "title": part, "parent_id": parent})["id"]
+                    self.folder_index[(parent, part)] = folder_id
+                    self.reporter.detail(f"notebook created: {key}")
+                self.dirty = True
+            self.folders[key] = parent = folder_id
+        return parent
+
+    # -- notes -----------------------------------------------------------
+    def find_by_source_url(self, rel):
+        """Full paginated scan, used only when state has no mapping for rel."""
+        if self.note_index is None:
+            self.note_index = {}
+            for note in self.api.get_all(
+                    "/notes", {"fields": "id,source_url,parent_id,updated_time"}):
+                url = note.get("source_url") or ""
+                if url.startswith(SOURCE_PREFIX):
+                    self.note_index.setdefault(url, note)
+        return self.note_index.get(SOURCE_PREFIX + rel)
+    def remote_meta(self, note_id):
+        try:
+            return self.api.request("GET", f"/notes/{note_id}",
+                                    {"fields": "updated_time,parent_id"})
+        except JoplinError as exc:
+            if exc.code != 404:
+                raise
+            return None   # note was trashed or deleted in Joplin
+    def backup_remote(self, note_id, required=True):
+        """Save the remote note before it is replaced/trashed.
+
+        Returns True when the backup exists (or backing up is disabled). A
+        failure raises for updates (the PUT must not happen) and only warns
+        for prune (the DELETE is skipped instead).
+        """
+        if self.backup_dir is None or self.dry_run:
+            return True
+        try:
+            note = self.api.request("GET", f"/notes/{note_id}", {
+                "fields": "id,title,body,parent_id,updated_time"})
+            backup_joplin_body(note, self.backup_dir)
+        except (JoplinError, OSError, ValueError) as exc:
+            message = (f"backup failed for Joplin note {note_id}: {exc}; "
+                       "refusing to replace it")
+            if required:
+                raise JoplinError(message) from exc
+            self.reporter.warn(f"warning: {message}; left it in place")
+            return False
+        return True
+    def create(self, rel, title, body, parent_id, digest):
+        self.counts["created"] += 1
+        self.reporter.detail(f"created: {rel}  ({title})")
+        if self.dry_run: return
+        result = self.api.request("POST", "/notes", body={
+            "title": title, "body": body, "parent_id": parent_id,
+            "source_url": SOURCE_PREFIX + rel})
+        if not result.get("id"):
+            raise JoplinError(f"POST /notes returned no id for {rel}")
+        self.notes[rel] = {"id": result["id"], "hash": digest, "title": title,
+                           "parent_id": parent_id, "updated_time": result.get("updated_time")}
+        self.dirty = True
+    def update(self, rel, entry, title, body, parent_id, digest):
+        self.counts["updated"] += 1
+        self.reporter.detail(f"updated: {rel}  ({title})")
+        if self.dry_run: return
+        # Never overwrite without a durable copy of what Joplin currently has.
+        self.backup_remote(entry["id"], required=True)
+        result = self.api.request("PUT", f"/notes/{entry['id']}", body={
+            "title": title, "body": body, "parent_id": parent_id})
+        updated_time = result.get("updated_time") or (
+            self.remote_meta(entry["id"]) or {}).get("updated_time")
+        entry.update({"hash": digest, "title": title, "parent_id": parent_id,
+                      "updated_time": updated_time})
+        self.dirty = True
+    def sync_file(self, rel, path):
+        try:
+            raw = path.read_bytes()
+        except OSError as exc:
+            return self.skip(rel, f"unreadable ({exc})")
+        if len(raw) > MAX_BODY_BYTES:
+            return self.skip(rel, f"too large for Joplin ({len(raw)} bytes)")
+        try:
+            body = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return self.skip(rel, "not valid UTF-8")
+        frontmatter, note_body = split_frontmatter(body)
+        note_body = strip_image_sizes(note_body)
+        title = ((frontmatter_title(frontmatter) if frontmatter is not None else "")
+                 or derive_title(note_body))
+        body = note_body
+        # Hash the file as written: a frontmatter-only edit must still update.
+        digest = hashlib.sha256(raw).hexdigest()
+        folder_rel = rel.rsplit("/", 1)[0] if "/" in rel else ""
+        parent_id = self.ensure_folder(folder_rel)
+
+        entry = self.notes.get(rel)
+        if entry is None:
+            found = self.find_by_source_url(rel)
+            if found:   # lost state: adopt the existing note by source_url
+                entry = {"id": found["id"], "hash": None, "title": title,
+                         "parent_id": found.get("parent_id"),
+                         "updated_time": found.get("updated_time")}
+                self.notes[rel] = entry
+                self.dirty = True
+                self.reporter.detail(f"adopted existing note: {rel}")
+        if entry is None:
+            return self.create(rel, title, body, parent_id, digest)
+
+        if (entry.get("hash") == digest and entry.get("title") == title
+                and entry.get("parent_id") == parent_id):
+            self.counts["unchanged"] += 1
+            return
+        if not self.force:
+            meta = self.remote_meta(entry["id"])
+            if meta is None:   # trashed in Joplin: recreate it
+                self.reporter.warn(f"warning: Joplin note for {rel} disappeared; recreating")
+                del self.notes[rel]; self.dirty = True
+                return self.create(rel, title, body, parent_id, digest)
+            remote_time = meta.get("updated_time")
+            # >2s drift means the note changed in Joplin since our last sync.
+            if (entry.get("updated_time") is not None and remote_time is not None
+                    and abs(remote_time - entry["updated_time"]) > CONFLICT_WINDOW_MS):
+                self.counts["conflicted"] += 1
+                self.reporter.warn(f"conflict: {rel} was edited in Joplin; skipped (use --force)")
+                return
+        self.update(rel, entry, title, body, parent_id, digest)
+    def skip(self, rel, reason):
+        self.counts["skipped"] += 1
+        self.reporter.warn(f"warning: skipped {rel}: {reason}")
+
+    # -- deleted locally -------------------------------------------------
+    def handle_missing(self, present):
+        for rel in sorted(set(self.notes) - present):
+            self.counts["missing"] += 1
+            note_id = self.notes[rel]["id"]
+            if not self.prune:   # default: never delete Joplin data
+                self.reporter.warn(f"missing: {rel} (Joplin note kept; use --prune to trash it)")
+                continue
+            self.reporter.detail(f"trashed: {rel}")
+            if self.dry_run:
+                self.counts["pruned"] += 1; continue
+            # A prune must be recoverable too; if we cannot back it up, keep it.
+            if not self.backup_remote(note_id, required=False):
+                continue
+            try:
+                self.api.request("DELETE", f"/notes/{note_id}")   # trashes, not purges
+            except JoplinError as exc:
+                if exc.code != 404:
+                    self.reporter.warn(f"warning: could not trash {rel}: {exc}")
+                    continue
+            del self.notes[rel]; self.counts["pruned"] += 1; self.dirty = True
+    def local_files(self):
+        if not self.notes_dir.is_dir():
+            raise ConfigError(f"notes directory not found: {self.notes_dir}")
+        files = {}
+        for path in sorted(self.notes_dir.rglob("*.md")):
+            rel = path.relative_to(self.notes_dir)
+            if path.is_file() and not any(p.startswith(".") for p in rel.parts):
+                files[rel.as_posix()] = path   # POSIX separators = stable state keys
+        return files
+    def run(self):
+        files = self.local_files()   # validate source dir before touching Joplin
+        self.load_folder_index()
+        self.ensure_root()
+        self.reporter.detail(f"source: {self.notes_dir} ({len(files)} markdown files)")
+        for rel, path in files.items():
+            self.sync_file(rel, path)
+        self.handle_missing(set(files))
+        if self.dirty and not self.dry_run:
+            save_state(self.state_path, self.state)
+        return self.counts
+
+def parse_args(argv):
+    p = argparse.ArgumentParser(
+        description="Mirror OmaNano Markdown notes into Joplin (one-way).")
+    for flag, text in {"--dry-run": "report changes only", "--force": "overwrite edits",
+                       "--prune": "trash locally deleted notes", "--quiet": "one line",
+                       "--verbose": "per-note detail", "--json": "machine-readable"}.items():
+        p.add_argument(flag, action="store_true", help=text)
+    for flag, text in {"--notebook": "target notebook title",
+                       "--api-url": "Joplin Data API base URL", "--token": "Joplin API token",
+                       "--notes-dir": "OmaNano notes directory",
+                       "--state": "state file path",
+                       "--backup-dir": "save remote bodies before replacing/trashing"
+                                       " (default: off; env OMANANO_JOPLIN_BACKUP_DIR)"}.items():
+        p.add_argument(flag, help=text)
+    return p.parse_args(argv)
+
+def summary_line(counts, dry_run):
+    line = (f"{counts['created']} created, {counts['updated']} updated, "
+            f"{counts['unchanged']} unchanged, {counts['conflicted']} conflicted, "
+            f"{counts['missing']} missing, {counts['skipped']} skipped")
+    if counts.get("pruned"):
+        line += f", {counts['pruned']} pruned"
+    return line + (" (dry run)" if dry_run else "")
+
+def main(argv=None):
+    args = parse_args(argv)
+    reporter = Reporter(args.quiet, args.verbose, args.json)
+    try:
+        cfg = load_config()
+        cfg["notebook"] = args.notebook or cfg["notebook"]
+        notes_dir = Path(os.path.expanduser(
+            args.notes_dir or os.environ.get("OMANANO_NOTES_DIR") or cfg["notes_dir"]))
+        state_path = Path(os.path.expanduser(
+            args.state or os.environ.get("OMANANO_JOPLIN_STATE") or DEFAULT_STATE))
+        api_url = (args.api_url or os.environ.get("OMANANO_JOPLIN_API")
+                   or cfg.get("api_url") or DEFAULT_API)
+        token = args.token or os.environ.get("OMANANO_JOPLIN_TOKEN") or load_token(cfg)
+        backup_dir = (args.backup_dir or os.environ.get("OMANANO_JOPLIN_BACKUP_DIR")
+                      or "").strip()
+    except ConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    api = Joplin(api_url, token)
+    if not api.ping():
+        # Exit 3 is treated as success by systemd (Joplin ships stopped).
+        print(f"Joplin API unreachable at {api_url}: {NOT_FOUND_HINT}", file=sys.stderr)
+        return EXIT_NO_JOPLIN
+    try:
+        syncer = Syncer(api, load_state(state_path, reporter), state_path, cfg,
+                        notes_dir, reporter, dry_run=args.dry_run,
+                        force=args.force, prune=args.prune,
+                        backup_dir=backup_dir or None)
+        counts = syncer.run()
+    except ConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    except JoplinError as exc:
+        print(f"error: Joplin API call failed: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    if args.json:
+        payload = dict(counts, notebook=cfg["notebook"], dry_run=args.dry_run,
+                       warnings=reporter.warnings)
+        print(json.dumps(payload, sort_keys=True))
+    elif args.quiet:
+        print(summary_line(counts, args.dry_run))
+    else:
+        print(f"OmaNano → Joplin ({cfg['notebook']}): "
+              f"{summary_line(counts, args.dry_run)}")
+        if counts["missing"] and not args.prune:
+            print("Note: missing notes are never deleted without --prune.")
+    return EXIT_OK
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

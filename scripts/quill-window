@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# quill-window - open one Quill note in a detached Quickshell window.
+#
+# Usage: quill-window <note-id> [title] [data-dir]
+#
+# Environment (defaults shown):
+#   QUILL_DATA_DIR    ~/.local/share/quill
+#   QUILL_STORE_PATH  <plugin>/scripts/quill-store
+#   QUILL_ALLOW_REAL_DATA  1 (set here for the production detached window)
+#
+# Detached.qml imports Quickshell's qs.Commons/qs.Ui modules. A standalone
+# `quickshell -p` run resolves `qs.X` from the directory holding the QML file,
+# and Omarchy's plugin validator forbids symlinks inside a plugin. So stage the
+# window (plus the shared components and the pure-JS table engine) in a cache
+# dir with links to the shell's modules, and run Quickshell against that copy.
+set -eu
+
+note_id="${1:-${QUILL_NOTE_ID:-}}"
+if [[ -z "$note_id" ]]; then
+  echo "usage: quill-window <note-id> [title] [data-dir]" >&2
+  exit 2
+fi
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+plugin_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
+stage="${XDG_CACHE_HOME:-$HOME/.cache}/quill/detached"
+
+export QUILL_NOTE_ID="$note_id"
+export QUILL_NOTE_TITLE="${2:-${QUILL_NOTE_TITLE:-Note}}"
+export QUILL_DATA_DIR="${3:-${QUILL_DATA_DIR:-$HOME/.local/share/quill}}"
+export QUILL_STORE_PATH="${QUILL_STORE_PATH:-$script_dir/quill-store}"
+# Production opt-in for WritableGuard. It is set per launch, never globally,
+# so a harness cannot inherit it by accident.
+export QUILL_ALLOW_REAL_DATA=1
+
+mkdir -p "$stage"
+for file in Detached.qml MarkdownEditor.qml PreviewPane.qml MathService.qml ImageSizing.js TableEngine.js MathSyntax.js MathText.js MarkdownFormat.js WritableGuard.js; do
+  if ! cmp -s "$plugin_dir/$file" "$stage/$file"; then
+    cp "$plugin_dir/$file" "$stage/$file"
+  fi
+done
+ln -sfn /usr/share/omarchy/shell/Commons "$stage/Commons"
+ln -sfn /usr/share/omarchy/shell/Ui "$stage/Ui"
+# Maths needs the renderer script and the vendored MathJax tree. Link them
+# rather than copying the ~9 MiB vendor directory on every launch.
+ln -sfn "$plugin_dir/scripts" "$stage/scripts"
+ln -sfn "$plugin_dir/vendor" "$stage/vendor"
+
+exec quickshell -d -p "$stage/Detached.qml"

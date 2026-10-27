@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""Paste an image from the Wayland clipboard into the Quill attachment store.
+
+Prints one JSON object on stdout. `{"ok": false, "reason": "no-image"}` and
+`{"ok": false, "reason": "text-preferred"}` are normal answers: the editor then
+performs a regular text paste. On success the store's JSON is echoed with
+`"ok": true` added.
+
+The store is $QUILL_STORE_PATH, defaulting to quill-store next to this script.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+
+IMAGE_TYPES = [
+    ("image/png", ".png"),
+    ("image/jpeg", ".jpg"),
+    ("image/webp", ".webp"),
+    ("image/gif", ".gif"),
+    ("image/bmp", ".bmp"),
+    ("image/x-png", ".png"),
+    ("image/jpg", ".jpg"),
+]
+STORE = os.environ.get("QUILL_STORE_PATH") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "quill-store"
+)
+
+
+LOG_PATH = os.path.join(
+    os.path.expanduser("~"), ".local", "state", "quill", "paste.log"
+)
+
+
+def log(event: dict) -> None:
+    """Best-effort diagnostic trail; never changes the paste result."""
+    try:
+        os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+        if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) > 256 * 1024:
+            os.replace(LOG_PATH, LOG_PATH + ".1")
+        entry = dict(event)
+        entry["ts"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        with open(LOG_PATH, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        os.chmod(LOG_PATH, 0o600)
+    except OSError:
+        pass
+
+
+def emit(payload: dict) -> int:
+    log({"event": "result", **payload})
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+    return 0
+
+
+def fail(message: str) -> int:
+    log({"event": "error", "error": message})
+    sys.stderr.write(json.dumps({"ok": False, "reason": "error", "error": message}, ensure_ascii=False) + "\n")
+    sys.stderr.flush()
+    return 1
+
+
+def wl_paste_types() -> list[str]:
+    result = subprocess.run(
+        ["wl-paste", "--list-types"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            (result.stderr or "").strip() or "wl-paste --list-types failed"
+        )
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def clipboard_bytes(mime: str, timeout: int = 5) -> bytes | None:
+    try:
+        result = subprocess.run(
+            ["wl-paste", "--type", mime],
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def clipboard_text_present(types: list[str]) -> bool:
+    candidates = [mime for mime in types if mime == "text/plain" or mime.startswith("text/plain;")]
+    for mime in candidates:
+        raw = clipboard_bytes(mime)
+        if raw and raw.strip():
+            return True
+    return False
+
+
+def image_file_reference(types: list[str]) -> str | None:
+    """Image *file* on the clipboard (file managers, viewers, some editors).
+
+    These apps often advertise only text/uri-list (or the path as text/plain)
+    instead of pixel data, so Ctrl+V would otherwise paste a useless path.
+    """
+    from urllib.parse import unquote, urlparse
+
+    def from_uri(line: str) -> str | None:
+        if line.startswith("file://"):
+            return unquote(urlparse(line).path)
+        if line.startswith("/"):
+            return line
+        return None
+
+    if "text/uri-list" in types:
+        raw = clipboard_bytes("text/uri-list")
+        if raw:
+            for line in raw.decode("utf-8", "replace").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                path = from_uri(line)
+                if path:
+                    return path
+
+    for mime in [m for m in types if m == "text/plain" or m.startswith("text/plain;")]:
+        raw = clipboard_bytes(mime)
+        if not raw:
+            continue
+        lines = [line.strip() for line in raw.decode("utf-8", "replace").splitlines() if line.strip()]
+        if len(lines) == 1:
+            path = from_uri(lines[0])
+            if path:
+                return path
+    return None
+
+
+def store_image_file(path: str, name: str = "Pasted image") -> dict | None:
+    """Ask the store to adopt an existing image file; None if it is not one."""
+    try:
+        stored = subprocess.run(
+            [STORE, "attachment", "save", "--file", path, "--name", name],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if stored.returncode != 0:
+        return None
+    try:
+        payload = json.loads((stored.stdout or "").strip() or "{}")
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict) or not payload.get("markdown"):
+        return None
+    payload["ok"] = True
+    return payload
+
+
+def main() -> int:
+    try:
+        types = wl_paste_types()
+    except FileNotFoundError:
+        return fail("wl-paste is not installed")
+    except subprocess.TimeoutExpired:
+        return fail("wl-paste --list-types timed out")
+    except (OSError, RuntimeError) as error:
+        return fail(str(error))
+
+    log({"event": "clipboard", "types": types})
+
+    match = None
+    for mime, extension in IMAGE_TYPES:
+        if mime in types:
+            match = (mime, extension)
+            break
+
+    has_text = clipboard_text_present(types)
+    has_image_type = any(mime.startswith("image/") for mime in types)
+
+    if match is None:
+        reference = image_file_reference(types)
+        if reference and os.path.isfile(reference):
+            stored_reference = store_image_file(reference)
+            if stored_reference:
+                return emit(stored_reference)
+        return emit({
+            "ok": False,
+            "reason": "no-image",
+            "hasText": has_text,
+            "hadImage": has_image_type,
+        })
+
+    # Copying text from a browser also places the page's images on the
+    # clipboard; prefer the text so Ctrl+V keeps behaving like a text paste.
+    if has_text:
+        return emit({"ok": False, "reason": "text-preferred"})
+
+    mime, extension = match
+    temporary = None
+    try:
+        handle, temporary = tempfile.mkstemp(prefix="quill-paste-", suffix=extension)
+        with os.fdopen(handle, "wb") as output:
+            try:
+                copied = subprocess.run(
+                    ["wl-paste", "--type", mime],
+                    stdout=output,
+                    stderr=subprocess.PIPE,
+                    timeout=20,
+                    check=False,
+                )
+            except FileNotFoundError:
+                return fail("wl-paste is not installed")
+        if copied.returncode != 0:
+            return fail((copied.stderr or b"").decode("utf-8", "replace").strip() or "wl-paste failed")
+        if os.path.getsize(temporary) == 0:
+            return emit({"ok": False, "reason": "no-image"})
+
+        try:
+            stored = subprocess.run(
+                [STORE, "attachment", "save", "--file", temporary, "--name", "Pasted image"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except FileNotFoundError:
+            return fail(f"quill-store not found: {STORE}")
+        if stored.returncode != 0:
+            return fail((stored.stderr or stored.stdout or "").strip() or "quill-store attachment save failed")
+        try:
+            payload = json.loads((stored.stdout or "").strip() or "{}")
+        except json.JSONDecodeError:
+            return fail("quill-store returned invalid JSON")
+        if not isinstance(payload, dict):
+            return fail("quill-store returned an unexpected payload")
+        payload["ok"] = True
+        return emit(payload)
+    except subprocess.TimeoutExpired:
+        return fail("reading the image from the clipboard timed out")
+    except (OSError, ValueError) as error:
+        return fail(str(error))
+    finally:
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

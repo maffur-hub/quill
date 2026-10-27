@@ -1,0 +1,12 @@
+[Unit]
+Description=Mirror Quill notes into Joplin
+Documentation=file://%h/.config/omarchy/plugins/matt.quill/README.md
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/quill-joplin-sync --quiet
+# Exit 3 means Joplin (or its Web Clipper service) is not running. Joplin is
+# often closed on a desktop, so that is not a failure worth alarming about.
+SuccessExitStatus=3
+TimeoutStartSec=120

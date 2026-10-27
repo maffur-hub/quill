@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodically mirror Quill notes into Joplin
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+Unit=quill-joplin-sync.service
+
+[Install]
+WantedBy=timers.target

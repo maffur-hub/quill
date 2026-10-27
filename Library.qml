@@ -1,0 +1,2211 @@
+import QtQuick
+import QtQuick.Controls
+import Quickshell
+import Quickshell.Io
+import qs.Commons
+import qs.Commons as Commons
+import qs.Ui
+import "ImageSizing.js" as ImageSizing
+import "TableEngine.js" as TableEngine
+import "WritableGuard.js" as WritableGuard
+
+// Quill's library: three panes, a Markdown editor with live highlighting,
+// a rendered preview and a single-writer backend queue.
+Item {
+  id: root
+
+  property string storePath: ""
+  property string dataRoot: ""
+  // Production hosts opt in explicitly. Harnesses leave this false so an
+  // accidental real data root can never be written to.
+  property bool allowRealData: false
+  readonly property bool writesAllowed: WritableGuard.writesAllowed(
+    dataRoot, allowRealData, Quickshell.env("HOME") || "")
+  property bool inWindow: false
+  property bool active: true
+
+  signal requestClose()
+  signal requestLibraryWindow()
+
+  // ---------------------------------------------------------------- state
+  property var notes: []
+  property var trashedNotes: []
+  property var folders: []
+  property var tags: []
+  property int trashCount: 0
+  property int totalCount: 0
+  // Note-link targets for the format bar. Recomputes only when the notes model
+  // changes, not on editor keystrokes.
+  property var noteTitleList: noteTitles()
+
+  property string category: "all"
+  property string searchText: ""
+  property var searchResults: []
+  property bool searching: false
+  property string selectedId: ""
+
+  property bool loadingList: true
+  property bool loadingNote: false
+  property bool loaded: false
+  property bool tooLarge: false
+  property bool suppressDirty: false
+  property bool dirty: false
+  property int editVersion: 0
+  property double loadedModified: 0
+  property string saveState: "Ready"
+  property string statusText: "Ready"
+
+  property string mode: "split"
+  property bool modeChosen: false
+  property var backlinks: []
+  property bool backlinksOpen: false
+  property string previewMarkdown: ""
+  // Preview lines start after the frontmatter block; add this to map a
+  // preview line back to the note file line.
+  property int previewLineOffset: 0
+  property bool previewLoading: false
+
+  property bool deleteArmed: false
+  property string deleteArmId: ""
+  property bool folderDeleteArmed: false
+  property string folderDeletePath: ""
+  property string pendingSelectId: ""
+  property bool pendingFocusEditor: false
+  property bool pendingCaretToEnd: false
+  property bool pendingDetach: false
+  property int saveSeq: 0
+
+  // Chat is remembered for this library session only: no config file, and it
+  // starts closed every time the shell launches.
+  property bool chatOpen: false
+  property bool sidebarOpen: true
+  property bool noteListOpen: true
+  property bool viewMenuOpen: false
+  property string chatNotice: ""
+
+  // Table grid state. The grid replaces the preview area while open; the mode
+  // it interrupted is restored on close.
+  property bool tableOpen: false
+  property string tableReturnMode: ""
+  property bool tableSavePending: false
+
+  readonly property var visibleNotes: filteredNotes()
+  readonly property var selectedNote: findAny(selectedId)
+  readonly property var folderOptions: buildFolderOptions()
+  readonly property string categoryLabel: labelForCategory()
+  readonly property int wordCount: countWords(editor.text)
+  readonly property Item focusItem: noteList
+  readonly property bool editorActive: editor.activeFocus
+  readonly property bool searchActive: noteList ? noteList.searchFocused : false
+  readonly property bool chatInputActive: chatDock ? chatDock.inputActive : false
+  readonly property bool compactHeader: editorPane ? editorPane.width < Style.space(560) : false
+  // Layout metrics used by the pane/view tests; harmless to bind from QML.
+  readonly property real sidebarPaneWidth: sidebar ? sidebar.width : 0
+  readonly property real noteListPaneWidth: noteList ? noteList.width : 0
+  readonly property real editorPaneWidth: editorPane ? editorPane.width : 0
+  readonly property real editorPaneX: editorPane ? editorPane.x : 0
+  readonly property real layoutColumnWidth: layoutColumn ? layoutColumn.width : 0
+  readonly property real panesRowWidth: panesArea ? panesArea.width : 0
+  readonly property real headerActionsWidth: headerActions ? headerActions.width : 0
+  readonly property real headerTitleWidth: headerTitle ? headerTitle.width : 0
+  readonly property string pluginDir: {
+    var marker = "/scripts/"
+    var cut = storePath.lastIndexOf(marker)
+    return cut > 0 ? storePath.slice(0, cut) : ""
+  }
+
+  // ------------------------------------------------------------ backend queue
+  property var jobs: []
+  property bool busy: false
+  property var activeJob: null
+
+  function enqueue(job) {
+    if (!root.writesAllowed && WritableGuard.isMutatingArgs(job.args || [])) {
+      var message = WritableGuard.refusalMessage()
+      root.saveState = "Read-only"
+      root.statusText = message
+      if (job.onError) job.onError(message)
+      return
+    }
+    root.jobs.push(job)
+    root.pump()
+  }
+
+  function pump() {
+    if (root.busy || root.jobs.length === 0) return
+    var job = root.jobs.shift()
+    root.activeJob = job
+    root.busy = true
+    process.outputText = ""
+    process.errorText = ""
+    var command = [root.storePath].concat(job.args || [])
+    process.command = command
+    process.running = true
+  }
+
+  function parseError(raw) {
+    var text = String(raw || "").trim()
+    if (!text) return "Quill backend failed"
+    try {
+      var payload = JSON.parse(text)
+      if (payload && payload.error) return String(payload.error)
+    } catch (error) { /* plain text error */ }
+    return text
+  }
+
+  function handleJobExit(exitCode) {
+    var job = root.activeJob
+    root.activeJob = null
+    root.busy = false
+    if (!job) { root.pump(); return }
+    if (exitCode === 0) {
+      var payload = {}
+      try {
+        payload = JSON.parse(process.outputText || "{}")
+      } catch (error) {
+        root.statusText = "Could not read the notes index"
+        if (job.onError) job.onError(root.statusText)
+        root.pump()
+        return
+      }
+      if (job.onSuccess) job.onSuccess(payload)
+    } else {
+      var message = parseError(process.errorText)
+      if (!job.silent) root.statusText = message
+      if (job.onError) job.onError(message)
+    }
+    root.pump()
+  }
+
+  // ------------------------------------------------------------ library load
+  function refreshAll() {
+    enqueue({
+      args: ["list"],
+      silent: true,
+      onSuccess: function(result) { root.applyList(result, false) },
+      onError: function(message) { root.loadingList = false; root.statusText = message }
+    })
+    if (root.category === "trash") refreshTrash()
+  }
+
+  function refreshTrash() {
+    enqueue({
+      args: ["list", "--trashed"],
+      silent: true,
+      onSuccess: function(result) { root.applyList(result, true) },
+      onError: function(message) { root.statusText = message }
+    })
+  }
+
+  function applyList(result, trashed) {
+    root.loadingList = false
+    if (trashed) {
+      root.trashedNotes = Array.isArray(result.notes) ? result.notes : []
+    } else {
+      root.notes = Array.isArray(result.notes) ? result.notes : []
+      root.folders = Array.isArray(result.folders) ? result.folders : []
+      root.tags = Array.isArray(result.tags) ? result.tags : []
+      root.totalCount = Number(result.totalCount || root.notes.length)
+      if (!root.searchText) root.statusText = root.totalCount + " notes"
+    }
+    root.trashCount = Number(result.trashCount || 0)
+    Qt.callLater(function() { root.ensureSelection() })
+  }
+
+  // ------------------------------------------------------------- categories
+  function labelForCategory() {
+    if (category === "all") return "All notes"
+    if (category === "pinned") return "Pinned"
+    if (category === "recent") return "Recent"
+    if (category === "trash") return "Trash"
+    if (category.indexOf("folder:") === 0) {
+      var folder = category.slice(7)
+      return folder === "" ? "Inbox" : folder
+    }
+    if (category.indexOf("tag:") === 0) return "#" + category.slice(4)
+    return "Notes"
+  }
+
+  function filteredNotes() {
+    if (searchText.trim() !== "") return searchResults
+    var source = category === "trash" ? trashedNotes : notes
+    if (category === "all" || category === "trash") return source
+    var now = Date.now()
+    var output = []
+    for (var i = 0; i < source.length; i++) {
+      var note = source[i]
+      var include = false
+      if (category === "pinned") include = !!note.pinned
+      else if (category === "recent") include = now - Number(note.modified || 0) < 7 * 86400000
+      else if (category.indexOf("folder:") === 0) include = String(note.folder || "") === category.slice(7)
+      else if (category.indexOf("tag:") === 0) {
+        var wanted = category.slice(4).toLowerCase()
+        var noteTags = note.tags || []
+        for (var t = 0; t < noteTags.length; t++) {
+          if (String(noteTags[t]).toLowerCase() === wanted) { include = true; break }
+        }
+      }
+      if (include) output.push(note)
+    }
+    return output
+  }
+
+  // Note titles for the note-link popup: skip trashed/broken entries, dedupe
+  // case-insensitively (a note list can contain two "Untitled" notes) and sort
+  // the way a person expects.
+  function noteTitles() {
+    var output = []
+    var seen = {}
+    for (var i = 0; i < notes.length; i++) {
+      var note = notes[i]
+      if (!note || note.trashed || note.missing || note.invalid) continue
+      var title = String(note.title === undefined || note.title === null ? "" : note.title)
+        .replace(/[\r\n]+/g, " ").trim()
+      if (title === "") continue
+      var key = title.toLowerCase()
+      if (seen[key]) continue
+      seen[key] = true
+      output.push(title)
+    }
+    output.sort(function(a, b) {
+      var left = a.toLowerCase()
+      var right = b.toLowerCase()
+      if (left < right) return -1
+      if (left > right) return 1
+      return a < b ? -1 : a > b ? 1 : 0
+    })
+    return output
+  }
+
+  function findAny(id) {
+    var key = String(id || "")
+    if (!key) return null
+    for (var i = 0; i < notes.length; i++) if (String(notes[i].id) === key) return notes[i]
+    for (var j = 0; j < trashedNotes.length; j++) if (String(trashedNotes[j].id) === key) return trashedNotes[j]
+    for (var k = 0; k < searchResults.length; k++) if (String(searchResults[k].id) === key) return searchResults[k]
+    return null
+  }
+
+  function selectCategory(nextCategory) {
+    if (category === nextCategory) return
+    flushSave()
+    category = String(nextCategory)
+    searchText = ""
+    searchResults = []
+    searching = false
+    deleteArmed = false
+    if (noteList) noteList.clearSearch()
+    if (category === "trash") refreshTrash()
+    Qt.callLater(function() { root.ensureSelection() })
+  }
+
+  function ensureSelection() {
+    if (pendingSelectId) {
+      // A freshly created/moved note may not be in the list snapshot that is
+      // already in flight. Wait for the refresh that contains it instead of
+      // falling back to another note and stealing its load flags.
+      if (!findAny(pendingSelectId)) {
+        if (!pendingSelectTimer.running) pendingSelectTimer.restart()
+        return
+      }
+      pendingSelectTimer.stop()
+      var wanted = pendingSelectId
+      pendingSelectId = ""
+      selectNote(wanted)
+      return
+    }
+    var list = filteredNotes()
+    for (var i = 0; i < list.length; i++) {
+      if (String(list[i].id) === selectedId) return
+    }
+    selectNote(list.length > 0 ? String(list[0].id) : "")
+  }
+
+  function selectNote(id) {
+    var next = String(id || "")
+    deleteArmed = false
+    pendingDetach = false
+    if (next === selectedId && (loaded || loadingNote)) return
+    if (tableOpen) closeTable(false)
+    flushSave()
+    selectedId = next
+    scheduleChatContext()
+    if (!next) {
+      clearEditor()
+      return
+    }
+    loadNote()
+  }
+
+  function clearEditor() {
+    if (tableOpen) closeTable(false)
+    suppressDirty = true
+    editor.text = ""
+    editor.cursorPosition = 0
+    suppressDirty = false
+    loaded = false
+    tooLarge = false
+    loadingNote = false
+    dirty = false
+    loadedModified = 0
+    previewMarkdown = ""
+    previewLineOffset = 0
+    backlinks = []
+    backlinksOpen = false
+    saveState = "Ready"
+  }
+
+  function loadNote() {
+    var note = selectedNote
+    if (!note) { clearEditor(); return }
+    if (note.tooLarge) {
+      tooLarge = true
+      loaded = false
+      loadingNote = false
+      previewMarkdown = ""
+      statusText = "This note is too large to edit safely"
+      return
+    }
+    var requestedId = selectedId
+    var requestedTrashed = !!note.trashed
+    // Capture the new-note intent for *this* load. A read that was already in
+    // flight when a note was created must not steal the capture focus/caret
+    // meant for the new note.
+    var caretAtEnd = root.pendingCaretToEnd
+    var focusAfterLoad = root.pendingFocusEditor
+    root.pendingCaretToEnd = false
+    root.pendingFocusEditor = false
+    loadingNote = true
+    tooLarge = false
+    // Drop the previous note's preview so its line numbers can never target a
+    // line in the newly loaded note while the fresh preview is in flight.
+    previewMarkdown = ""
+    previewLineOffset = 0
+    var args = ["read", requestedId]
+    if (requestedTrashed) args.push("--trashed")
+    enqueue({
+      args: args,
+      silent: true,
+      onSuccess: function(result) {
+        if (requestedId !== root.selectedId) return
+        root.suppressDirty = true
+        editor.text = result.tooLarge ? "" : String(result.content || "")
+        editor.cursorPosition = caretAtEnd ? editor.text.length : 0
+        root.suppressDirty = false
+        root.loadingNote = false
+        root.tooLarge = !!result.tooLarge
+        root.loaded = !result.tooLarge
+        root.loadedModified = Number(result.modified || 0)
+        root.dirty = false
+        root.editVersion = 0
+        root.backlinksOpen = false
+        root.scheduleChatContext()
+        root.saveState = root.loaded
+          ? "Saved " + Qt.formatTime(new Date(root.loadedModified), "HH:mm")
+          : "Read only"
+        root.statusText = root.tooLarge
+          ? "Note is larger than " + Math.ceil(Number(result.maxBytes || 1048576) / 1048576) + " MiB"
+          : root.categoryLabel
+        if (root.loaded) {
+          root.requestPreview()
+          root.requestBacklinks()
+          if (focusAfterLoad) {
+            Qt.callLater(function() {
+              editor.forceActiveFocus()
+              // Some TextEdit focus paths reset the caret; assert the
+              // end-of-document position once more after focus lands.
+              if (caretAtEnd) editor.cursorPosition = editor.text.length
+            })
+          }
+        }
+      },
+      onError: function(message) {
+        if (requestedId !== root.selectedId) return
+        root.loadingNote = false
+        root.loaded = false
+        root.statusText = message
+      }
+    })
+  }
+
+  // ---------------------------------------------------------------- saving
+  Component {
+    id: saveFileComponent
+
+    FileView {
+      id: saveView
+      property string targetNoteId: ""
+      property int targetVersion: 0
+      atomicWrites: true
+      blockAllReads: true
+      printErrors: false
+      onSaved: root.bufferSaved(saveView)
+      onSaveFailed: root.bufferFailed(saveView)
+    }
+  }
+
+  function flushSave() {
+    saveTimer.stop()
+    if (!root.writesAllowed) {
+      saveState = "Read-only"
+      statusText = WritableGuard.refusalMessage()
+      return
+    }
+    if (tableOpen && tableEditor) tableEditor.flushWrite()
+    if (!dirty || !loaded || tooLarge || !selectedNote || selectedNote.trashed) return
+    saveSeq += 1
+    var path = dataRoot + "/.quill-save-" + saveSeq + "-" + Date.now() + ".md"
+    var view = saveFileComponent.createObject(root, { path: path })
+    if (!view) {
+      saveState = "Save failed"
+      statusText = "Could not prepare a save"
+      return
+    }
+    view.targetNoteId = selectedId
+    view.targetVersion = editVersion
+    saveState = "Saving…"
+    view.setText(editor.text)
+  }
+
+  function bufferSaved(view) {
+    var noteId = view.targetNoteId
+    var version = view.targetVersion
+    var contentPath = view.path
+    view.destroy()
+    enqueue({
+      args: ["write", noteId, "--content-file", contentPath],
+      silent: true,
+      noteId: noteId,
+      version: version,
+      onSuccess: function(result) { root.afterWrite(noteId, version, result) },
+      onError: function(message) {
+        if (noteId === root.selectedId) {
+          root.saveState = "Save failed"
+          root.dirty = true
+        }
+        root.statusText = message
+      }
+    })
+  }
+
+  function bufferFailed(view) {
+    var noteId = view.targetNoteId
+    view.destroy()
+    if (noteId === root.selectedId) {
+      saveState = "Save failed"
+      dirty = true
+      statusText = "Could not write the note"
+      pendingDetach = false
+    }
+  }
+
+  function afterWrite(noteId, version, result) {
+    if (noteId === selectedId) {
+      loadedModified = Number(result.modified || Date.now())
+      if (editVersion === version) {
+        dirty = false
+        saveState = "Saved " + Qt.formatTime(new Date(loadedModified), "HH:mm")
+        if (root.tableSavePending) {
+          root.tableSavePending = false
+          statusText = "Table saved"
+        }
+      } else {
+        dirty = true
+        saveState = "Unsaved"
+        saveTimer.restart()
+      }
+      requestPreview()
+      requestBacklinks()
+      root.scheduleChatContext()
+    }
+    refreshTimer.restart()
+    if (pendingDetach && !dirty && noteId === selectedId) launchDetachedWindow()
+  }
+
+  // ------------------------------------------------------- detached window
+  function detachSelectedNote() {
+    if (!selectedNote) return
+    if (selectedNote.trashed) {
+      statusText = "Restore this note before opening it in a window"
+      return
+    }
+    if (selectedNote.tooLarge) {
+      statusText = "This note is too large to detach safely"
+      return
+    }
+    if (!pluginDir) {
+      statusText = "Could not locate the Quill plugin"
+      return
+    }
+    pendingDetach = true
+    if (dirty) {
+      flushSave()
+      return
+    }
+    launchDetachedWindow()
+  }
+
+  function launchDetachedWindow() {
+    var note = selectedNote
+    if (!note) { pendingDetach = false; return }
+    pendingDetach = false
+    detachedProcess.command = [
+      pluginDir + "/scripts/quill-window",
+      String(note.id),
+      String(note.title || "Note"),
+      dataRoot
+    ]
+    detachedProcess.running = true
+    statusText = "Opened “" + String(note.title || "note") + "” in a detached window"
+  }
+
+  function onEditorEdited() {
+    if (suppressDirty || !loaded || tooLarge || loadingNote) return
+    if (selectedNote && selectedNote.trashed) return
+    dirty = true
+    editVersion += 1
+    saveState = "Unsaved"
+    saveTimer.restart()
+  }
+
+  function countWords(value) {
+    var text = String(value || "").trim()
+    if (!text) return 0
+    var matches = text.match(/\S+/g)
+    return matches ? matches.length : 0
+  }
+
+  // -------------------------------------------------------------- preview
+  function requestPreview() {
+    if (!selectedId || !loaded) { previewMarkdown = ""; previewLineOffset = 0; return }
+    var requestedId = selectedId
+    previewLoading = true
+    enqueue({
+      args: ["preview", requestedId],
+      silent: true,
+      onSuccess: function(result) {
+        if (requestedId !== root.selectedId) return
+        root.previewMarkdown = String(result.markdown || "")
+        root.previewLineOffset = Number(result.lineOffset || 0)
+        root.previewLoading = false
+      },
+      onError: function(message) {
+        if (requestedId !== root.selectedId) return
+        root.previewLoading = false
+        root.previewMarkdown = ""
+        root.previewLineOffset = 0
+        root.statusText = message
+      }
+    })
+  }
+
+  // --------------------------------------------------- image size editing
+  // Replace one line of the editor in place so the caret/selection elsewhere
+  // keeps its position and the normal dirty/autosave path runs.
+  function replaceEditorLine(index, replacement) {
+    var lines = String(editor.text).split("\n")
+    if (index < 0 || index >= lines.length) return false
+    if (lines[index] === replacement) return false
+    var start = 0
+    for (var i = 0; i < index; i++) start += lines[i].length + 1
+    editor.remove(start, start + lines[index].length)
+    editor.insert(start, replacement)
+    return true
+  }
+
+  function setImageWidth(line, width) {
+    if (!loaded || tooLarge || !selectedNote || selectedNote.trashed) return
+    var index = Math.round(Number(line))
+    var lines = String(editor.text).split("\n")
+    if (!isFinite(index) || index < 0 || index >= lines.length) return
+    var updated = ImageSizing.setWidth(lines[index], width)
+    if (updated === null) return
+    replaceEditorLine(index, updated)
+  }
+
+  function clearImageSize(line) {
+    if (!loaded || tooLarge || !selectedNote || selectedNote.trashed) return
+    var index = Math.round(Number(line))
+    var lines = String(editor.text).split("\n")
+    if (!isFinite(index) || index < 0 || index >= lines.length) return
+    var updated = ImageSizing.clearSize(lines[index])
+    if (updated === null) return
+    replaceEditorLine(index, updated)
+  }
+
+  // --------------------------------------------------- table grid editing
+  function openTableAt(startLine, endLine) {
+    if (!loaded || tooLarge || !selectedNote || selectedNote.trashed) {
+      statusText = "This note is read-only"
+      return
+    }
+    var from = Math.round(Number(startLine))
+    var to = Math.round(Number(endLine))
+    if (!isFinite(from) || !isFinite(to)) return
+
+    var lines = String(editor.text).split("\n")
+    var tables = TableEngine.findTables(lines)
+    var found = null
+    for (var i = 0; i < tables.length; i++) {
+      if (tables[i].startLine === from) { found = tables[i]; break }
+    }
+    if (!found) {
+      // The preview is rendered from the last save, so an unsaved edit above
+      // the table can shift its line number. Ask for one more click instead
+      // of opening the wrong range.
+      statusText = "Table is not saved yet — click it again in a moment"
+      flushSave()
+      return
+    }
+    if (tableOpen) closeTable(false)
+    tableReturnMode = mode
+    if (mode === "edit") mode = "preview"
+    tableOpen = true
+    tableEditor.openRange(found.startLine, found.endLine)
+    statusText = "Editing table " + (found.rows.length) + "×" + found.header.length
+  }
+
+  function applyTableWrite(newLines) {
+    if (!tableOpen || !tableEditor) return
+    if (!selectedNote || selectedNote.trashed) return
+    var oldLines = tableEditor.pendingOldLines || []
+    var start = tableEditor.startLine
+    if (start < 0 || oldLines.length === 0) return
+    if (!newLines || typeof newLines.length !== "number") return
+
+    var rawLines = String(editor.text).split("\n")
+    var current = []
+    for (var i = 0; i < oldLines.length; i++) {
+      var line = rawLines[start + i]
+      current.push(line === undefined ? "" : line.replace(/\r$/, ""))
+    }
+    if (!TableEngine.sameLines(current, oldLines)) {
+      // The note moved or changed between the grid's check and this splice.
+      // Let the grid reconcile once (relocate, adopt, or raise the banner),
+      // then retry against its current region rather than stale indices.
+      if (!tableEditor.reconcileSource()) {
+        if (!tableEditor.externalChange) {
+          tableEditor.reportConflict("Table changed in the note — choose Use note or Overwrite")
+        }
+        return
+      }
+      start = tableEditor.startLine
+      oldLines = tableEditor.pendingOldLines && tableEditor.pendingOldLines.length > 0
+        ? tableEditor.pendingOldLines : (tableEditor.lastSnapshot || [])
+      rawLines = String(editor.text).split("\n")
+      current = []
+      for (var k = 0; k < oldLines.length; k++) {
+        var retryLine = rawLines[start + k]
+        current.push(retryLine === undefined ? "" : retryLine.replace(/\r$/, ""))
+      }
+      if (start < 0 || oldLines.length === 0
+        || !TableEngine.sameLines(current, oldLines)) {
+        if (!tableEditor.externalChange) {
+          tableEditor.reportConflict("Table changed in the note — choose Use note or Overwrite")
+        }
+        return
+      }
+    }
+
+    var carriage = String(editor.text).indexOf("\r\n") >= 0 ? "\r" : ""
+    var replacement = []
+    for (var j = 0; j < newLines.length; j++) {
+      replacement.push(String(newLines[j]).replace(/\r$/, "") + carriage)
+    }
+    var output = rawLines.slice(0, start)
+      .concat(replacement, rawLines.slice(start + oldLines.length))
+    var nextText = output.join("\n")
+    if (nextText === String(editor.text)) {
+      tableEditor.commitSucceeded = true
+      tableSavePending = false
+      statusText = "Table saved"
+      return
+    }
+
+    var caret = editor.cursorPosition
+    editor.text = nextText
+    editor.cursorPosition = Math.min(caret, nextText.length)
+    tableEditor.commitSucceeded = true
+    tableSavePending = true
+    statusText = "Table updated"
+  }
+
+  function closeTable(restoreMode) {
+    if (!tableOpen) return
+    if (tableEditor) tableEditor.flushWrite()
+    var target = restoreMode ? tableReturnMode : ""
+    tableOpen = false
+    tableReturnMode = ""
+    if (target !== "") mode = target
+    if (root.active) {
+      Qt.callLater(function() {
+        if (!root.tableOpen && editor) editor.forceActiveFocus()
+      })
+    }
+  }
+
+  // Ctrl+T: insert a 3×3 table (header + three body rows) at the caret and
+  // open it in the grid. Blank lines around the table keep GFM happy.
+  function insertTableTemplate() {
+    if (!loaded || tooLarge || !selectedNote || selectedNote.trashed) {
+      statusText = "This note is read-only"
+      return
+    }
+    var template = [
+      "| Column 1 | Column 2 | Column 3 |",
+      "| :--- | :--- | :--- |",
+      "|  |  |  |",
+      "|  |  |  |",
+      "|  |  |  |"
+    ]
+    var text = String(editor.text)
+    var eol = text.indexOf("\r\n") >= 0 ? "\r\n" : "\n"
+    var position = Math.max(0, Math.min(editor.cursorPosition, text.length))
+    // Never insert a table before YAML frontmatter: that would turn the
+    // metadata into body text. A caret inside the block moves below it.
+    if (/^---\r?\n/.test(text)) {
+      var closing = text.indexOf("\n---", 3)
+      if (closing >= 0) {
+        var bodyStart = text.indexOf("\n", closing + 1)
+        bodyStart = bodyStart < 0 ? text.length : bodyStart + 1
+        if (position < bodyStart) position = bodyStart
+      }
+    }
+    var before = text.slice(0, position)
+    var after = text.slice(position)
+
+    var leading = ""
+    if (position > 0 && text.charAt(position - 1) !== "\n") leading += eol
+    var prior = before + leading
+    var priorLines = prior.split("\n")
+    var previous = priorLines.length >= 2 ? priorLines[priorLines.length - 2] : ""
+    if (previous !== undefined && previous.trim() !== "") leading += eol
+
+    var trailing = eol
+    if (after.length > 0 && after.charAt(0) !== "\n") trailing += eol
+
+    var block = leading + template.join(eol) + trailing
+    var startLine = (before + leading).split("\n").length - 1
+    editor.insert(position, block)
+    editor.cursorPosition = position + block.length
+    openTableAt(startLine, startLine + template.length - 1)
+  }
+
+  function requestBacklinks() {
+    if (!selectedId) { backlinks = []; return }
+    var requestedId = selectedId
+    enqueue({
+      args: ["backlinks", requestedId],
+      silent: true,
+      onSuccess: function(result) {
+        if (requestedId !== root.selectedId) return
+        root.backlinks = Array.isArray(result.backlinks) ? result.backlinks : []
+      }
+    })
+  }
+
+  function openLink(link) {
+    var value = String(link || "")
+    if (value.indexOf("quill://note/") === 0) {
+      var noteId = decodeURIComponent(value.slice("quill://note/".length))
+      selectNote(noteId)
+    } else if (value.indexOf("quill://tag/") === 0) {
+      var tag = decodeURIComponent(value.slice("quill://tag/".length))
+      selectCategory("tag:" + tag)
+    } else if (value.indexOf("quill://missing/") === 0) {
+      statusText = "No note matches “" + decodeURIComponent(value.slice("quill://missing/".length)) + "”"
+    } else if (value.indexOf("http://") === 0 || value.indexOf("https://") === 0) {
+      Qt.openUrlExternally(value)
+    } else if (value !== "") {
+      Qt.openUrlExternally(value)
+    }
+  }
+
+  // -------------------------------------------------------------- actions
+  function buildFolderOptions() {
+    var options = [{ value: "", label: "Inbox" }]
+    for (var i = 0; i < folders.length; i++) options.push({ value: String(folders[i]), label: String(folders[i]) })
+    return options
+  }
+
+  function createNote(inCurrentFolder, focusEditor) {
+    flushSave()
+    var folder = ""
+    if (inCurrentFolder && category.indexOf("folder:") === 0) folder = category.slice(7)
+    enqueue({
+      args: ["create", "--folder", folder],
+      silent: true,
+      onSuccess: function(result) {
+        root.pendingSelectId = String(result.id || "")
+        root.pendingFocusEditor = !!focusEditor
+        root.pendingCaretToEnd = true
+        if (folder) root.category = "folder:" + folder
+        else if (root.category === "trash" || root.category === "pinned" || root.category === "recent" || root.category.indexOf("tag:") === 0) root.category = "all"
+        root.searchText = ""
+        root.searchResults = []
+        root.searching = false
+        if (noteList) noteList.clearSearch()
+        root.refreshAll()
+        root.statusText = "Created a note"
+      },
+      onError: function(message) { root.statusText = message }
+    })
+  }
+
+  function capture() {
+    createNote(false, true)
+  }
+
+  function openLibraryWindow() {
+    flushSave()
+    requestLibraryWindow()
+  }
+
+  // ------------------------------------------------------------- layout
+  function toggleSidebar() {
+    sidebarOpen = !sidebarOpen
+  }
+
+  function toggleNoteList() {
+    noteListOpen = !noteListOpen
+  }
+
+  // Editor and Preview can never both be off. Turning one off leaves the
+  // other visible; turning one on from the opposite single-pane mode restores
+  // split.
+  function toggleEditor() {
+    setMode(mode === "preview" ? "split" : "preview")
+  }
+
+  function togglePreview() {
+    setMode(mode === "edit" ? "split" : "edit")
+  }
+
+  function resetLayout() {
+    sidebarOpen = true
+    noteListOpen = true
+    setMode("split")
+    chatOpen = false
+  }
+
+  function focusSidebar() {
+    if (!sidebarOpen) {
+      sidebarOpen = true
+      Qt.callLater(function() {
+        if (sidebar) sidebar.forceActiveFocus()
+      })
+      return
+    }
+    sidebar.forceActiveFocus()
+  }
+
+  function focusNotes() {
+    if (!noteListOpen) {
+      noteListOpen = true
+      Qt.callLater(function() {
+        if (noteList) noteList.forceActiveFocus()
+      })
+      return
+    }
+    noteList.forceActiveFocus()
+  }
+
+  function focusSearch() {
+    if (!noteListOpen) {
+      noteListOpen = true
+      Qt.callLater(function() {
+        if (noteList) noteList.focusSearch()
+      })
+      return
+    }
+    noteList.focusSearch()
+  }
+
+  function openViewMenu() {
+    viewMenuOpen = true
+  }
+
+  function closeViewMenu() {
+    viewMenuOpen = false
+  }
+
+  // ---------------------------------------------------------------- chat
+  function showChatNotice(message) {
+    chatNotice = String(message || "")
+    chatNoticeTimer.restart()
+  }
+
+  function toggleChat() {
+    if (chatOpen) {
+      chatOpen = false
+      return
+    }
+    if (root.width < Style.space(980)) {
+      showChatNotice("Widen the window to use chat")
+      return
+    }
+    chatOpen = true
+    Qt.callLater(function() {
+      if (root.chatOpen && chatDock) chatDock.initialise()
+    })
+    pushChatContext(true)
+  }
+
+  function notePath(note) {
+    if (!note || !dataRoot) return ""
+    var folder = String(note.folder || "")
+    return dataRoot + "/notes/" + (folder !== "" ? folder + "/" : "") + String(note.id || "")
+  }
+
+  // .quill-context.json is how the agent knows "this note" and "here". Keep it
+  // small: the id/title/folder path plus at most 2000 characters of selection.
+  function pushChatContext(force) {
+    if (!chatOpen && force !== true) return
+    if (!chatDock || !chatDock.agent) return
+    var note = selectedNote
+    var selection = editor ? String(editor.selectedText || "") : ""
+    if (selection.length > 2000) selection = selection.slice(0, 2000)
+    var context = note ? {
+      id: String(note.id || ""),
+      title: String(note.title || ""),
+      folder: String(note.folder || ""),
+      path: notePath(note),
+      selectedText: selection,
+      updated: Number(note.modified || 0)
+    } : {
+      id: "",
+      title: "",
+      folder: "",
+      path: "",
+      selectedText: "",
+      updated: 0
+    }
+    chatDock.agent.sendContext(context)
+  }
+
+  function scheduleChatContext() {
+    if (!chatOpen) return
+    chatContextTimer.restart()
+  }
+
+  function togglePin() {
+    if (!selectedNote || selectedNote.trashed) return
+    var id = selectedId
+    enqueue({
+      args: ["pin", id],
+      silent: true,
+      onSuccess: function(result) {
+        root.statusText = result.pinned ? "Pinned" : "Unpinned"
+        root.refreshAll()
+      },
+      onError: function(message) { root.statusText = message }
+    })
+  }
+
+  function armDelete(deleteForever) {
+    deleteArmed = true
+    deleteArmId = selectedId
+    armTimer.restart()
+    statusText = deleteForever
+      ? "Press Ctrl+Delete again to delete forever"
+      : "Press Ctrl+Delete again to move to Trash"
+  }
+
+  function trashSelected() {
+    if (!selectedNote) return
+    if (selectedNote.trashed) { deleteForeverSelected(); return }
+    if (!deleteArmed || deleteArmId !== selectedId) { armDelete(false); return }
+    var id = selectedId
+    deleteArmed = false
+    if (tableOpen) closeTable(false)
+    enqueue({
+      args: ["trash", id],
+      silent: true,
+      onSuccess: function(result) {
+        if (root.selectedId === id) root.selectedId = ""
+        root.pendingSelectId = ""
+        root.statusText = "Moved to Trash"
+        root.refreshAll()
+        root.refreshTrash()
+      },
+      onError: function(message) { root.statusText = message }
+    })
+  }
+
+  function restoreSelected() {
+    if (!selectedNote || !selectedNote.trashed) return
+    var id = selectedId
+    enqueue({
+      args: ["restore", id],
+      silent: true,
+      onSuccess: function(result) {
+        root.pendingSelectId = String(result.id || "")
+        root.category = "all"
+        root.statusText = "Restored"
+        root.refreshAll()
+        root.refreshTrash()
+      },
+      onError: function(message) { root.statusText = message }
+    })
+  }
+
+  function deleteForeverSelected() {
+    if (!selectedNote || !selectedNote.trashed) return
+    if (!deleteArmed || deleteArmId !== selectedId) { armDelete(true); return }
+    var id = selectedId
+    deleteArmed = false
+    enqueue({
+      args: ["delete", id],
+      silent: true,
+      onSuccess: function() {
+        if (root.selectedId === id) root.selectedId = ""
+        root.statusText = "Deleted forever"
+        root.refreshTrash()
+        root.refreshAll()
+      },
+      onError: function(message) { root.statusText = message }
+    })
+  }
+
+  function emptyTrash() {
+    if (trashCount === 0) return
+    if (!deleteArmed) {
+      deleteArmed = true
+      deleteArmId = "@trash"
+      armTimer.restart()
+      statusText = "Press Empty trash again to delete everything in Trash"
+      return
+    }
+    deleteArmed = false
+    enqueue({
+      args: ["empty-trash"],
+      silent: true,
+      onSuccess: function(result) {
+        root.statusText = "Emptied Trash (" + Number(result.deleted || 0) + ")"
+        root.refreshTrash()
+        root.refreshAll()
+      },
+      onError: function(message) { root.statusText = message }
+    })
+  }
+
+  function moveSelectedTo(folder) {
+    if (!selectedNote || selectedNote.trashed) return
+    if (String(selectedNote.folder || "") === String(folder || "")) return
+    var id = selectedId
+    enqueue({
+      args: ["move", id, "--folder", String(folder || "")],
+      silent: true,
+      onSuccess: function(result) {
+        root.pendingSelectId = String(result.id || id)
+        root.category = String(folder || "") === "" ? "all" : "folder:" + String(folder)
+        root.statusText = "Moved"
+        root.refreshAll()
+      },
+      onError: function(message) { root.statusText = message }
+    })
+  }
+
+  function createFolder(path) {
+    enqueue({
+      args: ["folder", "create", path],
+      silent: true,
+      onSuccess: function(result) {
+        root.category = "folder:" + String(result.folder || path)
+        root.statusText = "Created folder " + String(result.folder || path)
+        root.refreshAll()
+      },
+      onError: function(message) { root.statusText = message }
+    })
+  }
+
+  function renameFolder(path, next) {
+    enqueue({
+      args: ["folder", "rename", path, next],
+      silent: true,
+      onSuccess: function(result) {
+        root.category = "folder:" + String(result.folder || next)
+        root.statusText = "Renamed folder"
+        root.refreshAll()
+      },
+      onError: function(message) { root.statusText = message }
+    })
+  }
+
+  function requestDeleteFolder(path) {
+    if (!folderDeleteArmed || folderDeletePath !== path) {
+      folderDeleteArmed = true
+      folderDeletePath = path
+      folderArmTimer.restart()
+      statusText = "Press × again to delete folder " + path
+      return
+    }
+    folderDeleteArmed = false
+    enqueue({
+      args: ["folder", "delete", path],
+      silent: true,
+      onSuccess: function() {
+        if (root.category === "folder:" + path) root.category = "all"
+        root.statusText = "Deleted folder"
+        root.refreshAll()
+      },
+      onError: function(message) { root.statusText = message }
+    })
+  }
+
+  // -------------------------------------------------------------- shortcuts
+  function cycleMode() {
+    if (tableOpen) closeTable(false)
+    var order = ["edit", "split", "preview"]
+    var index = order.indexOf(mode)
+    mode = order[(index + 1) % order.length]
+    modeChosen = true
+    if (mode !== "edit") flushSave()
+  }
+
+  function setMode(next) {
+    if (tableOpen) closeTable(false)
+    mode = next
+    modeChosen = true
+    if (next !== "edit") flushSave()
+  }
+
+  function handleEscape() {
+    if (viewMenuOpen) {
+      viewMenuOpen = false
+      return
+    }
+    if (tableOpen) {
+      tableEditor.handleEscape()
+      return
+    }
+    if (deleteArmed) {
+      deleteArmed = false
+      deleteArmId = ""
+      statusText = "Cancelled"
+      return
+    }
+    folderDeleteArmed = false
+    if (searchText !== "") {
+      searchText = ""
+      searchResults = []
+      searching = false
+      noteList.clearSearch()
+      ensureSelection()
+      return
+    }
+    requestClose()
+  }
+
+  function focusInitial() {
+    if (noteListOpen && noteList) noteList.forceActiveFocus()
+    else if (sidebarOpen && sidebar) sidebar.forceActiveFocus()
+    else if (editor) editor.forceActiveFocus()
+  }
+
+  // ------------------------------------------------------------------- UI
+  focus: true
+
+  Component.onCompleted: {
+    mode = width >= Style.space(1000) ? "split" : "edit"
+    if (active) refreshAll()
+  }
+
+  onWidthChanged: {
+    if (!modeChosen) mode = width >= Style.space(1000) ? "split" : "edit"
+    if (chatOpen && width < Style.space(980)) {
+      chatOpen = false
+      showChatNotice("Widen the window to use chat")
+    }
+  }
+
+  onActiveChanged: {
+    if (!active) viewMenuOpen = false
+  }
+
+  Timer { id: saveTimer; interval: 600; onTriggered: root.flushSave() }
+  Timer { id: searchTimer; interval: 170; onTriggered: root.runSearch() }
+  Timer { id: refreshTimer; interval: 1100; onTriggered: if (!root.dirty) root.refreshAll() }
+  Timer { id: armTimer; interval: 3200; onTriggered: { root.deleteArmed = false; root.deleteArmId = "" } }
+  Timer { id: folderArmTimer; interval: 3200; onTriggered: { root.folderDeleteArmed = false; root.folderDeletePath = "" } }
+  Timer { id: chatContextTimer; interval: 400; onTriggered: root.pushChatContext(false) }
+  Timer { id: chatNoticeTimer; interval: 2200; onTriggered: root.chatNotice = "" }
+  Timer {
+    id: pendingSelectTimer
+    interval: 2500
+    onTriggered: {
+      if (root.pendingSelectId && !root.findAny(root.pendingSelectId)) {
+        root.pendingSelectId = ""
+        root.pendingFocusEditor = false
+        root.pendingCaretToEnd = false
+        root.ensureSelection()
+      }
+    }
+  }
+
+  function runSearch() {
+    var query = searchText.trim()
+    if (!query) {
+      searching = false
+      searchResults = []
+      ensureSelection()
+      return
+    }
+    if (root.searching && root.searchResults.length > 0 && root.lastQuery === query) return
+    root.lastQuery = query
+    searching = true
+    enqueue({
+      args: ["search", query, "--limit", "80"],
+      silent: true,
+      onSuccess: function(result) {
+        if (root.searchText.trim() !== query) return
+        root.searchResults = Array.isArray(result.results) ? result.results : []
+        root.searching = false
+        root.ensureSelection()
+      },
+      onError: function(message) {
+        if (root.searchText.trim() !== query) return
+        root.searching = false
+        root.searchResults = []
+        root.statusText = message
+      }
+    })
+  }
+
+  property string lastQuery: ""
+
+  Shortcut { sequence: "Ctrl+N"; enabled: root.active; onActivated: root.createNote(false, false) }
+  Shortcut { sequence: "Ctrl+Shift+N"; enabled: root.active; onActivated: root.createNote(true, false) }
+  Shortcut { sequence: "Ctrl+F"; enabled: root.active; onActivated: root.focusSearch() }
+  Shortcut {
+    sequence: "/"
+    enabled: root.active && !root.editorActive && !root.searchActive && !root.chatInputActive
+    onActivated: root.focusSearch()
+  }
+  Shortcut { sequence: "Ctrl+P"; enabled: root.active; onActivated: root.togglePin() }
+  Shortcut { sequence: "Ctrl+E"; enabled: root.active; onActivated: root.cycleMode() }
+  Shortcut { sequence: "Ctrl+S"; enabled: root.active; onActivated: root.flushSave() }
+  Shortcut {
+    sequence: "Ctrl+T"
+    enabled: root.active && root.editorActive
+    onActivated: root.insertTableTemplate()
+  }
+  Shortcut { sequence: "Ctrl+Shift+Return"; enabled: root.active; onActivated: root.openLibraryWindow() }
+  Shortcut { sequence: "Ctrl+Return"; enabled: root.active; onActivated: root.detachSelectedNote() }
+  Shortcut { sequence: "Ctrl+Delete"; enabled: root.active; onActivated: root.trashSelected() }
+  Shortcut { sequence: "Escape"; enabled: root.active; onActivated: root.handleEscape() }
+  Shortcut { sequence: "Ctrl+1"; enabled: root.active; onActivated: root.focusSidebar() }
+  Shortcut { sequence: "Ctrl+2"; enabled: root.active; onActivated: root.focusNotes() }
+  Shortcut { sequence: "Ctrl+3"; enabled: root.active; onActivated: editor.forceActiveFocus() }
+
+  Process {
+    id: process
+    property string outputText: ""
+    property string errorText: ""
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: process.outputText = String(text || "")
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: process.errorText = String(text || "")
+    }
+    onExited: function(exitCode) { root.handleJobExit(exitCode) }
+  }
+
+  // `quill-window` daemonizes quickshell and returns immediately; a non-zero
+  // exit only means the launcher could not start (missing note id, bad path).
+  Process {
+    id: detachedProcess
+    stderr: StdioCollector { id: detachedError; waitForEnd: true }
+    onExited: function(exitCode) {
+      if (exitCode !== 0) {
+        root.statusText = String(detachedError.text || "").trim() || "Could not open a detached window"
+      }
+    }
+  }
+
+  Column {
+    id: layoutColumn
+    anchors.fill: parent
+    spacing: Style.space(8)
+
+    // ------------------------------------------------------------- header
+    Row {
+      id: headerRow
+      width: parent.width
+      height: Style.space(42)
+      spacing: Style.space(10)
+
+      Column {
+        id: headerTitle
+        width: parent.width - headerActions.width - parent.spacing
+        anchors.verticalCenter: parent.verticalCenter
+        spacing: Style.space(1)
+
+        Text {
+          width: parent.width
+          text: "QUILL  /  " + root.categoryLabel.toUpperCase()
+          textFormat: Text.PlainText
+          color: Commons.Color.foreground
+          font.family: Style.font.family
+          font.pixelSize: Style.font.title
+          font.bold: true
+          elide: Text.ElideRight
+        }
+        Text {
+          width: parent.width
+          text: "Local Markdown" + (root.totalCount > 0 ? "  ·  " + root.totalCount + " notes" : "")
+            + (root.trashCount > 0 ? "  ·  " + root.trashCount + " in trash" : "")
+          textFormat: Text.PlainText
+          color: Util.alpha(Commons.Color.foreground, 0.5)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.bodySmall
+          elide: Text.ElideRight
+        }
+      }
+
+      Row {
+        id: headerActions
+        anchors.verticalCenter: parent.verticalCenter
+        spacing: Style.space(6)
+
+        Row {
+          spacing: Style.space(2)
+          anchors.verticalCenter: parent.verticalCenter
+          ModeButton { label: "Edit"; current: root.mode === "edit"; onActivated: root.setMode("edit") }
+          ModeButton { label: "Split"; current: root.mode === "split"; onActivated: root.setMode("split") }
+          ModeButton { label: "Preview"; current: root.mode === "preview"; onActivated: root.setMode("preview") }
+          ModeButton {
+            label: "Agent"
+            current: root.chatOpen
+            onActivated: root.toggleChat()
+          }
+        }
+
+        Button {
+          text: root.inWindow ? "Dock" : "Window"
+          iconText: root.inWindow ? "⤡" : "⤢"
+          tooltipText: root.inWindow
+            ? "Dock back into the bar panel (Ctrl+Shift+Enter)"
+            : "Open the Quill library in its own window (Ctrl+Shift+Enter)"
+          fontSize: Style.font.bodySmall
+          horizontalPadding: Style.space(8)
+          verticalPadding: Style.space(5)
+          onClicked: root.openLibraryWindow()
+        }
+        Button {
+          text: "New note"
+          iconText: "+"
+          active: true
+          fontSize: Style.font.bodySmall
+          horizontalPadding: Style.space(9)
+          verticalPadding: Style.space(5)
+          tooltipText: "New note (Ctrl+N)"
+          onClicked: root.createNote(false, false)
+        }
+        Button {
+          id: viewButton
+          text: "View"
+          iconText: "☰"
+          fontSize: Style.font.bodySmall
+          horizontalPadding: Style.space(8)
+          verticalPadding: Style.space(5)
+          tooltipText: "Show or hide panes"
+          onClicked: root.viewMenuOpen ? root.closeViewMenu() : root.openViewMenu()
+        }
+      }
+    }
+
+    Rectangle {
+      width: parent.width
+      height: 1
+      color: Util.alpha(Commons.Color.foreground, 0.14)
+    }
+
+    // -------------------------------------------------------------- panes
+    Item {
+      id: panesArea
+      width: parent.width
+      height: parent.height - y - statusBar.height - parent.spacing
+
+      readonly property real gap: Style.space(8)
+      readonly property real sidebarSlot: sidebar.visible
+        ? sidebar.width : (sidebarRail.visible ? sidebarRail.width : 0)
+      readonly property real noteSlot: noteList.visible
+        ? noteList.width : (noteRail.visible ? noteRail.width : 0)
+
+      Sidebar {
+        id: sidebar
+        anchors.left: parent.left
+        anchors.top: parent.top
+        anchors.bottom: parent.bottom
+        visible: root.sidebarOpen
+        width: visible ? Math.max(Style.space(160), Math.min(Style.space(205), root.width * 0.16)) : 0
+        notes: root.notes
+        folders: root.folders
+        tags: root.tags
+        category: root.category
+        trashCount: root.trashCount
+        onCategorySelected: function(next) { root.selectCategory(next) }
+        onCreateFolderRequested: function(path) { root.createFolder(path) }
+        onRenameFolderRequested: function(path, next) { root.renameFolder(path, next) }
+        onDeleteFolderRequested: function(path) { root.requestDeleteFolder(path) }
+        onCollapseRequested: root.sidebarOpen = false
+      }
+
+      PaneRail {
+        id: sidebarRail
+        anchors.left: parent.left
+        anchors.top: parent.top
+        anchors.bottom: parent.bottom
+        visible: !root.sidebarOpen
+        width: visible ? Style.space(20) : 0
+        label: "Library"
+        onExpandRequested: root.sidebarOpen = true
+      }
+
+      NoteList {
+        id: noteList
+        anchors.left: parent.left
+        anchors.leftMargin: panesArea.sidebarSlot + panesArea.gap
+        anchors.top: parent.top
+        anchors.bottom: parent.bottom
+        visible: root.noteListOpen
+        width: visible ? Math.max(Style.space(280), Math.min(Style.space(340), root.width * 0.28)) : 0
+        notes: root.visibleNotes
+        selectedId: root.selectedId
+        searchText: root.searchText
+        searching: root.searching
+        showTrash: root.category === "trash"
+        loading: root.loadingList
+        onNoteSelected: function(id) { root.selectNote(id) }
+        onSearchQueryChanged: function(text) {
+          root.searchText = text
+          if (text.trim() !== "") {
+            root.searching = true
+            searchTimer.restart()
+          } else {
+            root.searching = false
+            root.searchResults = []
+            root.ensureSelection()
+          }
+        }
+        onEscapePressed: function() { root.handleEscape() }
+        onEditorFocusRequested: function() { editor.forceActiveFocus() }
+        onCollapseRequested: root.noteListOpen = false
+      }
+
+      PaneRail {
+        id: noteRail
+        anchors.left: parent.left
+        anchors.leftMargin: panesArea.sidebarSlot + panesArea.gap
+        anchors.top: parent.top
+        anchors.bottom: parent.bottom
+        visible: !root.noteListOpen
+        width: visible ? Style.space(20) : 0
+        label: "Notes"
+        onExpandRequested: root.noteListOpen = true
+      }
+
+      BorderSurface {
+        id: editorPane
+        // Anchors avoid the Row's stale child positions when the window
+        // shrinks and a child width depends on sibling widths.
+        anchors.left: parent.left
+        anchors.leftMargin: panesArea.sidebarSlot + panesArea.noteSlot + panesArea.gap * 2
+        anchors.top: parent.top
+        anchors.bottom: parent.bottom
+        anchors.right: chatDock.visible ? chatDock.left : parent.right
+        anchors.rightMargin: chatDock.visible ? panesArea.gap : 0
+        color: Util.alpha(Commons.Color.foreground, 0.022)
+        borderSpec: Border.controlSpec("normal", Commons.Color.foreground, Commons.Color.accent)
+        radius: Style.cornerRadius
+
+        Column {
+          anchors.fill: parent
+          anchors.margins: Style.space(11)
+          spacing: Style.space(6)
+
+          NoteHeader {
+            id: noteHeader
+            width: parent.width
+            height: root.selectedNote ? Style.space(62) : Style.space(36)
+          }
+
+          Rectangle {
+            width: parent.width
+            height: 1
+            color: Util.alpha(Commons.Color.foreground, 0.1)
+          }
+
+          FormatBar {
+            id: formatBar
+            // Full pane width: the surrounding column has 11 px margins for
+            // the note header and editor, but the toolbar reads as a full
+            // strip and gains 22 px at the user's 669/176 editor widths.
+            width: parent.width + Style.space(22)
+            x: -Style.space(11)
+            visible: root.mode !== "preview"
+            available: root.loaded && !root.tooLarge && !!root.selectedNote
+              && !root.selectedNote.trashed
+            canUndo: editor ? editor.canUndo : false
+            canRedo: editor ? editor.canRedo : false
+            linkValue: editor ? editor.currentLinkURL() : ""
+            noteTitles: root.noteTitleList
+            onAction: function(name, value) {
+              if (editor) editor.applyFormat(name, value)
+            }
+          }
+
+          Row {
+            id: contentRow
+            width: parent.width
+            height: Math.max(0, parent.height - y - backlinksBox.height - parent.spacing)
+            spacing: 0
+
+            Flickable {
+              id: editorScroll
+              width: root.mode === "edit" ? parent.width : root.mode === "preview" ? 0 : Math.floor((parent.width - Style.space(1)) / 2)
+              height: parent.height
+              visible: root.mode !== "preview"
+              clip: true
+              contentWidth: width
+              contentHeight: editor.implicitHeight
+              boundsBehavior: Flickable.StopAtBounds
+              interactive: contentHeight > height
+
+              function ensureVisible(rect) {
+                if (contentY >= rect.y) contentY = rect.y
+                else if (contentY + height <= rect.y + rect.height) contentY = rect.y + rect.height - height
+              }
+
+              MarkdownEditor {
+                id: editor
+                width: editorScroll.width
+                height: Math.max(editorScroll.height, implicitHeight)
+                storePath: root.storePath
+                enabled: root.loaded && !root.tooLarge && !root.loadingNote
+                  && !!root.selectedNote && !root.selectedNote.trashed
+                readOnly: root.selectedNote ? !!root.selectedNote.trashed : true
+                selectByMouse: true
+                wrapMode: TextEdit.Wrap
+                onCursorRectangleChanged: editorScroll.ensureVisible(cursorRectangle)
+                foregroundColor: enabled || readOnly ? Commons.Color.foreground : Util.alpha(Commons.Color.foreground, 0.38)
+                accentColor: Commons.Color.accent
+                font.family: Style.font.family
+                font.pixelSize: Style.font.body
+                leftPadding: Style.space(10)
+                rightPadding: Style.space(10)
+                topPadding: Style.space(8)
+                bottomPadding: Style.space(24)
+                placeholderText: root.tooLarge
+                  ? "This note is too large to edit safely in Quill."
+                  : root.selectedNote
+                    ? (root.selectedNote.trashed ? "This note is in Trash" : root.loaded ? "Start writing Markdown…" : "Loading note…")
+                    : "Select or create a note"
+                placeholderTextColor: Util.alpha(Commons.Color.foreground, 0.28)
+                onTextChanged: root.onEditorEdited()
+                onSelectedTextChanged: root.scheduleChatContext()
+                onLinkRequested: formatBar.openLinkPopover()
+                onNoteLinkRequested: formatBar.openNoteLink()
+                onFormatRejected: function(message) { root.statusText = message }
+                onImagePasted: function(path) { root.statusText = "Image added" }
+                onPasteFailed: function(message) { root.statusText = message }
+              }
+            }
+
+            Rectangle {
+              visible: root.mode === "split"
+              width: Style.space(1)
+              height: parent.height
+              color: Util.alpha(Commons.Color.foreground, 0.1)
+            }
+
+            Item {
+              id: previewArea
+              width: root.mode === "preview" ? parent.width
+                : root.mode === "edit" ? 0
+                : Math.floor((parent.width - Style.space(1)) / 2)
+              height: parent.height
+
+              PreviewPane {
+                anchors.fill: parent
+                visible: root.mode !== "edit" && !root.tableOpen
+                markdown: root.previewMarkdown
+                loading: root.previewLoading || root.loadingNote
+                dirty: root.dirty
+                hasNote: !!root.selectedNote
+                tooLarge: root.tooLarge
+                editable: root.loaded && !root.tooLarge && !!root.selectedNote
+                  && !root.selectedNote.trashed
+                lineOffset: root.previewLineOffset
+                onLinkActivated: function(link) { root.openLink(link) }
+                onImageResized: function(line, width) { root.setImageWidth(line, width) }
+                onImageReset: function(line) { root.clearImageSize(line) }
+                onTableActivated: function(startLine, endLine) {
+                  root.openTableAt(startLine, endLine)
+                }
+              }
+
+              TableGrid {
+                id: tableEditor
+                anchors.fill: parent
+                visible: root.tableOpen
+                sourceText: editor.text
+                editable: root.loaded && !root.tooLarge && !!root.selectedNote
+                  && !root.selectedNote.trashed
+                onCommitRequested: function(newLines) { root.applyTableWrite(newLines) }
+                onStatusMessage: function(message) { root.statusText = message }
+                onClosed: {
+                  if (root.tableOpen) root.closeTable(true)
+                }
+              }
+            }
+          }
+
+          // ---------------------------------------------------- backlinks
+          BorderSurface {
+            id: backlinksBox
+            width: parent.width
+            height: root.backlinksOpen ? Style.space(142) : Style.space(26)
+            color: Util.alpha(Commons.Color.foreground, 0.014)
+            borderSpec: Border.none
+            radius: Style.cornerRadius
+
+            Column {
+              anchors.fill: parent
+              anchors.leftMargin: Style.space(8)
+              anchors.rightMargin: Style.space(8)
+              anchors.topMargin: Style.space(3)
+              anchors.bottomMargin: Style.space(3)
+              spacing: 0
+
+              Item {
+                width: parent.width
+                height: Style.space(20)
+
+                Text {
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: (root.backlinksOpen ? "▾  " : "▸  ") + "Backlinks (" + root.backlinks.length + ")"
+                  color: root.backlinks.length > 0 ? Commons.Color.foreground : Util.alpha(Commons.Color.foreground, 0.46)
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.bodySmall
+                  font.bold: root.backlinks.length > 0
+                }
+
+                MouseArea {
+                  anchors.fill: parent
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.backlinksOpen = !root.backlinksOpen
+                }
+              }
+
+              ListView {
+                visible: root.backlinksOpen
+                width: parent.width
+                height: Math.max(0, parent.height - Style.space(22))
+                clip: true
+                model: root.backlinks
+                spacing: Style.space(2)
+
+                delegate: BorderSurface {
+                  id: backlinkRow
+                  required property var modelData
+                  width: ListView.view.width
+                  height: Style.space(28)
+                  color: backMouse.containsMouse ? Style.hoverFillFor(Commons.Color.foreground, Commons.Color.accent) : "transparent"
+                  borderSpec: Border.none
+                  radius: Style.cornerRadius
+
+                  Row {
+                    anchors.fill: parent
+                    anchors.leftMargin: Style.space(6)
+                    anchors.rightMargin: Style.space(6)
+                    spacing: Style.space(6)
+                    Text {
+                      anchors.verticalCenter: parent.verticalCenter
+                      text: "←"
+                      color: Util.alpha(Commons.Color.foreground, 0.35)
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.caption
+                    }
+                    Text {
+                      width: parent.width - Style.space(22)
+                      anchors.verticalCenter: parent.verticalCenter
+                      text: String(backlinkRow.modelData.title || "Untitled")
+                      textFormat: Text.PlainText
+                      color: Commons.Color.foreground
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.bodySmall
+                      elide: Text.ElideRight
+                    }
+                  }
+
+                  MouseArea {
+                    id: backMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.selectNote(String(backlinkRow.modelData.id))
+                  }
+                }
+
+                Text {
+                  visible: root.backlinks.length === 0
+                  anchors.centerIn: parent
+                  text: "No other note links here yet"
+                  color: Util.alpha(Commons.Color.foreground, 0.32)
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                }
+              }
+            }
+          }
+        }
+      }
+
+      ChatDock {
+        id: chatDock
+        anchors.right: parent.right
+        anchors.top: parent.top
+        anchors.bottom: parent.bottom
+        visible: root.chatOpen && root.active
+        width: Style.space(340)
+        dataRoot: root.dataRoot
+        pluginDir: root.pluginDir
+        onCloseRequested: root.chatOpen = false
+        onLinkActivated: function(link) { root.openLink(link) }
+      }
+    }
+
+    Row {
+      id: statusBar
+      width: parent.width
+      height: Style.space(20)
+      spacing: Style.space(6)
+
+      Rectangle {
+        width: Style.space(6)
+        height: width
+        radius: width / 2
+        anchors.verticalCenter: parent.verticalCenter
+        color: root.dirty ? Commons.Color.accent : Util.alpha(Commons.Color.foreground, 0.3)
+      }
+      Text {
+        anchors.verticalCenter: parent.verticalCenter
+        text: root.statusText
+        textFormat: Text.PlainText
+        color: Util.alpha(Commons.Color.foreground, 0.55)
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
+        elide: Text.ElideRight
+        width: parent.width - shortcuts.width - Style.space(24)
+      }
+      Text {
+        id: shortcuts
+        anchors.verticalCenter: parent.verticalCenter
+        text: "Ctrl+N new · Ctrl+T table · Ctrl+S save · Ctrl+E view · Ctrl+1/2/3 panes"
+        textFormat: Text.PlainText
+        color: Util.alpha(Commons.Color.foreground, 0.3)
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
+        elide: Text.ElideRight
+        width: Math.min(implicitWidth, parent.width * 0.5)
+      }
+    }
+  }
+
+  // The bridge reports ready before the service is necessarily usable; send
+  // the current note context once it is up so "this note" works immediately.
+  Connections {
+    target: chatDock.agent
+
+    function onReadyChanged() {
+      if (root.chatOpen && chatDock.agent.ready) root.pushChatContext(true)
+    }
+  }
+
+  Rectangle {
+    id: chatToast
+    visible: root.chatNotice !== ""
+    z: 150
+    anchors.horizontalCenter: parent.horizontalCenter
+    anchors.bottom: parent.bottom
+    anchors.bottomMargin: Style.space(32)
+    width: chatToastLabel.implicitWidth + Style.space(24)
+    height: chatToastLabel.implicitHeight + Style.space(12)
+    color: Util.alpha(Commons.Color.background, 0.96)
+    border.width: 1
+    border.color: Util.alpha(Commons.Color.accent, 0.35)
+    radius: Style.cornerRadius
+
+    Text {
+      id: chatToastLabel
+      anchors.centerIn: parent
+      text: root.chatNotice
+      textFormat: Text.PlainText
+      color: Commons.Color.foreground
+      font.family: Style.font.family
+      font.pixelSize: Style.font.bodySmall
+    }
+  }
+
+  // ------------------------------------------------------------ view menu
+  // Drawn in the library scene rather than as a native Qt menu so it follows
+  // the theme and stays visible in grabToImage. The backdrop closes it on the
+  // first click outside; rows deliberately keep it open.
+  Item {
+    id: viewOverlay
+    anchors.fill: parent
+    visible: root.viewMenuOpen
+    z: 100
+
+    MouseArea {
+      anchors.fill: parent
+      onClicked: root.closeViewMenu()
+    }
+
+    BorderSurface {
+      id: viewMenu
+      width: Style.space(196)
+      height: viewMenuColumn.implicitHeight + Style.space(10)
+      color: Commons.Color.background
+      borderSpec: Border.controlSpec("normal", Commons.Color.foreground, Commons.Color.accent)
+      radius: Style.cornerRadius
+
+      // The View button is the last header action, so the menu right-aligns
+      // with the header's right edge. Avoid mapToItem here: a binding inside a
+      // layout can evaluate before the header settles.
+      x: Math.max(Style.space(8), root.width - width - Style.space(2))
+      y: headerRow.y + headerRow.height + Style.space(4)
+
+      // Clicks on padding should not reach the backdrop.
+      MouseArea {
+        anchors.fill: parent
+        onClicked: {}
+      }
+
+      Column {
+        id: viewMenuColumn
+        anchors.fill: parent
+        anchors.margins: Style.space(5)
+        spacing: Style.space(1)
+
+        ViewMenuRow {
+          label: "Library"
+          checked: root.sidebarOpen
+          onActivated: root.toggleSidebar()
+        }
+        ViewMenuRow {
+          label: "Notes"
+          checked: root.noteListOpen
+          onActivated: root.toggleNoteList()
+        }
+        ViewMenuRow {
+          label: "Editor"
+          checked: root.mode !== "preview"
+          onActivated: root.toggleEditor()
+        }
+        ViewMenuRow {
+          label: "Preview"
+          checked: root.mode !== "edit"
+          onActivated: root.togglePreview()
+        }
+        ViewMenuRow {
+          label: "Agent"
+          checked: root.chatOpen
+          onActivated: root.toggleChat()
+        }
+
+        Rectangle {
+          width: parent.width
+          height: 1
+          color: Util.alpha(Commons.Color.foreground, 0.12)
+        }
+
+        ViewMenuRow {
+          label: "Reset layout"
+          showCheck: false
+          onActivated: root.resetLayout()
+        }
+      }
+    }
+  }
+
+  // --------------------------------------------------------- note header
+  component NoteHeader: Item {
+    id: noteHeaderRoot
+    width: parent ? parent.width : 0
+
+    Column {
+      anchors.fill: parent
+      spacing: Style.space(4)
+      visible: !!root.selectedNote
+
+      Row {
+        width: parent.width
+        height: Style.space(32)
+        spacing: Style.space(8)
+
+        Column {
+          width: parent.width - headerTools.width - parent.spacing
+          anchors.verticalCenter: parent.verticalCenter
+          spacing: 0
+          Text {
+            width: parent.width
+            text: root.selectedNote ? String(root.selectedNote.title || "Untitled") : "No note selected"
+            textFormat: Text.PlainText
+            color: Commons.Color.foreground
+            font.family: Style.font.family
+            font.pixelSize: Style.font.heading
+            font.bold: true
+            elide: Text.ElideRight
+          }
+          Text {
+            width: parent.width
+            text: root.selectedNote
+              ? (root.selectedNote.folder ? String(root.selectedNote.folder) : "Inbox")
+                + "  ·  " + root.relativeTime(root.selectedNote.modified)
+                + "  ·  " + root.wordCount + (root.wordCount === 1 ? " word" : " words")
+                + (root.backlinks.length > 0 ? "  ·  " + root.backlinks.length + (root.backlinks.length === 1 ? " backlink" : " backlinks") : "")
+              : ""
+            textFormat: Text.PlainText
+            color: Util.alpha(Commons.Color.foreground, 0.46)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+            elide: Text.ElideRight
+          }
+        }
+
+        Row {
+          id: headerTools
+          anchors.verticalCenter: parent.verticalCenter
+          spacing: Style.space(5)
+
+          Text {
+            anchors.verticalCenter: parent.verticalCenter
+            text: root.saveState
+            color: root.saveState.indexOf("Unsaved") === 0 || root.saveState.indexOf("Saving") === 0 || root.saveState.indexOf("failed") >= 0
+              ? Commons.Color.accent
+              : Util.alpha(Commons.Color.foreground, 0.42)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+          }
+
+          Dropdown {
+            visible: !!root.selectedNote && !root.selectedNote.trashed
+            width: root.compactHeader ? Style.space(104) : Style.space(136)
+            rowHeight: Style.space(26)
+            showLabel: false
+            options: root.folderOptions
+            value: root.selectedNote ? String(root.selectedNote.folder || "") : ""
+            onChanged: function(value) { root.moveSelectedTo(value) }
+          }
+
+          Button {
+            visible: !!root.selectedNote && !root.selectedNote.trashed && !root.compactHeader
+            text: root.selectedNote && root.selectedNote.pinned ? "Unpin" : "Pin"
+            fontSize: Style.font.bodySmall
+            horizontalPadding: Style.space(7)
+            verticalPadding: Style.space(4)
+            onClicked: root.togglePin()
+          }
+          Button {
+            visible: !!root.selectedNote && !root.selectedNote.trashed && !root.compactHeader
+            text: root.deleteArmed && root.deleteArmId === root.selectedId ? "Confirm trash" : "Trash"
+            foreground: root.deleteArmed ? Commons.Color.urgent : Util.alpha(Commons.Color.foreground, 0.6)
+            fontSize: Style.font.bodySmall
+            horizontalPadding: Style.space(7)
+            verticalPadding: Style.space(4)
+            onClicked: root.trashSelected()
+          }
+          Button {
+            visible: !!root.selectedNote && !!root.selectedNote.trashed && !root.compactHeader
+            text: "Restore"
+            fontSize: Style.font.bodySmall
+            horizontalPadding: Style.space(7)
+            verticalPadding: Style.space(4)
+            onClicked: root.restoreSelected()
+          }
+          Button {
+            visible: !!root.selectedNote && !!root.selectedNote.trashed && !root.compactHeader
+            text: root.deleteArmed && root.deleteArmId === root.selectedId ? "Confirm delete" : "Delete forever"
+            foreground: root.deleteArmed ? Commons.Color.urgent : Util.alpha(Commons.Color.foreground, 0.6)
+            fontSize: Style.font.bodySmall
+            horizontalPadding: Style.space(7)
+            verticalPadding: Style.space(4)
+            onClicked: root.deleteForeverSelected()
+          }
+        }
+      }
+
+      Row {
+        width: parent.width
+        height: Style.space(20)
+        spacing: Style.space(5)
+        visible: !!root.selectedNote
+
+        Repeater {
+          model: root.selectedNote && root.selectedNote.tags ? root.selectedNote.tags : []
+          delegate: TagChip {
+            required property var modelData
+            label: "#" + String(modelData)
+            onActivated: root.selectCategory("tag:" + String(modelData))
+          }
+        }
+
+        Item { width: Math.max(0, parent.width - x); height: 1 }
+
+        Text {
+          visible: root.category === "trash"
+          anchors.verticalCenter: parent.verticalCenter
+          text: "Empty trash"
+          color: root.deleteArmed ? Commons.Color.urgent : Util.alpha(Commons.Color.foreground, 0.45)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+          MouseArea {
+            anchors.fill: parent
+            anchors.margins: -4
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.emptyTrash()
+          }
+        }
+      }
+    }
+
+    Text {
+      visible: !root.selectedNote
+      anchors.verticalCenter: parent.verticalCenter
+      text: "Choose a note from the list, or press Ctrl+N to start one"
+      color: Util.alpha(Commons.Color.foreground, 0.4)
+      font.family: Style.font.family
+      font.pixelSize: Style.font.bodySmall
+    }
+  }
+
+  component TagChip: BorderSurface {
+    id: chip
+    property string label: ""
+    signal activated()
+    width: chipLabel.implicitWidth + Style.space(12)
+    height: Style.space(18)
+    color: chipMouse.containsMouse ? Style.hoverFillFor(Commons.Color.foreground, Commons.Color.accent) : Util.alpha(Commons.Color.accent, 0.09)
+    borderSpec: Border.flat(Util.alpha(Commons.Color.accent, 0.22), 1)
+    radius: Style.cornerRadius
+
+    Text {
+      id: chipLabel
+      anchors.centerIn: parent
+      text: chip.label
+      textFormat: Text.PlainText
+      color: Util.alpha(Commons.Color.accent, 0.9)
+      font.family: Style.font.family
+      font.pixelSize: Style.font.caption
+    }
+    MouseArea {
+      id: chipMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: chip.activated()
+    }
+  }
+
+  component ViewMenuRow: BorderSurface {
+    id: viewRow
+
+    property string label: ""
+    property bool checked: false
+    property bool showCheck: true
+    signal activated()
+
+    width: parent ? parent.width : 0
+    height: Style.space(26)
+    color: viewRowMouse.containsMouse
+      ? Style.hoverFillFor(Commons.Color.foreground, Commons.Color.accent)
+      : "transparent"
+    borderSpec: Border.none
+    radius: Style.cornerRadius
+
+    Row {
+      anchors.fill: parent
+      anchors.leftMargin: Style.space(7)
+      anchors.rightMargin: Style.space(7)
+      spacing: Style.space(5)
+
+      Text {
+        width: Style.space(14)
+        anchors.verticalCenter: parent.verticalCenter
+        text: viewRow.showCheck && viewRow.checked ? "✓" : ""
+        color: Commons.Color.accent
+        font.family: Style.font.family
+        font.pixelSize: Style.font.bodySmall
+        font.bold: true
+        horizontalAlignment: Text.AlignHCenter
+      }
+
+      Text {
+        width: parent.width - Style.space(19)
+        anchors.verticalCenter: parent.verticalCenter
+        text: viewRow.label
+        textFormat: Text.PlainText
+        color: viewRow.checked || !viewRow.showCheck
+          ? Commons.Color.foreground
+          : Util.alpha(Commons.Color.foreground, 0.7)
+        font.family: Style.font.family
+        font.pixelSize: Style.font.bodySmall
+        elide: Text.ElideRight
+      }
+    }
+
+    MouseArea {
+      id: viewRowMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: viewRow.activated()
+    }
+  }
+
+  component ModeButton: BorderSurface {
+    id: modeButton
+    property string label: ""
+    property bool current: false
+    signal activated()
+    width: modeLabel.implicitWidth + Style.space(14)
+    height: Style.space(26)
+    color: current ? Style.selectedAccentFill : modeMouse.containsMouse ? Style.hoverFillFor(Commons.Color.foreground, Commons.Color.accent) : "transparent"
+    borderSpec: current ? Border.controlSpec("selected", Commons.Color.accent, Commons.Color.accent) : Border.none
+    radius: Style.cornerRadius
+
+    Text {
+      id: modeLabel
+      anchors.centerIn: parent
+      text: modeButton.label
+      color: Commons.Color.foreground
+      font.family: Style.font.family
+      font.pixelSize: Style.font.caption
+      font.bold: modeButton.current
+    }
+    MouseArea {
+      id: modeMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: modeButton.activated()
+    }
+  }
+
+  function relativeTime(milliseconds) {
+    var value = Number(milliseconds || 0)
+    if (!value) return ""
+    var date = new Date(value)
+    var now = new Date()
+    var today = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
+    if (value >= today) return Qt.formatTime(date, "HH:mm")
+    if (value >= today - 86400000) return "Yesterday"
+    if (date.getFullYear() === now.getFullYear()) return Qt.formatDate(date, "MMM d")
+    return Qt.formatDate(date, "yyyy-MM-dd")
+  }
+}

@@ -1,0 +1,538 @@
+#!/usr/bin/env python3
+"""quill-joplin-restore - read a note back from Joplin into Quill (GET only).
+
+The mirror is one-way, so a Joplin note is normally the last copy of an edit
+made there. This tool lets you inspect the Quill notebook, compare it with the
+local files, and copy one Joplin body back into Quill. It never deletes or
+updates Joplin data: it only issues GET requests.
+
+Safety rules:
+  * A mapped local file is only overwritten with --yes, and quill-store
+    snapshots the replaced bytes first.
+  * A missing mapped file is recreated at its exact id with
+    `quill-store write <id> --create`.
+  * `--to-new` creates a new local note and leaves the existing mapping alone;
+    the next sync will create a second Joplin note for that copy.
+  * Nothing is written with --dry-run.
+  * The API token is read from config/settings and never printed.
+
+Exit codes: 0 = success/no-op, 1 = error, 2 = ambiguous title or --yes needed,
+3 = Joplin unreachable.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+EXIT_OK, EXIT_ERROR, EXIT_NEEDS_DECISION, EXIT_NO_JOPLIN = 0, 1, 2, 3
+DEFAULT_SYNC_TOOL = "~/.local/bin/omanano-joplin-sync"
+DEFAULT_NOTES_DIR = "~/.local/share/quill/notes"
+DEFAULT_STATE = "~/.local/share/quill-joplin/state.json"
+DEFAULT_STORE = "~/.config/omarchy/plugins/matt.quill/scripts/quill-store"
+DEFAULT_NOTEBOOK = "Quill"
+DEFAULT_API = "http://127.0.0.1:41184"
+SOURCE_PREFIX = "omanano://"
+MAX_NOTE_BYTES = 1024 * 1024
+NOTE_FIELDS = "id,title,body,parent_id,updated_time,source_url,deleted_time"
+FOLDER_FIELDS = "id,title,parent_id,deleted_time"
+
+
+class RestoreError(Exception):
+    """A safe, user-facing failure."""
+
+
+def expand(value):
+    return Path(os.path.expanduser(str(value)))
+
+
+def sha256_bytes(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def normalize_newlines(text):
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def same_text(left, right):
+    return normalize_newlines(left) == normalize_newlines(right)
+
+
+def safe_relative(raw):
+    """Same id rules as quill-store: a relative path below notes/."""
+    value = str(raw or "").replace("\\", "/").strip()
+    if not value:
+        raise RestoreError("note id is empty")
+    if "\x00" in value:
+        raise RestoreError("invalid note id")
+    candidate = Path(value)
+    if candidate.is_absolute() or value.startswith("/"):
+        raise RestoreError(f"note id is absolute: {value}")
+    if any(part in {"", ".", ".."} for part in candidate.parts):
+        raise RestoreError(f"invalid note id: {value}")
+    return candidate.as_posix()
+
+
+def local_path(notes_dir, relative):
+    base = expand(notes_dir).resolve()
+    relative = safe_relative(relative)
+    path = (base / relative).resolve()
+    if path != base and base not in path.parents:
+        raise RestoreError(f"note id escapes notes/: {relative}")
+    return path
+
+
+def load_sync_module(path):
+    target = expand(path)
+    if not target.is_file():
+        raise RestoreError(f"sync module not found: {target}")
+    loader = SourceFileLoader("omanano_joplin_sync", str(target))
+    spec = importlib.util.spec_from_file_location(
+        "omanano_joplin_sync", str(target), loader=loader)
+    if spec is None or spec.loader is None:
+        raise RestoreError(f"cannot load sync module: {target}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def sync_title(sync, body):
+    """The title the next sync will derive from this body."""
+    frontmatter, note_body = sync.split_frontmatter(body)
+    note_body = sync.strip_image_sizes(note_body)
+    return ((sync.frontmatter_title(frontmatter) if frontmatter is not None else "")
+            or sync.derive_title(note_body))
+
+
+def reverse_mapping(state):
+    """Joplin id -> sorted local ids (duplicates are handled deterministically)."""
+    mapping = {}
+    for rel in sorted(state.get("notes", {})):
+        entry = state["notes"][rel]
+        note_id = str((entry or {}).get("id") or "")
+        if note_id:
+            mapping.setdefault(note_id, []).append(rel)
+    return mapping
+
+
+def folder_subtree(api, notebook, reporter):
+    """Return (root folder, ids in the subtree, titles by id)."""
+    folders = api.get_all("/folders", {"fields": FOLDER_FIELDS})
+    live = [f for f in folders if not f.get("deleted_time")]
+    roots = sorted((f for f in live if str(f.get("title") or "") == notebook),
+                   key=lambda f: str(f.get("id") or ""))
+    if not roots:
+        raise RestoreError(f"Joplin notebook not found: {notebook!r}")
+    if len(roots) > 1:
+        reporter.warn(f"warning: {len(roots)} notebooks are titled {notebook!r}; "
+                      f"using {roots[0].get('id')}")
+    root = roots[0]
+    children = {}
+    for folder in live:
+        children.setdefault(str(folder.get("parent_id") or ""), []).append(folder)
+    ids, titles, queue = {str(root["id"])}, {str(root["id"]): str(root.get("title") or "")}, [str(root["id"])]
+    while queue:
+        current = queue.pop(0)
+        for child in children.get(current, []):
+            child_id = str(child.get("id") or "")
+            if not child_id or child_id in ids:
+                continue
+            ids.add(child_id)
+            titles[child_id] = str(child.get("title") or "")
+            queue.append(child_id)
+    return root, ids, titles
+
+
+def subtree_notes(api, folder_ids):
+    notes = api.get_all("/notes", {"fields": NOTE_FIELDS})
+    return [note for note in notes
+            if str(note.get("parent_id") or "") in folder_ids
+            and not note.get("deleted_time")]
+
+
+def note_entry(api, note_id):
+    note = api.request("GET", f"/notes/{note_id}", {"fields": NOTE_FIELDS})
+    if not isinstance(note, dict) or not note.get("id"):
+        raise RestoreError(f"Joplin note not found: {note_id}")
+    if note.get("deleted_time"):
+        raise RestoreError(f"Joplin note is in the trash: {note_id}")
+    return note
+
+
+def select_note(args, api, notebook, reporter):
+    """Pick one note by exact id or a unique (case-insensitive) title."""
+    if args.id:
+        return note_entry(api, args.id)
+    _root, folder_ids, _titles = folder_subtree(api, notebook, reporter)
+    notes = subtree_notes(api, folder_ids)
+    wanted = args.title
+    matches = [note for note in notes if str(note.get("title") or "") == wanted]
+    if not matches:
+        matches = [note for note in notes
+                   if str(note.get("title") or "").casefold() == wanted.casefold()]
+    if len(matches) == 1:
+        return note_entry(api, str(matches[0]["id"]))
+    return matches   # zero or several: the caller reports and exits 2
+
+
+def emit_ambiguous(matches, title, as_json, reporter):
+    reporter.warn(f"error: title {title!r} does not identify exactly one note")
+    if as_json:
+        print(json.dumps({
+            "error": f"title {title!r} is ambiguous",
+            "candidates": [{"id": str(n.get("id") or ""),
+                            "title": str(n.get("title") or ""),
+                            "parent_id": str(n.get("parent_id") or "")}
+                           for n in matches],
+        }, ensure_ascii=False))
+    else:
+        if not matches:
+            print(f"No note titled {title!r} in the Quill notebook.")
+        else:
+            print(f"Several notes match {title!r}; use --id:")
+            for note in matches:
+                print(f"  {note.get('id')}  {note.get('title')}  "
+                      f"(parent {note.get('parent_id')})")
+    return EXIT_NEEDS_DECISION
+
+
+def list_notes(api, state, notes_dir, notebook, reporter, as_json):
+    root, folder_ids, titles = folder_subtree(api, notebook, reporter)
+    reverse = reverse_mapping(state)
+    entries = []
+    for note in sorted(subtree_notes(api, folder_ids),
+                       key=lambda n: (str(n.get("title") or ""), str(n.get("id") or ""))):
+        note_id = str(note.get("id") or "")
+        rels = reverse.get(note_id, [])
+        rel = rels[0] if rels else None
+        if len(rels) > 1:
+            reporter.warn(f"warning: Joplin note {note_id} maps to several local "
+                          f"notes ({', '.join(rels)}); using {rel}")
+        body = str(note.get("body") or "")
+        local_size = local_hash = None
+        if rel is None:
+            status = "unmapped"
+        else:
+            path = local_path(notes_dir, rel)
+            if not path.is_file():
+                status = "missing"
+            else:
+                local_size = path.stat().st_size
+                local_hash = sha256_file(path)
+                expected = str((state["notes"].get(rel) or {}).get("hash") or "")
+                status = "unchanged" if expected and local_hash == expected else "diverged"
+        entries.append({
+            "id": note_id,
+            "title": str(note.get("title") or ""),
+            "parent_id": str(note.get("parent_id") or ""),
+            "parent_title": titles.get(str(note.get("parent_id") or ""), ""),
+            "size": len(body.encode("utf-8")),
+            "updated_time": note.get("updated_time"),
+            "local_id": rel,
+            "local_size": local_size,
+            "local_sha256": local_hash,
+            "status": status,
+        })
+    payload = {"notebook": notebook, "root_id": str(root["id"]),
+               "notes": entries, "warnings": reporter.warnings}
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"Joplin notebook {notebook} ({root['id']}): {len(entries)} notes")
+        for item in entries:
+            local = item["local_id"] or "-"
+            print(f"{item['status'].upper():9} {item['id']}  {item['title']}  "
+                  f"parent={item['parent_id']}  {item['size']}B  "
+                  f"updated={item['updated_time']}  local={local}")
+    return EXIT_OK
+
+
+def run_store(store, data_root, command, relative=None, body=None):
+    """Run quill-store and return its parsed JSON reply."""
+    argv = [str(expand(store)), command]
+    if relative is not None:
+        argv.append(relative)
+    if command == "write":
+        argv += ["--create", "--stdin"]
+    elif command == "create":
+        argv.append("--content-stdin")
+    env = os.environ.copy()
+    env["QUILL_DATA_DIR"] = str(expand(data_root))
+    try:
+        result = subprocess.run(argv, input=(body or "").encode("utf-8"),
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                env=env, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RestoreError(f"could not run quill-store: {exc}") from exc
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", "replace").strip()
+        try:
+            detail = str(json.loads(detail).get("error") or detail)
+        except (ValueError, TypeError):
+            pass
+        raise RestoreError(f"quill-store {command} failed: {detail}")
+    try:
+        return json.loads(result.stdout.decode("utf-8") or "{}")
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise RestoreError("quill-store returned invalid JSON") from exc
+
+
+def plan_payload(note, rel, status, local_meta, remote_bytes, *, to_new=False):
+    return {
+        "mode": "to-new" if to_new else "restore",
+        "joplin_id": str(note.get("id") or ""),
+        "joplin_title": str(note.get("title") or ""),
+        "parent_id": str(note.get("parent_id") or ""),
+        "target": rel,
+        "status": status,
+        "local": local_meta,
+        "remote": {"size": len(remote_bytes), "sha256": sha256_bytes(remote_bytes)},
+        "written": False,
+        "state_updated": False,
+    }
+
+
+def restore(args, sync, api, state, state_path, notes_dir, store, data_root, reporter):
+    note = select_note(args, api, args.notebook, reporter)
+    if isinstance(note, list):
+        return emit_ambiguous(note, args.title, args.json, reporter)
+
+    note_id = str(note.get("id") or "")
+    body = str(note.get("body") or "")
+    remote_bytes = body.encode("utf-8")
+    if len(remote_bytes) > MAX_NOTE_BYTES:
+        raise RestoreError(f"Joplin note is larger than the 1 MiB local limit "
+                           f"({len(remote_bytes)} bytes); refusing to restore")
+    title = sync_title(sync, body)
+
+    reverse = reverse_mapping(state)
+    rels = reverse.get(note_id, [])
+    if rels:
+        rel, origin = rels[0], "mapped"
+        if len(rels) > 1:
+            reporter.warn(f"warning: Joplin note {note_id} maps to several local "
+                          f"notes ({', '.join(rels)}); using {rel}")
+    else:
+        source = str(note.get("source_url") or "")
+        if source.startswith(SOURCE_PREFIX):
+            rel, origin = safe_relative(source[len(SOURCE_PREFIX):]), "source_url"
+        else:
+            rel, origin = None, "unmapped"
+
+    # --to-new never touches the mapped file or its state entry.
+    if args.to_new:
+        if args.dry_run:
+            payload = plan_payload(note, rel, "unmapped" if rel is None else "diverged",
+                                   {"id": None, "exists": False, "size": 0, "sha256": None},
+                                   remote_bytes, to_new=True)
+            payload["warnings"] = reporter.warnings + [
+                "next sync will create a second Joplin note for this copy"]
+            if args.json:
+                print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+            else:
+                print(f"Dry run: would create a new local note from {note.get('title')!r} "
+                      f"({note_id}); the existing mapping is left untouched.")
+            return EXIT_OK
+        created = run_store(store, data_root, "create", body=body)
+        reporter.warn("warning: created a new local copy; the existing state mapping "
+                      "was not changed, so the next sync will create a second Joplin "
+                      "note for this copy")
+        local_id = str(created.get("id") or "")
+        payload = plan_payload(note, rel, "unmapped" if rel is None else "diverged",
+                               {"id": local_id, "exists": True,
+                                "size": len(remote_bytes), "sha256": None},
+                               remote_bytes, to_new=True)
+        payload["written"] = True
+        payload["new_local_id"] = local_id
+        payload["warnings"] = reporter.warnings
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        else:
+            print(f"Created new local note {local_id} from Joplin note {note_id} "
+                  f"({note.get('title')!r}).")
+        return EXIT_OK
+
+    if rel is None:
+        raise RestoreError(
+            "this Joplin note has no Quill mapping or omanano:// source_url; "
+            "rerun with --to-new to create a new local note")
+
+    path = local_path(notes_dir, rel)
+    exists = path.is_file()
+    local_meta = {"id": rel, "exists": exists, "size": 0, "sha256": None}
+    if exists:
+        local_bytes = path.read_bytes()
+        local_meta["size"] = len(local_bytes)
+        local_meta["sha256"] = sha256_bytes(local_bytes)
+        local_text = local_bytes.decode("utf-8", errors="replace")
+        status = "unchanged" if same_text(local_text, body) else "diverged"
+    else:
+        status = "missing"
+
+    payload = plan_payload(note, rel, status, local_meta, remote_bytes)
+    payload["mapping_origin"] = origin
+
+    if status == "unchanged":
+        payload["mode"] = "noop"
+        payload["warnings"] = reporter.warnings
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        else:
+            print(f"No change: {rel} already matches Joplin note {note_id} "
+                  f"({note.get('title')!r}).")
+        return EXIT_OK
+
+    if status == "diverged" and not args.yes and not args.dry_run:
+        payload["needs_yes"] = True
+        payload["warnings"] = reporter.warnings
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        else:
+            print(f"Joplin note: {note.get('title')!r} ({note_id})")
+            print(f"Local note:  {rel} ({local_meta['size']} bytes, "
+                  f"sha256 {local_meta['sha256']})")
+            print(f"Joplin body: {len(remote_bytes)} bytes, "
+                  f"sha256 {payload['remote']['sha256']}")
+            print("The local copy differs. Rerun with --yes to overwrite it; "
+                  "quill-store keeps a local snapshot first.")
+        return EXIT_NEEDS_DECISION
+
+    if args.dry_run:
+        payload["warnings"] = reporter.warnings
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        else:
+            action = "create the missing local note" if status == "missing" \
+                else "overwrite the local note"
+            print(f"Dry run: would {action} {rel} from Joplin note {note_id} "
+                  f"({note.get('title')!r}); nothing written.")
+        return EXIT_OK
+
+    run_store(store, data_root, "write", relative=rel, body=body)
+    raw = path.read_bytes()
+    actual_hash = sha256_bytes(raw)
+
+    state["notes"][rel] = {
+        "id": note_id,
+        "hash": actual_hash,
+        "title": title,
+        "parent_id": str(note.get("parent_id") or ""),
+        "updated_time": note.get("updated_time"),
+    }
+    sync.save_state(state_path, state)
+
+    payload["mode"] = "restore"
+    payload["written"] = True
+    payload["state_updated"] = True
+    payload["local"] = {"id": rel, "exists": True, "size": len(raw),
+                        "sha256": actual_hash}
+    payload["warnings"] = reporter.warnings
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    else:
+        action = "Recreated" if status == "missing" else "Restored"
+        print(f"{action} {rel} from Joplin note {note_id} "
+              f"({note.get('title')!r}); state updated.")
+    return EXIT_OK
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="quill-joplin-restore",
+        description="Read a note back from Joplin into Quill (GET only).")
+    parser.add_argument("--list", action="store_true",
+                        help="list Quill-notebook notes and their mapping status")
+    parser.add_argument("--id", help="Joplin note id to restore (wins over --title)")
+    parser.add_argument("--title", help="exact Joplin note title to restore")
+    parser.add_argument("--to-new", action="store_true",
+                        help="create a new local note; leave the existing mapping alone")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="show the plan/diff and write nothing")
+    parser.add_argument("--yes", action="store_true",
+                        help="overwrite an existing, different local note")
+    parser.add_argument("--json", action="store_true", help="machine-readable output")
+    parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--notes-dir", help=f"default {DEFAULT_NOTES_DIR}")
+    parser.add_argument("--state", help=f"default {DEFAULT_STATE}")
+    parser.add_argument("--store", help=f"default {DEFAULT_STORE}")
+    parser.add_argument("--data-root",
+                        help="quill-store data root (default: parent of --notes-dir)")
+    parser.add_argument("--notebook", help=f"default {DEFAULT_NOTEBOOK}")
+    parser.add_argument("--api-url", help=f"default {DEFAULT_API}")
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        sync = load_sync_module(
+            os.environ.get("QUILL_JOPLIN_SYNC_TOOL") or DEFAULT_SYNC_TOOL)
+    except RestoreError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    reporter = sync.Reporter(quiet=args.quiet, as_json=args.json)
+    try:
+        cfg = dict(sync.DEFAULT_CONFIG)
+        if sync.CONFIG_PATH.exists():      # avoid creating a config as a side effect
+            cfg = sync.load_config()
+        token = sync.load_token(cfg)
+        args.notebook = (args.notebook or os.environ.get("QUILL_JOPLIN_NOTEBOOK")
+                         or DEFAULT_NOTEBOOK)
+        notes_dir = expand(args.notes_dir or os.environ.get("QUILL_JOPLIN_NOTES_DIR")
+                           or DEFAULT_NOTES_DIR)
+        state_path = expand(args.state or os.environ.get("QUILL_JOPLIN_STATE")
+                            or DEFAULT_STATE)
+        store = args.store or os.environ.get("QUILL_STORE_PATH") or DEFAULT_STORE
+        data_root = args.data_root or notes_dir.parent
+        api_url = (args.api_url or os.environ.get("QUILL_JOPLIN_API_URL")
+                   or DEFAULT_API)
+    except (sync.ConfigError, RestoreError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    if not args.list and not args.id and not args.title:
+        print("error: choose --list, --id JOPLIN_ID or --title TITLE", file=sys.stderr)
+        return EXIT_ERROR
+    if args.list and (args.id or args.title):
+        print("error: --list cannot be combined with --id/--title", file=sys.stderr)
+        return EXIT_ERROR
+
+    api = sync.Joplin(api_url, token)
+    if not api.ping():
+        print(f"Joplin API unreachable at {api_url}", file=sys.stderr)
+        return EXIT_NO_JOPLIN
+
+    try:
+        state = sync.load_state(state_path, reporter)
+        if args.list:
+            return list_notes(api, state, notes_dir, args.notebook, reporter, args.json)
+        return restore(args, sync, api, state, state_path, notes_dir, store,
+                       data_root, reporter)
+    except RestoreError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    except sync.JoplinError as exc:
+        print(f"error: Joplin API call failed: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

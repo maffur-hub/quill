@@ -1,0 +1,337 @@
+#!/usr/bin/env node
+"use strict"
+
+// quill-math - render TeX to themed SVG files for the Quill preview.
+//
+// One JSON request on stdin, one JSON response on stdout. Every formula in a
+// note is batched into this single node process, because MathJax's cold start
+// (~0.2 s) dominates. Results are cached by (tex, display, colour, font size)
+// under $XDG_CACHE_HOME/quill/math and reused until the theme or size changes.
+//
+//   {"color":"#rrggbb","fontPx":15,
+//    "items":[{"id":"1","tex":"x^2","display":false}]}
+//   {"items":[{"id":"1","ok":true,"path":"/home/.../abc.svg","invalid":false}]}
+//
+// `invalid` means MathJax rendered its own error image (a merror node); the
+// file is still written so the preview can show it with a warning border.
+// Per-item failures are reported in the response and never change the exit
+// status. Bad JSON or a missing vendor tree exits non-zero.
+//
+//   quill-math --purge    remove the cache directory
+//   quill-math --stats    print {"files":n,"bytes":n}
+
+const fs = require("fs")
+const os = require("os")
+const path = require("path")
+const crypto = require("crypto")
+
+const MAX_TEX_CHARS = 20000
+const MAX_CACHE_FILES = 2000
+const MAX_CACHE_BYTES = 64 * 1024 * 1024
+const MAX_LOG_BYTES = 256 * 1024
+const DEFAULT_COLOR = "#ffffff"
+const DEFAULT_FONT_PX = 15
+
+// MathJax writes nothing to stdout on success, but keep any stray chatter out
+// of the JSON channel just in case.
+for (const method of ["log", "info", "warn", "debug"]) {
+  console[method] = (...args) => process.stderr.write(args.join(" ") + "\n")
+}
+
+function cacheDirectory() {
+  const base = process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache")
+  return path.join(base, "quill", "math")
+}
+
+function logPath() {
+  const base = process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state")
+  return path.join(base, "quill", "math.log")
+}
+
+// Diagnostics go to a file because QML cannot read a child process's stderr
+// after the fact. Keep the log bounded so a broken formula cannot fill the disk.
+function logFailure(message) {
+  try {
+    const file = logPath()
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    const line = new Date().toISOString() + " "
+      + String(message).replace(/\s+/g, " ").slice(0, 400) + "\n"
+    fs.appendFileSync(file, line)
+    const stat = fs.statSync(file)
+    if (stat.size > MAX_LOG_BYTES) {
+      const contents = fs.readFileSync(file)
+      fs.writeFileSync(file, contents.subarray(contents.length - MAX_LOG_BYTES / 2))
+    }
+  } catch (error) {
+    // Diagnostics are best-effort; never fail a render because of them.
+  }
+}
+
+function normaliseColor(value) {
+  const color = String(value === undefined || value === null ? "" : value).trim()
+  return /^#[0-9a-fA-F]{3,8}$/.test(color) ? color : DEFAULT_COLOR
+}
+
+function normaliseFontPx(value) {
+  const size = Math.round(Number(value))
+  if (!isFinite(size) || size <= 0) return DEFAULT_FONT_PX
+  return Math.max(6, Math.min(200, size))
+}
+
+function cacheKey(tex, display, color, fontPx) {
+  return crypto.createHash("sha256")
+    .update(tex + "|" + (display ? "1" : "0") + "|" + color + "|" + fontPx)
+    .digest("hex")
+    .slice(0, 32)
+}
+
+let engine = null
+
+function renderEngine() {
+  if (engine) return engine
+  const base = path.join(__dirname, "..", "vendor", "node_modules", "mathjax-full", "js")
+  const { mathjax } = require(path.join(base, "mathjax.js"))
+  const { TeX } = require(path.join(base, "input", "tex.js"))
+  const { SVG } = require(path.join(base, "output", "svg.js"))
+  const { liteAdaptor } = require(path.join(base, "adaptors", "liteAdaptor.js"))
+  const { RegisterHTMLHandler } = require(path.join(base, "handlers", "html.js"))
+  const { AllPackages } = require(path.join(base, "input", "tex", "AllPackages.js"))
+
+  const adaptor = liteAdaptor()
+  RegisterHTMLHandler(adaptor)
+  const tex = new TeX({ packages: AllPackages })
+  const svg = new SVG({ fontCache: "none" })
+  const document = mathjax.document("", { InputJax: tex, OutputJax: svg })
+  engine = { adaptor, document }
+  return engine
+}
+
+// MathJax sizes the root SVG in ex. Convert to px for Qt, drop the
+// vertical-align style that Qt ignores anyway, force the theme colour (Qt
+// otherwise paints currentColor black) and keep just the <svg> element.
+function convertSvg(html, color, fontPx) {
+  const match = String(html).match(/<svg[\s\S]*?<\/svg>/)
+  if (!match) throw new Error("MathJax produced no SVG")
+  const svg = match[0]
+  const openTag = svg.match(/<svg[^>]*>/)
+  if (!openTag) throw new Error("MathJax produced no SVG root")
+  const ex = fontPx / 2
+  let root = openTag[0]
+    .replace(/\s*style="[^"]*"/, "")
+    .replace(/(width|height)="([0-9.]+)ex"/g, function(attribute, name, value) {
+      return name + '="' + (parseFloat(value) * ex).toFixed(2) + '"'
+    })
+    .replace(/<svg/, '<svg fill="' + color + '"')
+  let output = root + svg.slice(openTag[0].length)
+  output = output.split("currentColor").join(color)
+  // MathJax's merror background comes from its stylesheet, which a standalone
+  // SVG does not carry: without this the <rect> inherits the theme fill and
+  // paints a solid block behind the error text. Keep the error glyphs and
+  // colour them the red MathJax uses in the browser.
+  output = output.replace(/<rect data-background="true"[^>]*>(<\/rect>)?/g, "")
+  output = output.replace(/<g data-mml-node="merror"/,
+    '<g data-mml-node="merror" fill="#cc0000" stroke="#cc0000"')
+  return { svg: output, invalid: output.indexOf('data-mml-node="merror"') >= 0 }
+}
+
+function renderItem(item, color, fontPx) {
+  const tex = typeof item.tex === "string" ? item.tex : ""
+  if (tex.trim() === "") throw new Error("empty TeX source")
+  if (tex.length > MAX_TEX_CHARS) {
+    throw new Error("TeX too large (max " + MAX_TEX_CHARS + " characters)")
+  }
+  const display = !!item.display
+  const { adaptor, document } = renderEngine()
+  const node = document.convert(tex, {
+    display: display,
+    em: fontPx,
+    ex: fontPx / 2,
+    containerWidth: 80 * fontPx
+  })
+  return convertSvg(adaptor.outerHTML(node), color, fontPx)
+}
+
+function writeAtomic(file, contents) {
+  const temporary = file + ".tmp-" + process.pid + "-" + crypto.randomBytes(4).toString("hex")
+  fs.writeFileSync(temporary, contents)
+  fs.renameSync(temporary, file)
+}
+
+// Keep the cache bounded. Only runs when something was rendered, and a single
+// directory pass is enough at these limits.
+function pruneCache(directory) {
+  let names
+  try {
+    names = fs.readdirSync(directory)
+  } catch (error) {
+    return
+  }
+  const files = []
+  let bytes = 0
+  for (const name of names) {
+    if (!name.endsWith(".svg")) continue
+    try {
+      const stat = fs.statSync(path.join(directory, name))
+      files.push({ path: path.join(directory, name), mtime: stat.mtimeMs, size: stat.size })
+      bytes += stat.size
+    } catch (error) {
+      // A file deleted by a concurrent run is fine.
+    }
+  }
+  if (files.length <= MAX_CACHE_FILES && bytes <= MAX_CACHE_BYTES) return
+  files.sort((left, right) => left.mtime - right.mtime)
+  let count = files.length
+  for (const file of files) {
+    if (count <= MAX_CACHE_FILES && bytes <= MAX_CACHE_BYTES) break
+    try {
+      fs.unlinkSync(file.path)
+      count -= 1
+      bytes -= file.size
+    } catch (error) {
+      // Ignore; the next run will try again.
+    }
+  }
+}
+
+function cacheStats(directory) {
+  let files = 0
+  let bytes = 0
+  let names
+  try {
+    names = fs.readdirSync(directory)
+  } catch (error) {
+    return { files: 0, bytes: 0 }
+  }
+  for (const name of names) {
+    try {
+      const stat = fs.statSync(path.join(directory, name))
+      if (!stat.isFile()) continue
+      files += 1
+      bytes += stat.size
+    } catch (error) {
+      // Ignore transient files.
+    }
+  }
+  return { files: files, bytes: bytes }
+}
+
+// Quickshell keeps the child's stdin open after write(), so EOF never arrives
+// from the QML side. The request is one line of JSON: parse it as soon as the
+// newline shows up and close our end. A shell pipe still works via EOF.
+function readStdin() {
+  return new Promise((resolve, reject) => {
+    let data = ""
+    let settled = false
+
+    function finish(raw) {
+      if (settled) return
+      settled = true
+      try {
+        process.stdin.pause()
+        process.stdin.destroy()
+      } catch (error) {
+        // Already closed.
+      }
+      try {
+        resolve(JSON.parse(raw))
+      } catch (error) {
+        reject(error)
+      }
+    }
+
+    process.stdin.setEncoding("utf8")
+    process.stdin.on("data", chunk => {
+      data += chunk
+      // A complete value is enough; QML never closes stdin, and pretty-printed
+      // JSON from a shell pipe may not end with a newline yet.
+      if (data.trim() === "") return
+      try {
+        JSON.parse(data)
+        finish(data)
+      } catch (error) {
+        // Wait for the rest of the request.
+      }
+    })
+    process.stdin.on("end", () => finish(data))
+    process.stdin.on("error", error => {
+      if (!settled) {
+        settled = true
+        reject(error)
+      }
+    })
+  })
+}
+
+async function main() {
+  const argument = process.argv[2]
+  const directory = cacheDirectory()
+
+  if (argument === "--purge") {
+    fs.rmSync(directory, { recursive: true, force: true })
+    process.stdout.write(JSON.stringify({ purged: true }) + "\n")
+    return
+  }
+  if (argument === "--stats") {
+    process.stdout.write(JSON.stringify(cacheStats(directory)) + "\n")
+    return
+  }
+
+  let request
+  try {
+    request = await readStdin()
+  } catch (error) {
+    const message = "bad request: " + (error && error.message ? error.message : String(error))
+    logFailure(message)
+    process.stderr.write("quill-math: " + message + "\n")
+    process.exitCode = 2
+    return
+  }
+
+  const color = normaliseColor(request && request.color)
+  const fontPx = normaliseFontPx(request && request.fontPx)
+  const items = request && Array.isArray(request.items) ? request.items : null
+  if (!items) {
+    logFailure("bad request: missing items array")
+    process.stderr.write("quill-math: request has no items array\n")
+    process.exitCode = 2
+    return
+  }
+
+  fs.mkdirSync(directory, { recursive: true })
+
+  const results = []
+  for (let index = 0; index < items.length; index++) {
+    const item = items[index] || {}
+    const id = String(item.id === undefined || item.id === null ? index : item.id)
+    try {
+      const tex = typeof item.tex === "string" ? item.tex : ""
+      const display = !!item.display
+      const key = cacheKey(tex, display, color, fontPx)
+      const file = path.join(directory, key + ".svg")
+      let invalid = false
+      if (fs.existsSync(file)) {
+        // Cache hit: the file already has this colour and size in its key.
+        invalid = fs.readFileSync(file, "utf8").indexOf('data-mml-node="merror"') >= 0
+      } else {
+        const rendered = renderItem(item, color, fontPx)
+        writeAtomic(file, rendered.svg)
+        invalid = rendered.invalid
+      }
+      results.push({ id: id, ok: true, path: file, invalid: invalid })
+    } catch (error) {
+      const message = error && error.message ? error.message : String(error)
+      logFailure("item " + id + ": " + message)
+      results.push({ id: id, ok: false, error: message })
+    }
+  }
+
+  pruneCache(directory)
+  process.stdout.write(JSON.stringify({ items: results }) + "\n")
+}
+
+main().catch(error => {
+  const message = error && error.message ? error.message : String(error)
+  logFailure("fatal: " + message)
+  process.stderr.write("quill-math: " + message + "\n")
+  process.exitCode = 1
+})

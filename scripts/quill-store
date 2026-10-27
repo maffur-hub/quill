@@ -1,0 +1,2289 @@
+#!/usr/bin/env python3
+"""Quill note store.
+
+Plain Markdown on disk is the source of truth. A SQLite index (FTS5) is a
+derived cache and may be deleted at any time. Every command prints exactly
+one JSON object on stdout; failures print one JSON object on stderr and exit
+non-zero.
+
+Usage: quill-store <command> [args]
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import sqlite3
+import sys
+import tempfile
+import time
+import unicodedata
+import urllib.parse
+import uuid
+from pathlib import Path
+
+SCHEMA_VERSION = 1
+MAX_NOTE_BYTES = 1024 * 1024
+MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
+MAX_REFERENCE_BYTES = 8 * 1024 * 1024
+MAX_INDEX_BYTES = 512 * 1024
+MAX_LIST_NOTES = 2000
+MAX_LIST_FOLDERS = 2000
+MAX_STATE_BYTES = 1024 * 1024
+MAX_SEARCH_LIMIT = 500
+VERSION_RETENTION_DEFAULT = 50
+VERSION_RETENTION_MAX = 1000
+VERSION_THROTTLE_DEFAULT = 60.0
+
+VERSION_FILENAME_RE = re.compile(r"^(\d{8}T\d{6}Z)-([0-9a-f]{16})(?:-(\d+))?\.md$")
+
+TAG_RE = re.compile(r"(?<![#\w\\])#([A-Za-z0-9_/-]+)")
+WIKI_RE = re.compile(r"\[\[([^\[\]\n]+?)\]\]")
+INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
+FENCE_RE = re.compile(r"^\s{0,3}(```|~~~)")
+URL_RE = re.compile(r"(?:https?://|mailto:)[^\s<>()]+")
+MD_DEST_RE = re.compile(r"\]\(\s*([^\s()]+)")
+HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+")
+LIST_RE = re.compile(r"^\s{0,3}(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s*)?")
+
+
+def data_root() -> Path:
+    raw = os.environ.get("QUILL_DATA_DIR") or "~/.local/share/quill"
+    return Path(os.path.expanduser(raw)).resolve()
+
+
+ROOT = data_root()
+NOTES = ROOT / "notes"
+TRASH = ROOT / "trash"
+ATTACHMENTS = ROOT / "attachments"
+STATE = ROOT / "state.json"
+INDEX = ROOT / "index.db"
+LOCK = ROOT / ".lock"
+SAVE_BUFFER = ROOT / ".save-buffer"
+BACKUPS = ROOT / "backups"
+VERSIONS = BACKUPS / "versions"
+
+
+class StoreError(Exception):
+    pass
+
+
+# --------------------------------------------------------------------------
+# storage primitives
+
+
+def ensure_store() -> None:
+    NOTES.mkdir(parents=True, exist_ok=True)
+    TRASH.mkdir(parents=True, exist_ok=True)
+    if not STATE.exists():
+        write_json(STATE, {"version": 1, "pinned": []})
+
+
+@contextlib.contextmanager
+def locked():
+    """Serialise every command that can touch files or the index.
+
+    Atomic renames keep readers safe, but the index and state.json are
+    read-modify-write, so a process lock removes the race entirely. Quill's
+    UI also funnels writes through one queue; this is the second line of
+    defence for concurrent CLI callers.
+    """
+    ensure_store()
+    fd = os.open(str(LOCK), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def read_json(path: Path, fallback):
+    try:
+        with path.open("rb") as handle:
+            payload = handle.read(MAX_STATE_BYTES + 1)
+        if len(payload) > MAX_STATE_BYTES:
+            return fallback
+        return json.loads(payload.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return fallback
+
+
+def write_json(path: Path, value) -> None:
+    atomic_write(path, (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+
+
+def atomic_write(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".quill-tmp-", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        with contextlib.suppress(OSError):
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+
+def safe_relative(raw: str) -> str:
+    value = str(raw or "").replace("\\", "/").strip()
+    if not value:
+        raise StoreError("note id is empty")
+    if "\x00" in value:
+        raise StoreError("invalid note id")
+    candidate = Path(value)
+    if candidate.is_absolute() or value.startswith("/"):
+        raise StoreError("invalid note id")
+    if any(part in {"", ".", ".."} for part in candidate.parts):
+        raise StoreError("invalid note id")
+    return candidate.as_posix()
+
+
+def note_path(identifier: str, trashed: bool = False) -> Path:
+    relative = safe_relative(identifier)
+    base = TRASH if trashed else NOTES
+    path = (base / relative).resolve()
+    if path != base.resolve() and base.resolve() not in path.parents:
+        raise StoreError("note path escapes the data directory")
+    return path
+
+
+def clean_folder(raw: str) -> str:
+    value = str(raw or "").strip().replace("\\", "/").strip("/")
+    if not value or value == ".":
+        return ""
+    parts = []
+    for part in value.split("/"):
+        if part in {"", ".", ".."}:
+            raise StoreError("invalid folder path")
+        cleaned = re.sub(r"[\x00-\x1f/:]+", "-", part).strip().strip(".")
+        if cleaned:
+            parts.append(cleaned[:120])
+    return "/".join(parts)
+
+
+def rel_folder(path: Path, base: Path) -> str:
+    folder = path.parent.relative_to(base).as_posix()
+    return "" if folder == "." else folder
+
+
+def prune_empty_dirs(start: Path) -> None:
+    """Remove `start` and its now-empty ancestors, never the notes root."""
+    root = NOTES.resolve()
+    current = start
+    while True:
+        try:
+            resolved = current.resolve()
+        except OSError:
+            return
+        if resolved == root or root not in resolved.parents:
+            return
+        try:
+            if any(current.iterdir()):
+                return
+            current.rmdir()
+        except OSError:
+            return
+        current = current.parent
+
+
+# --------------------------------------------------------------------------
+# local version history
+#
+# Every snapshot is the *old* bytes of a note, named
+# <UTC timestamp>-<sha256 prefix>.md inside a per-note directory under
+# backups/versions/. Directories are derived from the note id with a hash
+# suffix, so folder ids stay distinct and `..` cannot escape. Snapshot bytes
+# are the source of truth; `versions` is a read-only listing.
+
+
+def version_retention() -> int:
+    raw = os.environ.get("QUILL_VERSION_RETENTION")
+    try:
+        value = int(raw) if raw not in (None, "") else VERSION_RETENTION_DEFAULT
+    except (TypeError, ValueError):
+        value = VERSION_RETENTION_DEFAULT
+    return max(1, min(VERSION_RETENTION_MAX, value))
+
+
+def version_throttle() -> float:
+    raw = os.environ.get("QUILL_VERSION_THROTTLE")
+    try:
+        value = float(raw) if raw not in (None, "") else VERSION_THROTTLE_DEFAULT
+    except (TypeError, ValueError):
+        value = VERSION_THROTTLE_DEFAULT
+    return max(0.0, value)
+
+
+def version_dir(identifier: str) -> Path:
+    relative = safe_relative(identifier)
+    digest = hashlib.sha256(relative.encode("utf-8")).hexdigest()[:16]
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", relative).strip(".-")
+    slug = slug[:80] or "note"
+    directory = VERSIONS / f"{slug}-{digest}"
+    if BACKUPS.is_symlink() or VERSIONS.is_symlink() or directory.is_symlink():
+        raise StoreError("version directory is a symlink; refusing to follow it")
+    root = ROOT.resolve()
+    resolved = directory.resolve()
+    if resolved != root and root not in resolved.parents:
+        raise StoreError("version directory escapes the data directory")
+    return directory
+
+
+def version_files(directory: Path) -> list[Path]:
+    if directory.is_symlink():
+        raise StoreError("version directory is a symlink; refusing to follow it")
+    if not directory.is_dir():
+        return []
+    files: list[Path] = []
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                    continue
+                if VERSION_FILENAME_RE.match(entry.name):
+                    files.append(Path(entry.path))
+    except OSError:
+        return []
+    try:
+        files.sort(key=lambda path: (path.stat().st_mtime_ns, path.name), reverse=True)
+    except OSError:
+        files.sort(key=lambda path: path.name, reverse=True)
+    return files
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def snapshot_note(identifier: str, data: bytes, reason: str, destructive: bool = False) -> Path | None:
+    """Save `data` as a version of `identifier`.
+
+    Ordinary autosave snapshots are throttled; destructive operations and
+    restores are not. Identical snapshots are deduplicated. Any failure is
+    raised so the caller can abort before touching the note.
+    """
+    directory = version_dir(identifier)
+    digest = hashlib.sha256(data).hexdigest()
+    prefix = digest[:16]
+    retention = version_retention()
+    existing = version_files(directory)
+
+    for index, path in enumerate(existing):
+        match = VERSION_FILENAME_RE.match(path.name)
+        if not match or match.group(2) != prefix:
+            continue
+        try:
+            if path.read_bytes() == data:
+                # Only count a duplicate that retention will keep. Otherwise a
+                # fresh snapshot is needed before the old one is pruned.
+                if index < retention:
+                    return path
+                break
+        except OSError:
+            continue
+
+    if not destructive and existing:
+        try:
+            newest_age = time.time() - existing[0].stat().st_mtime
+        except OSError:
+            newest_age = VERSION_THROTTLE_DEFAULT
+        if newest_age < version_throttle():
+            return None
+
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        name = f"{stamp}-{prefix}.md"
+        target = directory / name
+        counter = 1
+        # Guard the (very unlikely) same-second, same-prefix collision while
+        # keeping the readable timestamp-hash filename.
+        while target.exists():
+            try:
+                if target.read_bytes() == data:
+                    return target
+            except OSError:
+                pass
+            counter += 1
+            target = directory / f"{stamp}-{prefix}-{counter}.md"
+        atomic_write(target, data)
+    except OSError as error:
+        raise StoreError(
+            f"could not save {reason} snapshot for {identifier}: {error}"
+        ) from error
+    return target
+
+
+def prune_versions(identifier: str) -> None:
+    """Keep the newest `retention` snapshots; never let pruning fail a save."""
+    try:
+        directory = version_dir(identifier)
+        files = version_files(directory)
+        retention = version_retention()
+        if len(files) <= retention:
+            return
+        for path in files[retention:]:
+            try:
+                path.unlink()
+            except OSError:
+                continue
+    except (StoreError, OSError):
+        return
+
+
+def snapshot_path(identifier: str, raw: str) -> Path:
+    """Resolve a basename or absolute snapshot path inside one note's dir."""
+    directory = version_dir(identifier).resolve()
+    value = str(raw or "").strip()
+    if not value:
+        raise StoreError("snapshot path is empty")
+    if "\x00" in value:
+        raise StoreError("invalid snapshot path")
+    if any(part == ".." for part in value.replace("\\", "/").split("/")):
+        raise StoreError("snapshot path must not contain '..'")
+    candidate = Path(os.path.expanduser(value))
+    if not candidate.is_absolute():
+        candidate = directory / candidate
+    if candidate.is_symlink():
+        raise StoreError("snapshot path is a symlink; refusing to follow it")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as error:
+        raise StoreError(f"snapshot not found: {value}") from error
+    if resolved.parent != directory:
+        raise StoreError("snapshot is outside this note's version directory")
+    if resolved.is_symlink() or not resolved.is_file():
+        raise StoreError("snapshot is not a regular file")
+    if not VERSION_FILENAME_RE.match(resolved.name):
+        raise StoreError("snapshot name is not a Quill version")
+    return resolved
+
+
+def detect_newline(text: str) -> str:
+    crlf = text.count("\r\n")
+    lf = text.count("\n") - crlf
+    return "\r\n" if crlf > lf else "\n"
+
+
+def normalize_newlines(text: str, newline: str) -> str:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    return normalized if newline == "\n" else normalized.replace("\n", newline)
+
+
+# --------------------------------------------------------------------------
+# attachments
+#
+# Images live in <data>/attachments, deliberately outside notes/ so they are
+# never enumerated as notes or folders. Names are content-addressed
+# (<sha256>.<ext>), so pasting the same image twice reuses one file.
+
+
+def attachments_dir() -> Path:
+    if ATTACHMENTS.is_symlink():
+        raise StoreError("attachments directory is a symlink; refusing to follow it")
+    ATTACHMENTS.mkdir(parents=True, exist_ok=True)
+    resolved = ATTACHMENTS.resolve()
+    root = ROOT.resolve()
+    if resolved != root and root not in resolved.parents:
+        raise StoreError("attachments directory escapes the data directory")
+    with contextlib.suppress(OSError):
+        os.chmod(ATTACHMENTS, 0o755)
+    return ATTACHMENTS
+
+
+def sniff_image(data: bytes) -> tuple[str, str] | None:
+    """Return (extension, mime) from magic bytes, or None for other content."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png", "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "jpg", "image/jpeg"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif", "image/gif"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp", "image/webp"
+    if data[:2] == b"BM":
+        return "bmp", "image/bmp"
+    return None
+
+
+def attachment_alt(raw: str) -> str:
+    value = unicodedata.normalize("NFC", str(raw or ""))
+    value = re.sub(r"[\x00-\x1f\x7f]+", " ", value)
+    value = value.replace("[", "").replace("]", "").replace("(", "").replace(")", "")
+    value = re.sub(r"\s+", " ", value).strip()
+    if not value:
+        value = "image"
+    return value[:120]
+
+
+def attachment_markdown(alt: str, path: Path) -> str:
+    destination = path.as_posix()
+    # Parentheses and whitespace would end the Markdown destination early.
+    if re.search(r"[\s()]", destination):
+        destination = "<" + destination + ">"
+    return f"![{alt}]({destination})"
+
+
+def attachment_files() -> list[Path]:
+    """Regular files directly inside attachments/, never symlinks."""
+    if not ATTACHMENTS.exists() or ATTACHMENTS.is_symlink():
+        return []
+    files: list[Path] = []
+    try:
+        with os.scandir(ATTACHMENTS) as entries:
+            for entry in entries:
+                if entry.name.startswith("."):
+                    continue
+                if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                    continue
+                files.append(Path(entry.path))
+    except OSError:
+        return []
+    return sorted(files)
+
+
+def referenced_attachment_names() -> set[str]:
+    """Names mentioned by any note, including trashed notes.
+
+    Content is matched as text rather than parsed, because a note may use the
+    angle-bracket destination form or HTML. False positives only keep files,
+    which is the safe direction for `attachment gc`.
+    """
+    blobs: list[str] = []
+    for base in (NOTES, TRASH):
+        if not base.exists():
+            continue
+        for path in base.rglob("*.md"):
+            try:
+                if path.is_symlink() or not path.is_file():
+                    continue
+                payload = read_note_bytes(path, MAX_REFERENCE_BYTES)
+            except OSError:
+                continue
+            blobs.append(payload.decode("utf-8", errors="replace"))
+    text = "\n".join(blobs)
+    names: set[str] = set()
+    for path in attachment_files():
+        name = path.name
+        variants = {
+            str(path),
+            urllib.parse.quote(str(path)),
+            str(path).replace(" ", "%20"),
+            "<" + str(path) + ">",
+            "attachments/" + name,
+        }
+        if any(variant in text for variant in variants):
+            names.add(name)
+    return names
+
+
+
+
+def read_note_bytes(path: Path, cap: int | None = None) -> bytes:
+    limit = MAX_NOTE_BYTES if cap is None else cap
+    with path.open("rb") as handle:
+        return handle.read(limit + 1)
+
+
+# --------------------------------------------------------------------------
+# markdown parsing
+
+
+def split_frontmatter(text: str) -> tuple[str | None, str]:
+    """Return (frontmatter body without fences, rest of document)."""
+    if not text.startswith("---"):
+        return None, text
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
+        return None, text
+    for index in range(1, min(len(lines), 400)):
+        if lines[index].strip() == "---":
+            return "".join(lines[1:index]), "".join(lines[index + 1 :])
+    return None, text
+
+
+def frontmatter_title(frontmatter: str | None) -> str:
+    if not frontmatter:
+        return ""
+    for line in frontmatter.splitlines():
+        match = re.match(r"^\s*title\s*:\s*(.*)$", line, re.IGNORECASE)
+        if not match:
+            continue
+        value = match.group(1).strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        return value[:120]
+    return ""
+
+
+def frontmatter_tags(frontmatter: str | None) -> list[str]:
+    if not frontmatter:
+        return []
+    lines = frontmatter.splitlines()
+    collected: list[str] = []
+    for index, line in enumerate(lines):
+        match = re.match(r"^\s*tags\s*:\s*(.*)$", line, re.IGNORECASE)
+        if not match:
+            continue
+        rest = match.group(1).strip()
+        values: list[str] = []
+        if rest:
+            rest = rest.strip("[]")
+            values = [part.strip() for part in rest.split(",")]
+        else:
+            for follow in lines[index + 1 :]:
+                item = re.match(r"^\s*-\s*(.+)$", follow)
+                if item:
+                    values.append(item.group(1).strip())
+                elif follow.strip() == "":
+                    continue
+                else:
+                    break
+        for value in values:
+            value = value.strip().strip("'\"").strip()
+            if value:
+                collected.append(value.lstrip("#"))
+        break
+    return normalize_tags(collected)
+
+
+def normalize_tags(values) -> list[str]:
+    output: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        value = str(raw or "").strip().lstrip("#").strip()
+        if not value:
+            continue
+        value = re.sub(r"[^A-Za-z0-9_/-]+", "-", value).strip("-/")
+        if not value:
+            continue
+        key = value.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(value[:80])
+    return output
+
+
+def scan_blocks(text: str):
+    """Yield (in_code, line) for each line, tracking fenced code blocks."""
+    in_code = False
+    for line in text.splitlines():
+        if FENCE_RE.match(line):
+            in_code = not in_code
+            yield in_code, line
+            continue
+        yield in_code, line
+
+
+def protected_spans(line: str) -> list[tuple[int, int]]:
+    """Spans that look like `#tag` but are URL fragments, not tags.
+
+    `https://example.com/#section` and a Markdown link destination are not
+    Quill tags. The link *label* is still ordinary visible text, so only the
+    destination is masked (which also keeps offsets stable for rewrites).
+    """
+    spans = [match.span() for match in URL_RE.finditer(line)]
+    spans.extend(match.span(1) for match in MD_DEST_RE.finditer(line))
+    return spans
+
+
+def overlaps(span: tuple[int, int], spans: list[tuple[int, int]]) -> bool:
+    start, end = span
+    for other_start, other_end in spans:
+        if start < other_end and other_start < end:
+            return True
+    return False
+
+
+def extract_inline_tags(text: str) -> list[str]:
+    found: list[str] = []
+    for in_code, line in scan_blocks(text):
+        if in_code:
+            continue
+        protected = protected_spans(line)
+        pieces: list[tuple[int, int]] = []
+        cursor = 0
+        for match in INLINE_CODE_RE.finditer(line):
+            pieces.append((cursor, match.start()))
+            cursor = match.end()
+        pieces.append((cursor, len(line)))
+        for start, end in pieces:
+            for match in TAG_RE.finditer(line, start, end):
+                if not overlaps(match.span(), protected):
+                    found.append(match.group(1))
+    return found
+
+
+def extract_wiki_links(text: str) -> list[dict]:
+    links: list[dict] = []
+    for in_code, line in scan_blocks(text):
+        if in_code:
+            continue
+        pieces: list[tuple[int, int]] = []
+        cursor = 0
+        for match in INLINE_CODE_RE.finditer(line):
+            pieces.append((cursor, match.start()))
+            cursor = match.end()
+        pieces.append((cursor, len(line)))
+        for start, end in pieces:
+            for match in WIKI_RE.finditer(line, start, end):
+                raw = match.group(1)
+                target_part, _, alias = raw.partition("|")
+                target_part = target_part.strip()
+                heading = ""
+                if "#" in target_part:
+                    target_part, heading = target_part.split("#", 1)
+                    target_part, heading = target_part.strip(), heading.strip()
+                if not target_part:
+                    continue
+                links.append(
+                    {
+                        "target": target_part,
+                        "norm": target_part.casefold(),
+                        "heading": heading,
+                        "alias": alias.strip(),
+                    }
+                )
+    return links
+
+
+def plain_line(line: str) -> str:
+    value = line.strip()
+    if not value:
+        return ""
+    value = HEADING_RE.sub("", value)
+    value = LIST_RE.sub("", value)
+    value = value.replace("```", "").replace("~~~", "")
+    value = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", value)
+    value = re.sub(r"\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|([^\]]*))?\]\]", lambda m: m.group(2) or m.group(1), value)
+    value = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", value)
+    value = value.replace("`", "")
+    value = re.sub(r"[*_~]", "", value)
+    value = re.sub(r"^\s*>\s?", "", value)
+    return value.strip()
+
+
+def title_and_snippet(content: str) -> tuple[str, str]:
+    frontmatter, body = split_frontmatter(content)
+    title = frontmatter_title(frontmatter)
+    useful: list[str] = []
+    seen_title = bool(title)
+    in_code = False
+    for raw in body.splitlines():
+        if FENCE_RE.match(raw):
+            in_code = not in_code
+            continue
+        if in_code:
+            continue
+        line = plain_line(raw)
+        if not line:
+            continue
+        if not seen_title:
+            title = line[:120]
+            seen_title = True
+            continue
+        useful.append(line)
+        if len(" ".join(useful)) >= 200:
+            break
+    return (title or "Untitled"), " ".join(useful)[:180]
+
+
+# --------------------------------------------------------------------------
+# index
+
+
+def index_connect() -> sqlite3.Connection:
+    ROOT.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(INDEX), timeout=15)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=15000")
+    version = 0
+    try:
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    except (sqlite3.DatabaseError, TypeError):
+        version = -1
+    if version != SCHEMA_VERSION:
+        conn.close()
+        for suffix in ("", "-wal", "-shm"):
+            with contextlib.suppress(OSError):
+                os.unlink(str(INDEX) + suffix)
+        conn = sqlite3.connect(str(INDEX), timeout=15)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=15000")
+        create_schema(conn)
+    return conn
+
+
+def create_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS notes (
+          key TEXT PRIMARY KEY,
+          id TEXT NOT NULL,
+          trashed INTEGER NOT NULL DEFAULT 0,
+          folder TEXT NOT NULL DEFAULT '',
+          title TEXT NOT NULL,
+          stem TEXT NOT NULL,
+          snippet TEXT NOT NULL DEFAULT '',
+          size INTEGER NOT NULL DEFAULT 0,
+          mtime_ms INTEGER NOT NULL DEFAULT 0,
+          pinned INTEGER NOT NULL DEFAULT 0,
+          body TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS notes_id ON notes(id);
+        CREATE TABLE IF NOT EXISTS tags (
+          note_key TEXT NOT NULL,
+          tag TEXT NOT NULL,
+          tag_key TEXT NOT NULL,
+          PRIMARY KEY (note_key, tag_key)
+        );
+        CREATE INDEX IF NOT EXISTS tags_tag ON tags(tag_key);
+        CREATE TABLE IF NOT EXISTS links (
+          src_key TEXT NOT NULL,
+          src_id TEXT NOT NULL,
+          target TEXT NOT NULL,
+          target_norm TEXT NOT NULL,
+          resolved_id TEXT
+        );
+        CREATE INDEX IF NOT EXISTS links_target ON links(target_norm);
+        CREATE INDEX IF NOT EXISTS links_resolved ON links(resolved_id);
+        CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
+          id UNINDEXED, title, body, tokenize='unicode61 remove_diacritics 2'
+        );
+        PRAGMA user_version=1;
+        """
+    )
+    conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+    conn.commit()
+
+
+def pinned_set() -> set[str]:
+    state = read_json(STATE, {"pinned": []})
+    values = state.get("pinned", []) if isinstance(state, dict) else []
+    return {str(value) for value in values if isinstance(value, str)}
+
+
+def save_pinned(values: set[str]) -> None:
+    write_json(STATE, {"version": 1, "pinned": sorted(values)})
+
+
+def note_key(identifier: str, trashed: bool) -> str:
+    return ("T:" if trashed else "N:") + identifier
+
+
+def index_file(conn: sqlite3.Connection, path: Path, trashed: bool, pinned: set[str]) -> bool:
+    key = note_key(path.relative_to(TRASH if trashed else NOTES).as_posix(), trashed)
+    try:
+        stat = path.stat()
+        raw = read_note_bytes(path, MAX_INDEX_BYTES)
+    except OSError:
+        return False
+    binary = raw[:MAX_INDEX_BYTES]
+    content = binary.decode("utf-8", errors="replace")
+    frontmatter, body = split_frontmatter(content)
+    title, snippet = title_and_snippet(content)
+    identifier = path.relative_to(TRASH if trashed else NOTES).as_posix()
+    folder = rel_folder(path, TRASH if trashed else NOTES)
+    tags = []
+    seen = set()
+    for tag in list(frontmatter_tags(frontmatter)) + list(extract_inline_tags(body)):
+        normalized = normalize_tags([tag])
+        if not normalized:
+            continue
+        value = normalized[0]
+        lowered = value.casefold()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        tags.append(value)
+    links = extract_wiki_links(content)
+    is_pinned = 1 if (not trashed and identifier in pinned) else 0
+
+    conn.execute(
+        """
+        INSERT INTO notes(key,id,trashed,folder,title,stem,snippet,size,mtime_ms,pinned,body)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(key) DO UPDATE SET
+          id=excluded.id, trashed=excluded.trashed, folder=excluded.folder,
+          title=excluded.title, stem=excluded.stem, snippet=excluded.snippet,
+          size=excluded.size, mtime_ms=excluded.mtime_ms, pinned=excluded.pinned,
+          body=excluded.body
+        """,
+        (
+            key,
+            identifier,
+            1 if trashed else 0,
+            folder,
+            title,
+            path.stem,
+            snippet,
+            stat.st_size,
+            int(stat.st_mtime * 1000),
+            is_pinned,
+            body[:MAX_INDEX_BYTES],
+        ),
+    )
+    conn.execute("DELETE FROM tags WHERE note_key=?", (key,))
+    conn.executemany(
+        "INSERT OR REPLACE INTO tags(note_key,tag,tag_key) VALUES(?,?,?)",
+        [(key, tag, tag.casefold()) for tag in tags],
+    )
+    conn.execute("DELETE FROM links WHERE src_key=?", (key,))
+    conn.executemany(
+        "INSERT INTO links(src_key,src_id,target,target_norm,resolved_id) VALUES(?,?,?,?,NULL)",
+        [(key, identifier, link["target"], link["norm"]) for link in links],
+    )
+    conn.execute("DELETE FROM notes_fts WHERE id=?", (key,))
+    conn.execute(
+        "INSERT INTO notes_fts(id,title,body) VALUES(?,?,?)",
+        (key, title, body[:MAX_INDEX_BYTES]),
+    )
+    return True
+
+
+def resolve_links(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        "SELECT id,title,stem FROM notes WHERE trashed=0 ORDER BY pinned DESC, mtime_ms DESC, id"
+    ).fetchall()
+    by_title: dict[str, str] = {}
+    by_stem: dict[str, str] = {}
+    for identifier, title, stem in rows:
+        by_title.setdefault(unicodedata.normalize("NFC", str(title)).casefold(), str(identifier))
+        by_stem.setdefault(unicodedata.normalize("NFC", str(stem)).casefold(), str(identifier))
+    links = conn.execute("SELECT rowid,target_norm FROM links").fetchall()
+    for rowid, target_norm in links:
+        norm = unicodedata.normalize("NFC", str(target_norm)).casefold()
+        resolved = by_title.get(norm) or by_stem.get(norm)
+        conn.execute("UPDATE links SET resolved_id=? WHERE rowid=?", (resolved, rowid))
+
+
+def sync_index(conn: sqlite3.Connection, full: bool = False) -> bool:
+    pinned = pinned_set()
+    existing = {
+        (row[0], row[1]): (row[2], row[3])
+        for row in conn.execute("SELECT key,trashed,size,mtime_ms FROM notes").fetchall()
+    }
+    seen: set[tuple[str, int]] = set()
+    changed = full
+    for trashed, root in ((False, NOTES), (True, TRASH)):
+        if not root.exists():
+            continue
+        for path in root.rglob("*.md"):
+            if not path.is_file():
+                continue
+            identifier = path.relative_to(root).as_posix()
+            key = note_key(identifier, trashed)
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            seen.add((key, 1 if trashed else 0))
+            previous = existing.get((key, 1 if trashed else 0))
+            if full or previous is None or previous != (stat.st_size, int(stat.st_mtime * 1000)):
+                if index_file(conn, path, trashed, pinned):
+                    changed = True
+    for (key, _trashed), _value in existing.items():
+        if (key, _trashed) not in seen:
+            conn.execute("DELETE FROM notes WHERE key=?", (key,))
+            conn.execute("DELETE FROM tags WHERE note_key=?", (key,))
+            conn.execute("DELETE FROM links WHERE src_key=?", (key,))
+            conn.execute("DELETE FROM notes_fts WHERE id=?", (key,))
+            changed = True
+    # Pinned flags live in state.json, so they can change without touching a
+    # note file. Reconcile them on every sync rather than only when a file
+    # changed.
+    desired = {(note_key(identifier, False)) for identifier in pinned}
+    current = {row[0] for row in conn.execute("SELECT key FROM notes WHERE pinned=1").fetchall()}
+    if desired != current:
+        conn.execute("UPDATE notes SET pinned=0")
+        if pinned:
+            conn.executemany(
+                "UPDATE notes SET pinned=1 WHERE trashed=0 AND id=?",
+                [(value,) for value in pinned],
+            )
+        changed = True
+    if changed:
+        resolve_links(conn)
+        conn.commit()
+    return changed
+
+
+def with_index():
+    conn = index_connect()
+    sync_index(conn)
+    return conn
+
+
+# --------------------------------------------------------------------------
+# commands
+
+
+def command_list(args) -> dict:
+    ensure_store()
+    with locked():
+        conn = with_index()
+        try:
+            trashed = 1 if getattr(args, "trashed", False) else 0
+            rows = conn.execute(
+                """
+                SELECT id,title,snippet,folder,mtime_ms,pinned,size
+                FROM notes WHERE trashed=? AND id NOT LIKE '.quill-%'
+                ORDER BY pinned DESC, mtime_ms DESC, title COLLATE NOCASE
+                LIMIT ?
+                """,
+                (trashed, MAX_LIST_NOTES),
+            ).fetchall()
+            notes = []
+            for identifier, title, snippet, folder, mtime_ms, pinned, size in rows:
+                key = note_key(str(identifier), bool(trashed))
+                tags = [
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT tag FROM tags WHERE note_key=? ORDER BY tag COLLATE NOCASE", (key,)
+                    ).fetchall()
+                ]
+                notes.append(
+                    {
+                        "id": str(identifier),
+                        "title": str(title),
+                        "snippet": str(snippet),
+                        "folder": str(folder),
+                        "modified": int(mtime_ms),
+                        "tags": tags,
+                        "pinned": bool(pinned) and not trashed,
+                        "size": int(size),
+                        **({"trashed": True} if trashed else {}),
+                    }
+                )
+            tag_rows = conn.execute(
+                """
+                SELECT t.tag, COUNT(*) AS n
+                FROM tags t JOIN notes n ON n.key=t.note_key
+                WHERE n.trashed=0
+                GROUP BY t.tag_key
+                ORDER BY n DESC, t.tag COLLATE NOCASE
+                """
+            ).fetchall()
+            tag_counts = [{"tag": str(tag), "count": int(count)} for tag, count in tag_rows]
+            trash_count = int(
+                conn.execute("SELECT COUNT(*) FROM notes WHERE trashed=1").fetchone()[0]
+            )
+            total_count = int(
+                conn.execute("SELECT COUNT(*) FROM notes WHERE trashed=0").fetchone()[0]
+            )
+        finally:
+            conn.close()
+
+    folders: list[str] = []
+    if NOTES.exists():
+        for directory in NOTES.rglob("*"):
+            if directory.is_dir():
+                folders.append(directory.relative_to(NOTES).as_posix())
+            if len(folders) >= MAX_LIST_FOLDERS:
+                break
+    for note in notes:
+        folder = note["folder"]
+        if folder and folder not in folders:
+            folders.append(folder)
+    folders = sorted(dict.fromkeys(folders), key=str.casefold)
+    return {
+        "notes": notes,
+        "folders": folders,
+        "tags": tag_counts,
+        "trashCount": trash_count,
+        "totalCount": total_count,
+        "maxNoteBytes": MAX_NOTE_BYTES,
+    }
+
+
+def command_read(args) -> dict:
+    ensure_store()
+    path = note_path(args.id, trashed=getattr(args, "trashed", False))
+    if not path.is_file():
+        raise StoreError(f"note not found: {args.id}")
+    stat = path.stat()
+    identifier = safe_relative(args.id)
+    if stat.st_size > MAX_NOTE_BYTES:
+        return {
+            "id": identifier,
+            "content": "",
+            "tooLarge": True,
+            "size": int(stat.st_size),
+            "modified": int(stat.st_mtime * 1000),
+            "maxBytes": MAX_NOTE_BYTES,
+        }
+    payload = read_note_bytes(path)
+    if len(payload) > MAX_NOTE_BYTES:
+        return {
+            "id": identifier,
+            "content": "",
+            "tooLarge": True,
+            "size": len(payload),
+            "modified": int(stat.st_mtime * 1000),
+            "maxBytes": MAX_NOTE_BYTES,
+        }
+    return {
+        "id": identifier,
+        "content": payload.decode("utf-8", errors="replace"),
+        "tooLarge": False,
+        "size": int(stat.st_size),
+        "modified": int(stat.st_mtime * 1000),
+        "maxBytes": MAX_NOTE_BYTES,
+    }
+
+
+def command_write(args) -> dict:
+    ensure_store()
+    identifier = safe_relative(args.id)
+    path = note_path(identifier)
+    create = bool(getattr(args, "create", False))
+    if not path.is_file() and not create:
+        raise StoreError(f"note not found: {args.id}")
+    if path.exists() and not path.is_file():
+        raise StoreError(f"note path is not a file: {args.id}")
+    if getattr(args, "content_file", None):
+        content_path = Path(os.path.expanduser(args.content_file))
+        try:
+            payload = content_path.read_bytes()
+        except OSError as error:
+            raise StoreError(f"could not read content file: {error}") from error
+        finally:
+            # The UI hands over one throwaway buffer per save. Never delete a
+            # caller-supplied file, only Quill's own save buffers.
+            if content_path.name.startswith(".quill-save-"):
+                with contextlib.suppress(OSError):
+                    content_path.unlink()
+    else:
+        payload = sys.stdin.buffer.read(MAX_NOTE_BYTES + 1)
+    if len(payload) > MAX_NOTE_BYTES:
+        raise StoreError(f"note exceeds {MAX_NOTE_BYTES} bytes")
+    try:
+        content = payload.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise StoreError("note content is not valid UTF-8") from error
+    with locked():
+        if path.is_file():
+            try:
+                previous_raw = path.read_bytes()
+            except OSError as error:
+                raise StoreError(f"could not read the existing note: {error}") from error
+            previous = previous_raw.decode("utf-8", errors="replace")
+            newline = detect_newline(previous) if previous else "\n"
+            content = normalize_newlines(content, newline)
+            updated = content.encode("utf-8")
+            if updated != previous_raw:
+                snapshot_note(identifier, previous_raw, "write")
+        else:
+            # Explicit mapped id (restore path): there is no previous content
+            # to snapshot, so newline normalisation starts from LF.
+            path.parent.mkdir(parents=True, exist_ok=True)
+            updated = normalize_newlines(content, "\n").encode("utf-8")
+        atomic_write(path, updated)
+        stat = path.stat()
+        conn = index_connect()
+        try:
+            index_file(conn, path, False, pinned_set())
+            resolve_links(conn)
+            conn.commit()
+        finally:
+            conn.close()
+        prune_versions(identifier)
+    return {"id": identifier, "modified": int(stat.st_mtime * 1000), "size": int(stat.st_size)}
+
+
+def command_create(args) -> dict:
+    ensure_store()
+    folder = clean_folder(args.folder)
+    title = str(args.title or "").strip() or "Untitled"
+    if args.content_stdin:
+        payload = sys.stdin.buffer.read(MAX_NOTE_BYTES + 1)
+        if len(payload) > MAX_NOTE_BYTES:
+            raise StoreError(f"note exceeds {MAX_NOTE_BYTES} bytes")
+        try:
+            content = payload.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise StoreError("note content is not valid UTF-8") from error
+    else:
+        content = f"# {title}\n\n"
+    with locked():
+        parent = NOTES / folder
+        parent.mkdir(parents=True, exist_ok=True)
+        identifier = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}.md"
+        path = parent / identifier
+        while path.exists():
+            identifier = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}.md"
+            path = parent / identifier
+        atomic_write(path, normalize_newlines(content, "\n").encode("utf-8"))
+        conn = index_connect()
+        try:
+            index_file(conn, path, False, pinned_set())
+            resolve_links(conn)
+            conn.commit()
+        finally:
+            conn.close()
+        return {"id": path.relative_to(NOTES).as_posix(), "modified": int(path.stat().st_mtime * 1000)}
+
+
+def rewrite_title(content: str, title: str) -> str:
+    clean = title.strip().replace("\n", " ")[:120] or "Untitled"
+    newline = detect_newline(content)
+    lines = content.splitlines(keepends=True)
+    # Update frontmatter title when one exists, because it wins over headings.
+    if lines and lines[0].strip() == "---":
+        closing = None
+        for index in range(1, min(len(lines), 400)):
+            if lines[index].strip() == "---":
+                closing = index
+                break
+        if closing is not None:
+            for index in range(1, closing):
+                match = re.match(r"^(\s*title\s*:\s*)(.*?)(\r?\n)?$", lines[index], re.IGNORECASE)
+                if match:
+                    lines[index] = match.group(1) + json.dumps(clean, ensure_ascii=False) + (match.group(3) or "")
+                    return "".join(lines)
+            lines.insert(closing, f"title: {json.dumps(clean, ensure_ascii=False)}{newline}")
+            return "".join(lines)
+    for index, line in enumerate(lines):
+        if HEADING_RE.match(line):
+            ending = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
+            lines[index] = f"# {clean}{ending}"
+            return "".join(lines)
+    prefix = f"# {clean}{newline}"
+    if content and not content.startswith(("\n", "\r\n")):
+        prefix += newline
+    return prefix + content
+
+
+def command_rename(args) -> dict:
+    ensure_store()
+    identifier = safe_relative(args.id)
+    path = note_path(identifier)
+    if not path.is_file():
+        raise StoreError(f"note not found: {args.id}")
+    with locked():
+        try:
+            previous_raw = path.read_bytes()
+        except OSError as error:
+            raise StoreError(f"could not read the existing note: {error}") from error
+        content = previous_raw.decode("utf-8", errors="replace")
+        updated = rewrite_title(content, str(args.title)).encode("utf-8")
+        if updated != previous_raw:
+            snapshot_note(identifier, previous_raw, "rename", destructive=True)
+        atomic_write(path, updated)
+        stat = path.stat()
+        conn = index_connect()
+        try:
+            index_file(conn, path, False, pinned_set())
+            resolve_links(conn)
+            conn.commit()
+        finally:
+            conn.close()
+        prune_versions(identifier)
+    return {"id": identifier, "modified": int(stat.st_mtime * 1000)}
+
+
+def unique_target(directory: Path, name: str, suffix: str = "") -> Path:
+    target = directory / name
+    if not target.exists():
+        return target
+    stem = Path(name).stem
+    extension = Path(name).suffix
+    counter = 1
+    while True:
+        candidate = directory / f"{stem}-{suffix or ''}{counter}{extension}"
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
+def command_move(args) -> dict:
+    ensure_store()
+    identifier = safe_relative(args.id)
+    source = note_path(identifier)
+    if not source.is_file():
+        raise StoreError(f"note not found: {identifier}")
+    folder = clean_folder(args.folder)
+    with locked():
+        target_dir = NOTES / folder
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / source.name
+        if target.resolve() != source.resolve():
+            if target.exists():
+                target = unique_target(target_dir, source.name, "moved")
+            try:
+                data = source.read_bytes()
+            except OSError as error:
+                raise StoreError(f"could not read the note before moving it: {error}") from error
+            snapshot_note(identifier, data, "move", destructive=True)
+            shutil.move(str(source), str(target))
+            prune_empty_dirs(source.parent)
+            next_id = target.relative_to(NOTES).as_posix()
+            pins = pinned_set()
+            if identifier in pins:
+                pins.discard(identifier)
+                pins.add(next_id)
+                save_pinned(pins)
+            conn = index_connect()
+            try:
+                sync_index(conn)
+            finally:
+                conn.close()
+            prune_versions(identifier)
+        else:
+            next_id = identifier
+    return {"id": next_id}
+
+
+def command_trash(args) -> dict:
+    ensure_store()
+    identifier = safe_relative(args.id)
+    source = note_path(identifier)
+    if not source.is_file():
+        raise StoreError(f"note not found: {identifier}")
+    with locked():
+        target_dir = TRASH / source.parent.relative_to(NOTES)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / source.name
+        if target.exists():
+            target = unique_target(target_dir, source.name, "trashed-")
+        try:
+            data = source.read_bytes()
+        except OSError as error:
+            raise StoreError(f"could not read the note before trashing it: {error}") from error
+        snapshot_note(identifier, data, "trash", destructive=True)
+        shutil.move(str(source), str(target))
+        prune_empty_dirs(source.parent)
+        pins = pinned_set()
+        if identifier in pins:
+            pins.discard(identifier)
+            save_pinned(pins)
+        new_id = target.relative_to(TRASH).as_posix()
+        conn = index_connect()
+        try:
+            sync_index(conn)
+        finally:
+            conn.close()
+        prune_versions(identifier)
+    return {"id": new_id}
+
+
+def command_restore(args) -> dict:
+    ensure_store()
+    identifier = safe_relative(args.id)
+    source = note_path(identifier, trashed=True)
+    if not source.is_file():
+        raise StoreError(f"note not found in trash: {identifier}")
+    with locked():
+        target_dir = NOTES / source.parent.relative_to(TRASH)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / source.name
+        if target.exists():
+            target = unique_target(target_dir, source.name, "restored-")
+        shutil.move(str(source), str(target))
+        prune_empty_dirs(source.parent)
+        new_id = target.relative_to(NOTES).as_posix()
+        conn = index_connect()
+        try:
+            sync_index(conn)
+        finally:
+            conn.close()
+    return {"id": new_id}
+
+
+def command_delete(args) -> dict:
+    ensure_store()
+    identifier = safe_relative(args.id)
+    path = note_path(identifier, trashed=True)
+    if not path.is_file():
+        raise StoreError(f"note not found in trash: {args.id}")
+    with locked():
+        try:
+            data = path.read_bytes()
+        except OSError as error:
+            raise StoreError(f"could not read the note before deleting it: {error}") from error
+        snapshot_note(identifier, data, "delete", destructive=True)
+        path.unlink()
+        conn = index_connect()
+        try:
+            sync_index(conn)
+        finally:
+            conn.close()
+        prune_versions(identifier)
+    return {"deleted": True, "id": identifier}
+
+
+def command_versions(args) -> dict:
+    """Read-only listing; deliberately does not create the store or index."""
+    identifier = safe_relative(args.id)
+    directory = version_dir(identifier)
+    versions = []
+    for path in version_files(directory):
+        try:
+            stat = path.stat(follow_symlinks=False)
+            digest = file_sha256(path)
+        except OSError:
+            continue
+        versions.append(
+            {
+                "path": str(path.resolve()),
+                "name": path.name,
+                "mtime": int(stat.st_mtime * 1000),
+                "size": int(stat.st_size),
+                "sha256": digest,
+            }
+        )
+    return {"id": identifier, "versions": versions, "retention": version_retention()}
+
+
+def command_restore_version(args) -> dict:
+    ensure_store()
+    identifier = safe_relative(args.id)
+    snapshot = snapshot_path(identifier, args.snapshot)
+    try:
+        data = snapshot.read_bytes()
+    except OSError as error:
+        raise StoreError(f"could not read snapshot: {error}") from error
+    if len(data) > MAX_NOTE_BYTES:
+        raise StoreError(f"snapshot exceeds {MAX_NOTE_BYTES} bytes")
+    path = note_path(identifier)
+    with locked():
+        if path.exists() and not path.is_file():
+            raise StoreError(f"note path is not a file: {identifier}")
+        if path.is_file():
+            try:
+                current = path.read_bytes()
+            except OSError as error:
+                raise StoreError(f"could not read the current note: {error}") from error
+            if current != data:
+                snapshot_note(identifier, current, "restore-version", destructive=True)
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write(path, data)
+        stat = path.stat()
+        conn = index_connect()
+        try:
+            index_file(conn, path, False, pinned_set())
+            resolve_links(conn)
+            conn.commit()
+        finally:
+            conn.close()
+        prune_versions(identifier)
+    return {
+        "id": identifier,
+        "size": int(stat.st_size),
+        "modified": int(stat.st_mtime * 1000),
+        "snapshot": snapshot.name,
+    }
+
+
+def command_empty_trash(_args) -> dict:
+    ensure_store()
+    deleted = 0
+    snapshotted: list[str] = []
+    with locked():
+        files = [path for path in TRASH.rglob("*") if path.is_file()] if TRASH.exists() else []
+        # Snapshot every note before deleting anything. A snapshot failure
+        # aborts the whole operation, so Trash is never partially destroyed.
+        for path in files:
+            if path.suffix.lower() != ".md":
+                continue
+            identifier = path.relative_to(TRASH).as_posix()
+            try:
+                data = path.read_bytes()
+            except OSError as error:
+                raise StoreError(
+                    f"could not read a trashed note before emptying Trash: {error}"
+                ) from error
+            snapshot_note(identifier, data, "empty-trash", destructive=True)
+            snapshotted.append(identifier)
+        for path in sorted(files, key=lambda item: len(item.parts), reverse=True):
+            with contextlib.suppress(OSError):
+                path.unlink()
+                deleted += 1
+        if TRASH.exists():
+            for path in sorted(TRASH.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+                if path.is_dir():
+                    with contextlib.suppress(OSError):
+                        path.rmdir()
+        conn = index_connect()
+        try:
+            sync_index(conn)
+        finally:
+            conn.close()
+        for identifier in snapshotted:
+            prune_versions(identifier)
+    return {"deleted": deleted}
+
+
+def command_pin(args) -> dict:
+    ensure_store()
+    identifier = safe_relative(args.id)
+    path = note_path(identifier)
+    if not path.is_file():
+        raise StoreError(f"note not found: {identifier}")
+    with locked():
+        try:
+            data = path.read_bytes()
+        except OSError as error:
+            raise StoreError(f"could not read the note before pinning it: {error}") from error
+        snapshot_note(identifier, data, "pin", destructive=True)
+        pins = pinned_set()
+        if identifier in pins:
+            pins.discard(identifier)
+            state = False
+        else:
+            pins.add(identifier)
+            state = True
+        save_pinned(pins)
+        conn = index_connect()
+        try:
+            sync_index(conn)
+        finally:
+            conn.close()
+        prune_versions(identifier)
+    return {"id": identifier, "pinned": state}
+
+
+def command_folder(args) -> dict:
+    ensure_store()
+    action = args.folder_action
+    snapshotted: list[str] = []
+    with locked():
+        if action == "create":
+            folder = clean_folder(args.path)
+            if not folder:
+                raise StoreError("folder name is empty")
+            target = NOTES / folder
+            if target.exists():
+                raise StoreError(f"folder already exists: {folder}")
+            target.mkdir(parents=True)
+            result = {"folder": folder}
+        elif action == "rename":
+            folder = clean_folder(args.path)
+            if not folder:
+                raise StoreError("cannot rename the notes root")
+            source = NOTES / folder
+            if not source.is_dir():
+                raise StoreError(f"folder not found: {folder}")
+            next_name = clean_folder(args.new)
+            if not next_name:
+                raise StoreError("new folder name is empty")
+            target = NOTES / next_name
+            if target.exists() and target != source:
+                raise StoreError(f"folder already exists: {next_name}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            source.rename(target)
+            pins = pinned_set()
+            next_pins = set()
+            for pin in pins:
+                if pin == folder or pin.startswith(folder + "/"):
+                    next_pins.add(next_name + pin[len(folder) :])
+                else:
+                    next_pins.add(pin)
+            save_pinned(next_pins)
+            prune_empty_dirs(source.parent)
+            result = {"folder": next_name, "from": folder}
+        elif action == "delete":
+            folder = clean_folder(args.path)
+            if not folder:
+                raise StoreError("cannot delete the notes root")
+            target = NOTES / folder
+            if not target.is_dir():
+                raise StoreError(f"folder not found: {folder}")
+            files = [path for path in target.rglob("*") if path.is_file()]
+            if files and not args.force:
+                raise StoreError(f"folder is not empty: {folder}")
+            # Notes moved out of the folder survive, but the folder itself is
+            # removed and non-Markdown files are discarded. Snapshot every note
+            # first so a failure aborts before anything is moved or deleted.
+            for path in files:
+                if path.suffix.lower() != ".md":
+                    continue
+                identifier = path.relative_to(NOTES).as_posix()
+                try:
+                    data = path.read_bytes()
+                except OSError as error:
+                    raise StoreError(
+                        f"could not read a note before deleting the folder: {error}"
+                    ) from error
+                snapshot_note(identifier, data, "folder-delete", destructive=True)
+                snapshotted.append(identifier)
+            moved = 0
+            if files:
+                root = NOTES
+                for path in files:
+                    if path.suffix.lower() != ".md":
+                        with contextlib.suppress(OSError):
+                            path.unlink()
+                        continue
+                    destination = root / path.name
+                    if destination.exists():
+                        destination = unique_target(root, path.name, "moved")
+                    shutil.move(str(path), str(destination))
+                    moved += 1
+                pins = pinned_set()
+                next_pins = set()
+                for pin in pins:
+                    if pin.startswith(folder + "/"):
+                        next_pins.add(Path(pin).name)
+                    else:
+                        next_pins.add(pin)
+                save_pinned(next_pins)
+            for path in sorted(target.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+                if path.is_dir():
+                    with contextlib.suppress(OSError):
+                        path.rmdir()
+            with contextlib.suppress(OSError):
+                target.rmdir()
+            prune_empty_dirs(target.parent)
+            result = {"deleted": True, "folder": folder, "moved": moved}
+        else:
+            raise StoreError("unknown folder action")
+        conn = index_connect()
+        try:
+            sync_index(conn)
+        finally:
+            conn.close()
+        for identifier in snapshotted:
+            prune_versions(identifier)
+    return result
+
+
+def fts_query(raw: str) -> str:
+    tokens = re.findall(r"[^\s]+", str(raw or ""))
+    tokens = tokens[:12]
+    parts = []
+    for token in tokens:
+        cleaned = token.replace('"', '""')
+        if cleaned.strip('"*'):
+            parts.append(f'"{cleaned}"*')
+    return " AND ".join(parts)
+
+
+def command_search(args) -> dict:
+    ensure_store()
+    query = fts_query(args.query)
+    limit = max(1, min(MAX_SEARCH_LIMIT, int(args.limit)))
+    with locked():
+        conn = with_index()
+        try:
+            if not query:
+                return {"results": []}
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT n.id, n.title,
+                           snippet(notes_fts, 2, '⟪', '⟫', '…', 14) AS snip,
+                           n.folder, n.mtime_ms, n.key, n.pinned, n.size
+                    FROM notes_fts JOIN notes n ON n.key=notes_fts.id
+                    WHERE notes_fts MATCH ? AND n.trashed=0
+                    ORDER BY bm25(notes_fts, 4.0, 1.0), n.mtime_ms DESC
+                    LIMIT ?
+                    """,
+                    (query, limit),
+                ).fetchall()
+            except sqlite3.OperationalError as error:
+                raise StoreError(f"search failed: {error}") from error
+            results = []
+            for identifier, title, snip, folder, mtime_ms, key, pinned, size in rows:
+                tags = [
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT tag FROM tags WHERE note_key=? ORDER BY tag COLLATE NOCASE", (key,)
+                    ).fetchall()
+                ]
+                results.append(
+                    {
+                        "id": str(identifier),
+                        "title": str(title),
+                        "snippet": " ".join(str(snip or "").split()),
+                        "folder": str(folder),
+                        "tags": tags,
+                        "modified": int(mtime_ms),
+                        "pinned": bool(pinned),
+                        "size": int(size),
+                    }
+                )
+        finally:
+            conn.close()
+    return {"results": results}
+
+
+def command_tags(_args) -> dict:
+    ensure_store()
+    with locked():
+        conn = with_index()
+        try:
+            rows = conn.execute(
+                """
+                SELECT t.tag, COUNT(*) AS n
+                FROM tags t JOIN notes n ON n.key=t.note_key
+                WHERE n.trashed=0
+                GROUP BY t.tag_key
+                ORDER BY n DESC, t.tag COLLATE NOCASE
+                """
+            ).fetchall()
+        finally:
+            conn.close()
+    return {"tags": [{"tag": str(tag), "count": int(count)} for tag, count in rows]}
+
+
+def replace_inline_tag(line: str, old_key: str, new_tag: str) -> tuple[str, int]:
+    pieces: list[tuple[int, int]] = []
+    cursor = 0
+    for match in INLINE_CODE_RE.finditer(line):
+        pieces.append((cursor, match.start()))
+        cursor = match.end()
+    pieces.append((cursor, len(line)))
+    protected = protected_spans(line)
+    changes = 0
+    output = line
+    # Right-to-left keeps earlier offsets valid.
+    spans = []
+    for start, end in pieces:
+        for match in TAG_RE.finditer(line, start, end):
+            if match.group(1).casefold() == old_key and not overlaps(match.span(), protected):
+                spans.append(match.span(1))
+    for start, end in reversed(spans):
+        output = output[:start] + new_tag + output[end:]
+        changes += 1
+    return output, changes
+
+
+def rewrite_tags(content: str, old: str, new: str) -> tuple[str, int]:
+    old_key = old.casefold()
+    newline = detect_newline(content)
+    lines = content.splitlines(keepends=True)
+    changes = 0
+    # Frontmatter (inline or block list forms).
+    if lines and lines[0].strip() == "---":
+        closing = None
+        for index in range(1, min(len(lines), 400)):
+            if lines[index].strip() == "---":
+                closing = index
+                break
+        if closing is not None:
+            for index in range(1, closing):
+                line = lines[index]
+                match = re.match(r"^(\s*tags\s*:\s*)(.*?)(\r?\n)?$", line, re.IGNORECASE)
+                if match:
+                    rest = match.group(2)
+                    if rest.strip().startswith("["):
+                        inner = rest.strip()[1:-1] if rest.strip().endswith("]") else rest.strip()[1:]
+                        values = [value.strip().strip("'\"") for value in inner.split(",")]
+                        next_values = [new if value.casefold().lstrip("#") == old_key else value for value in values]
+                        changes += sum(
+                            1
+                            for before, after in zip(values, next_values)
+                            if before.casefold().lstrip("#") == old_key
+                        )
+                        lines[index] = match.group(1) + "[" + ", ".join(next_values) + "]" + (match.group(3) or "")
+                    elif rest.strip().casefold().lstrip("#") == old_key:
+                        lines[index] = match.group(1) + new + (match.group(3) or "")
+                        changes += 1
+                    continue
+                item = re.match(r"^(\s*-\s*)(.+?)(\r?\n)?$", line)
+                if item and item.group(2).strip().strip("'\"").casefold().lstrip("#") == old_key:
+                    lines[index] = item.group(1) + new + (item.group(3) or "")
+                    changes += 1
+            content = "".join(lines)
+    # Inline tags outside frontmatter and code.
+    frontmatter, body = split_frontmatter(content)
+    in_code = False
+    output_lines = []
+    for line in body.splitlines(keepends=True):
+        bare = line.rstrip("\r\n")
+        ending = line[len(bare) :]
+        if FENCE_RE.match(bare):
+            in_code = not in_code
+            output_lines.append(line)
+            continue
+        if in_code:
+            output_lines.append(line)
+            continue
+        replaced, count = replace_inline_tag(bare, old_key, new)
+        changes += count
+        output_lines.append(replaced + ending)
+    body = "".join(output_lines)
+    if frontmatter is not None:
+        # Rebuild with the original fences.
+        return "---" + newline + frontmatter + "---" + newline + body, changes
+    return body, changes
+
+
+def command_tag_rename(args) -> dict:
+    ensure_store()
+    old = str(args.old or "").strip().lstrip("#")
+    new = normalize_tags([args.new])
+    if not old:
+        raise StoreError("old tag is empty")
+    if not new:
+        raise StoreError("new tag is empty")
+    new = new[0]
+    updated = 0
+    snapshotted: list[str] = []
+    with locked():
+        for path in list(NOTES.rglob("*.md")):
+            if not path.is_file():
+                continue
+            try:
+                previous_raw = path.read_bytes()
+                content = previous_raw.decode("utf-8", errors="replace")
+            except OSError:
+                continue
+            updated_content, changes = rewrite_tags(content, old, new)
+            if changes:
+                identifier = path.relative_to(NOTES).as_posix()
+                updated_bytes = updated_content.encode("utf-8")
+                if updated_bytes != previous_raw:
+                    snapshot_note(identifier, previous_raw, "tag-rename", destructive=True)
+                atomic_write(path, updated_bytes)
+                snapshotted.append(identifier)
+                updated += 1
+        conn = index_connect()
+        try:
+            sync_index(conn, full=True)
+        finally:
+            conn.close()
+        for identifier in snapshotted:
+            prune_versions(identifier)
+    return {"tag": new, "from": old, "updated": updated}
+
+
+def command_backlinks(args) -> dict:
+    ensure_store()
+    identifier = safe_relative(args.id)
+    with locked():
+        conn = with_index()
+        try:
+            rows = conn.execute(
+                """
+                SELECT n.id, n.title, n.snippet
+                FROM links l JOIN notes n ON n.key=l.src_key
+                WHERE l.resolved_id=? AND n.trashed=0 AND n.id<>?
+                GROUP BY n.id
+                ORDER BY n.mtime_ms DESC
+                """,
+                (identifier, identifier),
+            ).fetchall()
+        finally:
+            conn.close()
+    return {
+        "backlinks": [
+            {"id": str(identifier), "title": str(title), "snippet": str(snippet)}
+            for identifier, title, snippet in rows
+        ]
+    }
+
+
+def lookup_titles(conn: sqlite3.Connection) -> tuple[dict[str, str], dict[str, str]]:
+    rows = conn.execute(
+        "SELECT id,title,stem FROM notes WHERE trashed=0 ORDER BY pinned DESC, mtime_ms DESC, id"
+    ).fetchall()
+    by_title: dict[str, str] = {}
+    by_stem: dict[str, str] = {}
+    for identifier, title, stem in rows:
+        by_title.setdefault(unicodedata.normalize("NFC", str(title)).casefold(), str(identifier))
+        by_stem.setdefault(unicodedata.normalize("NFC", str(stem)).casefold(), str(identifier))
+    return by_title, by_stem
+
+
+def transform_line(line: str, by_title: dict[str, str], by_stem: dict[str, str]) -> str:
+    def wiki(match: re.Match) -> str:
+        raw = match.group(1)
+        target_part, _, alias = raw.partition("|")
+        target_part = target_part.strip()
+        if "#" in target_part:
+            target_part = target_part.split("#", 1)[0].strip()
+        if not target_part:
+            return match.group(0)
+        label = alias.strip() or target_part
+        norm = unicodedata.normalize("NFC", target_part).casefold()
+        resolved = by_title.get(norm) or by_stem.get(norm)
+        if resolved:
+            url = "quill://note/" + urllib.parse.quote(resolved, safe="/")
+        else:
+            url = "quill://missing/" + urllib.parse.quote(target_part, safe="")
+        return f"[{label}]({url})"
+
+    def tag(match: re.Match) -> str:
+        value = match.group(1)
+        return f"[#{value}](quill://tag/{urllib.parse.quote(value, safe='')})"
+
+    # Protect ordinary Markdown links and bare URLs so a `#fragment` in a
+    # URL is never mistaken for an inline tag.
+    protected: list[str] = []
+
+    def stash(match: re.Match) -> str:
+        protected.append(match.group(0))
+        return f"\x00{len(protected) - 1}\x00"
+
+    output = re.sub(r"\[[^\]\n]+\]\([^\s()\n]+\)|https?://[^\s<>()]+", stash, line)
+    output = WIKI_RE.sub(wiki, output)
+    output = TAG_RE.sub(tag, output)
+    if protected:
+        output = re.sub(
+            r"\x00(\d+)\x00",
+            lambda match: protected[int(match.group(1))],
+            output,
+        )
+    return output
+
+
+def command_preview(args) -> dict:
+    ensure_store()
+    path = note_path(args.id, trashed=getattr(args, "trashed", False))
+    if not path.is_file():
+        raise StoreError(f"note not found: {args.id}")
+    payload = read_note_bytes(path)
+    if len(payload) > MAX_NOTE_BYTES:
+        return {"markdown": "", "tooLarge": True}
+    content = payload.decode("utf-8", errors="replace")
+    with locked():
+        conn = index_connect()
+        try:
+            sync_index(conn)
+            by_title, by_stem = lookup_titles(conn)
+        finally:
+            conn.close()
+
+    frontmatter, body = split_frontmatter(content)
+    # Preview lines are body-relative; tell the UI how many file lines the
+    # stripped frontmatter occupied so image resize edits the right line.
+    line_offset = content.count("\n", 0, len(content) - len(body))
+    output: list[str] = []
+    in_code = False
+    for line in body.splitlines():
+        if FENCE_RE.match(line):
+            in_code = not in_code
+            output.append(line)
+            continue
+        if in_code:
+            output.append(line)
+            continue
+        segments: list[tuple[int, int, bool]] = []
+        cursor = 0
+        for match in INLINE_CODE_RE.finditer(line):
+            if match.start() > cursor:
+                segments.append((cursor, match.start(), False))
+            segments.append((match.start(), match.end(), True))
+            cursor = match.end()
+        if cursor < len(line):
+            segments.append((cursor, len(line), False))
+        rendered = ""
+        for start, end, is_code in segments:
+            segment = line[start:end]
+            rendered += segment if is_code else transform_line(segment, by_title, by_stem)
+        output.append(rendered)
+    markdown = "\n".join(output)
+    return {"markdown": markdown, "tooLarge": False, "lineOffset": line_offset}
+
+
+def command_import(args) -> dict:
+    ensure_store()
+    source = Path(
+        os.path.expanduser(os.environ.get("OMANANO_DATA_DIR") or "~/.local/share/omanano")
+    ).resolve()
+    source_notes = source / "notes"
+    imported = 0
+    skipped = 0
+    imported_ids: list[str] = []
+    if source_notes.is_dir():
+        with locked():
+            for path in source_notes.rglob("*.md"):
+                if not path.is_file():
+                    continue
+                relative = path.relative_to(source_notes)
+                target = NOTES / relative
+                if target.exists():
+                    skipped += 1
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(path, target)
+                imported += 1
+                imported_ids.append(relative.as_posix())
+            if imported_ids:
+                source_state = read_json(source / "state.json", {"pinned": []})
+                source_pins = set(source_state.get("pinned", []) if isinstance(source_state, dict) else [])
+                if source_pins:
+                    pins = pinned_set()
+                    existing = {path.relative_to(NOTES).as_posix() for path in NOTES.rglob("*.md")}
+                    pins.update(value for value in source_pins if value in existing)
+                    save_pinned(pins)
+            conn = index_connect()
+            try:
+                sync_index(conn, full=True)
+            finally:
+                conn.close()
+    return {"imported": imported, "skipped": skipped, "ids": imported_ids}
+
+
+def command_index(args) -> dict:
+    ensure_store()
+    with locked():
+        if args.rebuild:
+            for suffix in ("", "-wal", "-shm"):
+                with contextlib.suppress(OSError):
+                    os.unlink(str(INDEX) + suffix)
+        conn = index_connect()
+        try:
+            sync_index(conn, full=bool(args.rebuild))
+            notes = int(conn.execute("SELECT COUNT(*) FROM notes WHERE trashed=0").fetchone()[0])
+            trashed = int(conn.execute("SELECT COUNT(*) FROM notes WHERE trashed=1").fetchone()[0])
+            links = int(conn.execute("SELECT COUNT(*) FROM links").fetchone()[0])
+        finally:
+            conn.close()
+    return {"notes": notes, "trashed": trashed, "links": links, "rebuilt": bool(args.rebuild)}
+
+
+def command_attachment_save(args) -> dict:
+    ensure_store()
+    if getattr(args, "file", None):
+        source = Path(os.path.expanduser(args.file))
+        try:
+            if not source.is_file():
+                raise StoreError(f"image not found: {args.file}")
+            with source.open("rb") as handle:
+                payload = handle.read(MAX_ATTACHMENT_BYTES + 1)
+        except FileNotFoundError:
+            raise StoreError(f"image not found: {args.file}") from None
+        except IsADirectoryError:
+            raise StoreError(f"not a file: {args.file}") from None
+    else:
+        payload = sys.stdin.buffer.read(MAX_ATTACHMENT_BYTES + 1)
+
+    if not payload:
+        raise StoreError("image is empty")
+    if len(payload) > MAX_ATTACHMENT_BYTES:
+        raise StoreError("image is larger than 20 MiB")
+    kind = sniff_image(payload)
+    if kind is None:
+        raise StoreError("unsupported image type (expected PNG, JPEG, GIF, WebP or BMP)")
+    extension, mime = kind
+    alt = attachment_alt(getattr(args, "name", "") or "")
+
+    digest = hashlib.sha256(payload).hexdigest()
+    with locked():
+        directory = attachments_dir()
+        target = directory / f"{digest}.{extension}"
+        deduped = (
+            target.is_file()
+            and not target.is_symlink()
+            and target.stat().st_size == len(payload)
+        )
+        if not deduped:
+            atomic_write(target, payload)
+            with contextlib.suppress(OSError):
+                os.chmod(target, 0o644)
+
+    return {
+        "id": digest,
+        "path": str(target),
+        "markdown": attachment_markdown(alt, target),
+        "size": len(payload),
+        "mime": mime,
+        "deduped": bool(deduped),
+    }
+
+
+def command_attachment_list(_args) -> dict:
+    ensure_store()
+    with locked():
+        referenced = referenced_attachment_names()
+        files = []
+        for path in attachment_files():
+            try:
+                stat = path.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            files.append(
+                {
+                    "path": str(path),
+                    "size": int(stat.st_size),
+                    "mtime": int(stat.st_mtime * 1000),
+                    "referenced": path.name in referenced,
+                }
+            )
+    return {"attachments": files}
+
+
+def command_attachment_gc(args) -> dict:
+    ensure_store()
+    dry_run = bool(getattr(args, "dry_run", False))
+    removed = 0
+    freed = 0
+    kept = 0
+    with locked():
+        referenced = referenced_attachment_names()
+        for path in attachment_files():
+            if path.name in referenced:
+                kept += 1
+                continue
+            try:
+                size = int(path.stat(follow_symlinks=False).st_size)
+            except OSError:
+                kept += 1
+                continue
+            if dry_run:
+                removed += 1
+                freed += size
+                continue
+            try:
+                path.unlink()
+            except OSError:
+                kept += 1
+                continue
+            removed += 1
+            freed += size
+    return {"removed": removed, "freed": freed, "kept": kept, "dryRun": dry_run}
+
+
+def command_stats(_args) -> dict:
+    ensure_store()
+    notes = 0
+    trashed = 0
+    total_bytes = 0
+    folders = 0
+    with locked():
+        conn = with_index()
+        try:
+            notes = int(conn.execute("SELECT COUNT(*) FROM notes WHERE trashed=0").fetchone()[0])
+            trashed = int(conn.execute("SELECT COUNT(*) FROM notes WHERE trashed=1").fetchone()[0])
+            total_bytes = int(conn.execute("SELECT COALESCE(SUM(size),0) FROM notes").fetchone()[0])
+            tags = int(conn.execute("SELECT COUNT(DISTINCT tag_key) FROM tags").fetchone()[0])
+        finally:
+            conn.close()
+        if NOTES.exists():
+            folders = sum(1 for path in NOTES.rglob("*") if path.is_dir())
+    return {
+        "notes": notes,
+        "trashed": trashed,
+        "folders": folders,
+        "tags": tags,
+        "bytes": total_bytes,
+        "dataRoot": str(ROOT),
+        "attachments": len(attachment_files()),
+        "indexBytes": INDEX.stat().st_size if INDEX.exists() else 0,
+    }
+
+
+# --------------------------------------------------------------------------
+# entry point
+
+
+MUTATING_COMMANDS = {
+    "write",
+    "create",
+    "rename",
+    "move",
+    "trash",
+    "restore",
+    "delete",
+    "empty-trash",
+    "pin",
+    "tag-rename",
+    "import-omanano",
+    "index",
+    "restore-version",
+}
+
+
+def real_data_root() -> Path:
+    return Path(os.path.expanduser("~/.local/share/quill")).resolve()
+
+
+def command_is_mutating(args) -> bool:
+    command = str(getattr(args, "command", "") or "")
+    if command == "folder":
+        return True
+    if command == "attachment":
+        return str(getattr(args, "attachment_command", "") or "") in {"save", "gc"}
+    return command in MUTATING_COMMANDS
+
+
+def enforce_e2e(args) -> None:
+    """Refuse mutations of the user's real root from an E2E harness.
+
+    Read-only commands still work so a harness can inspect a clone or (for a
+    deliberate read-only check) the real root. Our tooling must never set
+    QUILL_E2E_ALLOW_REAL.
+    """
+    if os.environ.get("QUILL_E2E") != "1":
+        return
+    if os.environ.get("QUILL_E2E_ALLOW_REAL") == "1":
+        return
+    if command_is_mutating(args) and ROOT == real_data_root():
+        raise StoreError(
+            "QUILL_E2E=1 refuses to modify the real Quill data root; "
+            "point QUILL_DATA_DIR at a clone or set QUILL_E2E_ALLOW_REAL=1 deliberately"
+        )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="quill-store", description="Quill notes backend")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    listing = sub.add_parser("list")
+    listing.add_argument("--trashed", action="store_true")
+    listing.set_defaults(func=command_list)
+
+    read = sub.add_parser("read")
+    read.add_argument("id")
+    read.add_argument("--trashed", action="store_true")
+    read.set_defaults(func=command_read)
+
+    write = sub.add_parser("write")
+    write.add_argument("id")
+    write.add_argument("--stdin", action="store_true", help="read the new body from stdin")
+    write.add_argument("--content-file", help="read the new body from a file (UI convenience)")
+    write.add_argument("--create", action="store_true",
+                       help="create the note at this exact id when it is missing")
+    write.set_defaults(func=command_write)
+
+    create = sub.add_parser("create")
+    create.add_argument("--folder", default="")
+    create.add_argument("--title", default="")
+    create.add_argument("--content-stdin", action="store_true")
+    create.set_defaults(func=command_create)
+
+    rename = sub.add_parser("rename")
+    rename.add_argument("id")
+    rename.add_argument("--title", required=True)
+    rename.set_defaults(func=command_rename)
+
+    move = sub.add_parser("move")
+    move.add_argument("id")
+    move.add_argument("--folder", default="")
+    move.set_defaults(func=command_move)
+
+    for name, handler in (
+        ("trash", command_trash),
+        ("restore", command_restore),
+        ("delete", command_delete),
+        ("pin", command_pin),
+    ):
+        item = sub.add_parser(name)
+        item.add_argument("id")
+        item.set_defaults(func=handler)
+
+    sub.add_parser("empty-trash").set_defaults(func=command_empty_trash)
+
+    versions = sub.add_parser("versions")
+    versions.add_argument("id")
+    versions.set_defaults(func=command_versions)
+
+    restore_version = sub.add_parser("restore-version")
+    restore_version.add_argument("id")
+    restore_version.add_argument("snapshot", help="snapshot basename or absolute path")
+    restore_version.set_defaults(func=command_restore_version)
+
+    folder = sub.add_parser("folder")
+    folder_sub = folder.add_subparsers(dest="folder_action", required=True)
+    folder_create = folder_sub.add_parser("create")
+    folder_create.add_argument("path")
+    folder_create.set_defaults(func=command_folder)
+    folder_rename = folder_sub.add_parser("rename")
+    folder_rename.add_argument("path")
+    folder_rename.add_argument("new")
+    folder_rename.set_defaults(func=command_folder)
+    folder_delete = folder_sub.add_parser("delete")
+    folder_delete.add_argument("path")
+    folder_delete.add_argument("--force", action="store_true")
+    folder_delete.set_defaults(func=command_folder)
+
+    search = sub.add_parser("search")
+    search.add_argument("query")
+    search.add_argument("--limit", type=int, default=50)
+    search.set_defaults(func=command_search)
+
+    sub.add_parser("tags").set_defaults(func=command_tags)
+
+    tag_rename = sub.add_parser("tag-rename")
+    tag_rename.add_argument("old")
+    tag_rename.add_argument("new")
+    tag_rename.set_defaults(func=command_tag_rename)
+
+    backlinks = sub.add_parser("backlinks")
+    backlinks.add_argument("id")
+    backlinks.set_defaults(func=command_backlinks)
+
+    preview = sub.add_parser("preview")
+    preview.add_argument("id")
+    preview.add_argument("--trashed", action="store_true")
+    preview.set_defaults(func=command_preview)
+
+    sub.add_parser("import-omanano").set_defaults(func=command_import)
+
+    index = sub.add_parser("index")
+    index.add_argument("--rebuild", action="store_true")
+    index.set_defaults(func=command_index)
+
+    attachment = sub.add_parser("attachment")
+    attachment_sub = attachment.add_subparsers(dest="attachment_command", required=True)
+    attachment_save = attachment_sub.add_parser("save")
+    attachment_source = attachment_save.add_mutually_exclusive_group(required=True)
+    attachment_source.add_argument("--file", help="read the image from this path")
+    attachment_source.add_argument("--stdin", action="store_true", help="read the image from stdin")
+    attachment_save.add_argument("--name", default="", help="alt text for the Markdown image")
+    attachment_save.set_defaults(func=command_attachment_save)
+    attachment_sub.add_parser("list").set_defaults(func=command_attachment_list)
+    attachment_gc = attachment_sub.add_parser("gc")
+    attachment_gc.add_argument("--dry-run", action="store_true")
+    attachment_gc.set_defaults(func=command_attachment_gc)
+
+    sub.add_parser("stats").set_defaults(func=command_stats)
+    return parser
+
+
+def main() -> int:
+    try:
+        args = build_parser().parse_args()
+        enforce_e2e(args)
+        result = args.func(args)
+        sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+        return 0
+    except StoreError as error:
+        sys.stderr.write(json.dumps({"error": str(error)}, ensure_ascii=False) + "\n")
+        return 1
+    except FileNotFoundError as error:
+        sys.stderr.write(json.dumps({"error": str(error)}, ensure_ascii=False) + "\n")
+        return 1
+    except PermissionError as error:
+        sys.stderr.write(json.dumps({"error": str(error)}, ensure_ascii=False) + "\n")
+        return 1
+    except sqlite3.Error as error:
+        sys.stderr.write(json.dumps({"error": f"index error: {error}"}, ensure_ascii=False) + "\n")
+        return 1
+    except ValueError as error:
+        sys.stderr.write(json.dumps({"error": str(error)}, ensure_ascii=False) + "\n")
+        return 1
+    except OSError as error:
+        sys.stderr.write(json.dumps({"error": str(error)}, ensure_ascii=False) + "\n")
+        return 1
+    except Exception as error:  # keep the shell contract: JSON on stderr
+        sys.stderr.write(json.dumps({"error": f"{type(error).__name__}: {error}"}, ensure_ascii=False) + "\n")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

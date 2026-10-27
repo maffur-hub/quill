@@ -1,0 +1,951 @@
+#!/usr/bin/env node
+'use strict'
+
+// quill-agent - the JSONL bridge between Quill's QML chat dock and the
+// OpenCode service.
+//
+// One JSON object per stdin line in, one JSON object per stdout line out.
+// All HTTP, SSE reconnection and transcript normalisation live here so QML
+// only has to route events into a model. The bridge never exits on a service
+// error: it keeps the SSE stream reconnecting and reports failures as
+// `error` events for the dock's Retry button.
+//
+// Runtime: Node built-ins only. Logs go to <state>/agent.log (capped) or
+// stderr with QUILL_AGENT_DEBUG=1; stdout is protocol-only.
+
+const fs = require('fs')
+const os = require('os')
+const path = require('path')
+const http = require('http')
+const https = require('https')
+const { spawnSync } = require('child_process')
+
+const HOME = os.homedir()
+const STATE_DIR = path.join(
+  process.env.XDG_STATE_HOME || path.join(HOME, '.local', 'state'),
+  'quill'
+)
+const LOG_PATH = path.join(STATE_DIR, 'agent.log')
+const LOG_CAP = 256 * 1024
+const DEFAULT_DATA_ROOT = path.join(HOME, '.local', 'share', 'quill')
+const DEFAULT_AGENT = 'build'
+const TOOL_LIMIT = 4000
+const REST_TIMEOUT = 10000
+
+let serviceURL = ''
+let password = ''
+let agent = process.env.QUILL_AGENT || DEFAULT_AGENT
+let dataRoot = DEFAULT_DATA_ROOT
+
+let currentSessionID = ''
+let sessions = []
+let sessionInfo = {}
+let titlePatched = {}
+let streamParts = new Map()
+let sseRequest = null
+let sseReconnectTimer = null
+let sseBackoff = 500
+let sseGeneration = 0
+let lastServiceError = ''
+let stopping = false
+let stdoutBroken = false
+let toolNames = {}
+let sessionsTimer = null
+let commandChain = Promise.resolve()
+
+// ---------------------------------------------------------------- utilities
+
+function log(message) {
+  const line = new Date().toISOString() + ' ' + String(message) + '\n'
+  if (process.env.QUILL_AGENT_DEBUG === '1') {
+    try { process.stderr.write(line) } catch (error) { /* nowhere left */ }
+  }
+  try {
+    fs.mkdirSync(STATE_DIR, { recursive: true })
+    let size = 0
+    try { size = fs.statSync(LOG_PATH).size } catch (error) { size = 0 }
+    if (size > LOG_CAP) fs.truncateSync(LOG_PATH, 0)
+    fs.appendFileSync(LOG_PATH, line)
+  } catch (error) { /* logging must never break the bridge */ }
+}
+
+function send(payload) {
+  if (stdoutBroken) return
+  try {
+    process.stdout.write(JSON.stringify(payload) + '\n')
+  } catch (error) {
+    if (error && error.code === 'EPIPE') { stdoutBroken = true; shutdown() }
+    else log('stdout write failed: ' + error.message)
+  }
+}
+
+function emitError(scope, message) {
+  send({ type: 'error', scope: String(scope), message: String(message || 'Chat failed') })
+}
+
+function expandHome(value) {
+  const text = String(value || '')
+  if (text === '~') return HOME
+  if (text.indexOf('~/') === 0) return path.join(HOME, text.slice(2))
+  return text
+}
+
+function clampText(value, limit) {
+  const text = String(value === undefined || value === null ? '' : value)
+  if (text.length <= limit) return text
+  return text.slice(0, limit) + '\n…'
+}
+
+function messageOf(error) {
+  if (!error) return 'Unknown error'
+  if (error.message) return String(error.message)
+  return String(error)
+}
+
+class HttpError extends Error {
+  constructor(status, message) {
+    super(message)
+    this.status = status
+  }
+}
+
+// ------------------------------------------------------------- service HTTP
+
+function resolveService() {
+  let value = String(process.env.QUILL_OPENCODE_URL || '').trim()
+  if (!value) {
+    try {
+      const result = spawnSync('opencode', ['service', 'status'], {
+        encoding: 'utf8',
+        timeout: 5000
+      })
+      const match = String(result.stdout || '').match(/https?:\/\/[^\s]+/)
+      if (match) value = match[0]
+    } catch (error) {
+      log('service status failed: ' + messageOf(error))
+    }
+  }
+  // The documented default if the probe is unavailable; the dock will show a
+  // service error and Retry if this address is not actually listening.
+  if (!value) value = 'http://127.0.0.1:49374'
+  serviceURL = value.replace(/\/+$/, '')
+}
+
+function resolvePassword() {
+  const override = String(process.env.QUILL_OPENCODE_PASSWORD || '')
+  if (override) { password = override; return }
+  const configHome = process.env.XDG_CONFIG_HOME || path.join(HOME, '.config')
+  const candidates = [
+    path.join(configHome, 'opencode', 'service.json'),
+    path.join(HOME, '.config', 'opencode', 'service.json')
+  ]
+  for (let i = 0; i < candidates.length; i++) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(candidates[i], 'utf8'))
+      if (parsed && parsed.password) { password = String(parsed.password); return }
+    } catch (error) { /* try the next location */ }
+  }
+  password = ''
+}
+
+function authorization() {
+  return 'Basic ' + Buffer.from('opencode:' + password).toString('base64')
+}
+
+function api(method, apiPath, body) {
+  return new Promise(function(resolve, reject) {
+    let url
+    try {
+      url = new URL(serviceURL + apiPath)
+    } catch (error) {
+      reject(new Error('Invalid OpenCode service URL'))
+      return
+    }
+    const transport = url.protocol === 'https:' ? https : http
+    const payload = body === undefined ? null : Buffer.from(JSON.stringify(body))
+    const headers = {
+      Authorization: authorization(),
+      Accept: 'application/json'
+    }
+    if (payload) {
+      headers['Content-Type'] = 'application/json'
+      headers['Content-Length'] = payload.length
+    }
+    const request = transport.request(url, { method: method, headers: headers }, function(response) {
+      let raw = ''
+      response.setEncoding('utf8')
+      response.on('data', function(chunk) { raw += chunk })
+      response.on('end', function() {
+        let parsed = null
+        if (raw.trim() !== '') {
+          try { parsed = JSON.parse(raw) } catch (error) { parsed = null }
+        }
+        if (response.statusCode >= 200 && response.statusCode < 300) {
+          resolve(parsed)
+          return
+        }
+        let message = ''
+        if (parsed && parsed.message) message = String(parsed.message)
+        else if (parsed && parsed.error) {
+          message = typeof parsed.error === 'string' ? parsed.error : String(parsed.error.message || '')
+        }
+        if (!message) message = 'OpenCode returned HTTP ' + response.statusCode
+        reject(new HttpError(response.statusCode, message))
+      })
+    })
+    request.setTimeout(REST_TIMEOUT, function() {
+      request.destroy(new Error('OpenCode request timed out'))
+    })
+    request.on('error', function(error) {
+      reject(new Error('Cannot reach OpenCode: ' + messageOf(error)))
+    })
+    if (payload) request.write(payload)
+    request.end()
+  })
+}
+
+// --------------------------------------------------------------- sessions
+
+function normaliseSession(item) {
+  const time = item && item.time ? item.time : {}
+  return {
+    id: String(item && item.id ? item.id : ''),
+    title: String(item && item.title ? item.title : 'New chat'),
+    updated: Number(time.updated || time.created || 0),
+    agent: String(item && item.agent ? item.agent : agent)
+  }
+}
+
+async function fetchSessions(emit) {
+  const query = '/api/session?directory=' + encodeURIComponent(dataRoot) + '&limit=50'
+  const response = await api('GET', query)
+  const list = response && Array.isArray(response.data) ? response.data : []
+  sessions = list.map(normaliseSession)
+  for (let i = 0; i < list.length; i++) {
+    if (list[i] && list[i].id) sessionInfo[list[i].id] = normaliseSession(list[i])
+  }
+  if (emit !== false) send({ type: 'sessions', items: sessions })
+  return sessions
+}
+
+function refreshSessionsSoon() {
+  if (sessionsTimer) return
+  sessionsTimer = setTimeout(function() {
+    sessionsTimer = null
+    fetchSessions(true).catch(function(error) {
+      log('session refresh failed: ' + messageOf(error))
+    })
+  }, 250)
+}
+
+function sessionTitle(sessionID) {
+  if (sessionInfo[sessionID] && sessionInfo[sessionID].title) return sessionInfo[sessionID].title
+  for (let i = 0; i < sessions.length; i++) {
+    if (sessions[i].id === sessionID) return sessions[i].title
+  }
+  return ''
+}
+
+// --------------------------------------------------------------- history
+
+function toolOutput(content) {
+  if (!Array.isArray(content)) return ''
+  const pieces = []
+  for (let i = 0; i < content.length; i++) {
+    const item = content[i]
+    if (!item || item.type !== 'text') continue
+    const text = String(item.text === undefined ? '' : item.text)
+    // Shell tools wrap their real output in a JSON-encoded string. Prefer the
+    // readable output over the envelope, but keep plain text as-is.
+    try {
+      const parsed = JSON.parse(text)
+      if (parsed && typeof parsed.output === 'string') {
+        pieces.push(parsed.output)
+        continue
+      }
+    } catch (error) { /* ordinary text content */ }
+    pieces.push(text)
+  }
+  return clampText(pieces.join('\n'), TOOL_LIMIT)
+}
+
+function structuredError(value) {
+  if (!value) return ''
+  if (typeof value === 'string') return value
+  if (value.message) return String(value.message)
+  try { return JSON.stringify(value) } catch (error) { return 'Tool failed' }
+}
+
+function normaliseTool(part) {
+  const state = part && part.state ? part.state : {}
+  let status = 'completed'
+  if (state.status === 'error') status = 'error'
+  else if (state.status === 'streaming' || state.status === 'running') status = 'running'
+  const entry = {
+    toolID: String(part && part.id ? part.id : ''),
+    name: String(part && part.name ? part.name : 'tool'),
+    input: state.input === undefined ? null : state.input,
+    status: status,
+    output: toolOutput(state.content),
+    error: structuredError(state.error)
+  }
+  return entry
+}
+
+function normaliseHistory(data) {
+  const messages = []
+  const list = Array.isArray(data) ? data : []
+  for (let i = 0; i < list.length; i++) {
+    const item = list[i]
+    if (!item) continue
+    const time = item.time && item.time.created ? Number(item.time.created) : 0
+    if (item.type === 'user') {
+      messages.push({
+        kind: 'user',
+        id: String(item.id || ''),
+        text: String(item.text || ''),
+        time: time
+      })
+      continue
+    }
+    if (item.type !== 'assistant') continue
+    const textParts = []
+    const reasoningParts = []
+    const tools = []
+    const content = Array.isArray(item.content) ? item.content : []
+    for (let c = 0; c < content.length; c++) {
+      const part = content[c]
+      if (!part) continue
+      if (part.type === 'text') textParts.push(String(part.text || ''))
+      else if (part.type === 'reasoning') reasoningParts.push(String(part.text || ''))
+      else if (part.type === 'tool') tools.push(normaliseTool(part))
+    }
+    messages.push({
+      kind: 'assistant',
+      id: String(item.id || ''),
+      text: textParts.join('\n\n'),
+      reasoning: reasoningParts.join('\n\n'),
+      tools: tools,
+      time: time
+    })
+  }
+  return messages
+}
+
+// ---------------------------------------------------------- stream parts
+
+function partStore(messageID, kind) {
+  const key = String(messageID) + '|' + kind
+  let entry = streamParts.get(key)
+  if (!entry) {
+    entry = {}
+    streamParts.set(key, entry)
+  }
+  return entry
+}
+
+function appendPart(messageID, kind, ordinal, delta) {
+  const entry = partStore(messageID, kind)
+  const key = String(ordinal === undefined || ordinal === null ? 0 : ordinal)
+  entry[key] = String(entry[key] || '') + String(delta === undefined ? '' : delta)
+}
+
+function setPart(messageID, kind, ordinal, text) {
+  const entry = partStore(messageID, kind)
+  const key = String(ordinal === undefined || ordinal === null ? 0 : ordinal)
+  entry[key] = String(text === undefined ? '' : text)
+}
+
+function composedParts(messageID, kind) {
+  const entry = partStore(messageID, kind)
+  const keys = Object.keys(entry).sort(function(a, b) { return Number(a) - Number(b) })
+  const pieces = []
+  for (let i = 0; i < keys.length; i++) {
+    if (entry[keys[i]] !== '') pieces.push(entry[keys[i]])
+  }
+  return pieces.join('\n\n')
+}
+
+
+function resetTranscriptParts() {
+  streamParts.clear()
+  toolNames = {}
+}
+
+// ------------------------------------------------------------------- SSE
+
+function scheduleReconnect() {
+  if (stopping || !password) return
+  if (sseReconnectTimer) return
+  const delay = sseBackoff
+  sseBackoff = Math.min(15000, sseBackoff * 2)
+  sseReconnectTimer = setTimeout(function() {
+    sseReconnectTimer = null
+    connectSSE()
+  }, delay)
+}
+
+function reportServiceError(message) {
+  const next = String(message || 'OpenCode service unavailable')
+  if (next === lastServiceError) return
+  lastServiceError = next
+  emitError('service', next)
+}
+
+function connectSSE() {
+  if (stopping || !password) return
+  const generation = ++sseGeneration
+  let url
+  try {
+    url = new URL(serviceURL + '/api/event')
+  } catch (error) {
+    reportServiceError('Invalid OpenCode service URL')
+    return
+  }
+  const transport = url.protocol === 'https:' ? https : http
+  let finished = false
+  const request = transport.request(url, {
+    method: 'GET',
+    headers: {
+      Authorization: authorization(),
+      Accept: 'text/event-stream',
+      'Cache-Control': 'no-cache'
+    }
+  }, function(response) {
+    if (generation !== sseGeneration) { response.resume(); return }
+    if (response.statusCode !== 200) {
+      response.resume()
+      reportServiceError('OpenCode event stream returned HTTP ' + response.statusCode)
+      if (!finished) { finished = true; scheduleReconnect() }
+      return
+    }
+    lastServiceError = ''
+    sseBackoff = 500
+    // A reconnect may have missed events. Reload the open transcript and the
+    // session list instead of trying to replay deltas; on the first connect
+    // the list refresh also clears any stale service error in the dock.
+    if (currentSessionID) {
+      loadHistory(currentSessionID, true).catch(function(error) {
+        log('history refresh failed: ' + messageOf(error))
+      })
+    }
+    refreshSessionsSoon()
+
+    let buffer = ''
+    let dataLines = []
+    response.setEncoding('utf8')
+    response.on('data', function(chunk) {
+      if (generation !== sseGeneration) return
+      buffer += chunk
+      let index = buffer.indexOf('\n')
+      while (index >= 0) {
+        let line = buffer.slice(0, index)
+        buffer = buffer.slice(index + 1)
+        if (line.charAt(line.length - 1) === '\r') line = line.slice(0, -1)
+        if (line === '') {
+          if (dataLines.length > 0) {
+            const raw = dataLines.join('\n')
+            dataLines = []
+            handleSSEPayload(raw)
+          }
+        } else if (line.indexOf('data:') === 0) {
+          dataLines.push(line.slice(5).replace(/^ /, ''))
+        }
+        index = buffer.indexOf('\n')
+      }
+    })
+    response.on('end', function() {
+      if (finished || stopping || generation !== sseGeneration) return
+      finished = true
+      sseRequest = null
+      reportServiceError('OpenCode event stream closed')
+      scheduleReconnect()
+    })
+    response.on('error', function(error) {
+      if (finished || stopping || generation !== sseGeneration) return
+      finished = true
+      sseRequest = null
+      reportServiceError('OpenCode event stream failed: ' + messageOf(error))
+      scheduleReconnect()
+    })
+  })
+  request.setTimeout(0)
+  request.on('error', function(error) {
+    if (finished || stopping || generation !== sseGeneration) return
+    finished = true
+    sseRequest = null
+    reportServiceError('Cannot reach OpenCode: ' + messageOf(error))
+    scheduleReconnect()
+  })
+  request.end()
+  sseRequest = request
+}
+
+function handleSSEPayload(raw) {
+  let event = null
+  try { event = JSON.parse(raw) } catch (error) { return }
+  if (!event || !event.type) return
+  const data = event.data && typeof event.data === 'object' ? event.data : {}
+  handleEvent(String(event.type), data)
+}
+
+function isCurrent(data) {
+  return !!currentSessionID && String(data.sessionID || '') === currentSessionID
+}
+
+function handleEvent(type, data) {
+  const sessionID = String(data.sessionID || '')
+  switch (type) {
+    case 'session.execution.started':
+      if (isCurrent(data)) send({ type: 'status', sessionID: sessionID, status: 'running' })
+      break
+    case 'session.execution.succeeded':
+    case 'session.execution.failed':
+    case 'session.execution.interrupted':
+      if (isCurrent(data)) send({ type: 'status', sessionID: sessionID, status: 'idle' })
+      refreshSessionsSoon()
+      break
+    case 'session.step.started':
+      if (isCurrent(data)) send({ type: 'status', sessionID: sessionID, status: 'running' })
+      break
+    case 'session.step.ended':
+      if (isCurrent(data) && data.cost !== undefined) {
+        send({
+          type: 'usage',
+          sessionID: sessionID,
+          cost: Number(data.cost || 0),
+          tokens: data.tokens || null
+        })
+      }
+      break
+    case 'session.usage.updated':
+      if (isCurrent(data)) {
+        send({
+          type: 'usage',
+          sessionID: sessionID,
+          cost: Number(data.cost || 0),
+          tokens: data.tokens || null
+        })
+      }
+      break
+    case 'session.text.delta':
+      if (!isCurrent(data)) return
+      appendPart(data.assistantMessageID, 'text', data.ordinal, data.delta)
+      send({
+        type: 'delta',
+        sessionID: sessionID,
+        messageID: String(data.assistantMessageID || ''),
+        kind: 'text',
+        delta: String(data.delta || '')
+      })
+      break
+    case 'session.text.ended':
+      if (!isCurrent(data)) return
+      setPart(data.assistantMessageID, 'text', data.ordinal, data.text)
+      send({
+        type: 'text',
+        sessionID: sessionID,
+        messageID: String(data.assistantMessageID || ''),
+        text: composedParts(data.assistantMessageID, 'text')
+      })
+      break
+    case 'session.reasoning.delta':
+      if (!isCurrent(data)) return
+      appendPart(data.assistantMessageID, 'reasoning', data.ordinal, data.delta)
+      send({
+        type: 'delta',
+        sessionID: sessionID,
+        messageID: String(data.assistantMessageID || ''),
+        kind: 'reasoning',
+        delta: String(data.delta || '')
+      })
+      break
+    case 'session.reasoning.ended':
+      if (!isCurrent(data)) return
+      setPart(data.assistantMessageID, 'reasoning', data.ordinal, data.text)
+      send({
+        type: 'text',
+        sessionID: sessionID,
+        messageID: String(data.assistantMessageID || ''),
+        text: composedParts(data.assistantMessageID, 'reasoning'),
+        kind: 'reasoning'
+      })
+      break
+    case 'session.tool.input.started':
+    case 'session.tool.input.ended':
+    case 'session.tool.called':
+    case 'session.tool.success':
+    case 'session.tool.failed':
+      if (isCurrent(data)) handleToolEvent(type, data)
+      break
+    case 'permission.asked': {
+      if (!isCurrent(data)) break
+      const resources = Array.isArray(data.resources) ? data.resources : []
+      send({
+        type: 'permission',
+        sessionID: sessionID,
+        requestID: String(data.id || ''),
+        action: String(data.action || ''),
+        resource: String(resources[0] || ''),
+        description: String(data.message || data.action || 'Permission required')
+      })
+      break
+    }
+    case 'permission.replied':
+      if (isCurrent(data)) {
+        send({
+          type: 'permission-cleared',
+          sessionID: sessionID,
+          requestID: String(data.requestID || '')
+        })
+      }
+      break
+    default:
+      break
+  }
+}
+
+function parseToolInput(data) {
+  if (data.input !== undefined) return data.input
+  if (typeof data.text === 'string') {
+    try { return JSON.parse(data.text) } catch (error) { return data.text }
+  }
+  return null
+}
+
+function genericToolName(name) {
+  const value = String(name || '')
+  return value === '' || value === 'tool' || value === 'execute'
+}
+
+// OpenCode emits a generic name on some tool events and the real tool name
+// (for example "shell") on others. Keep the first specific name per tool id so
+// a later "tool" event cannot rename a running command in the UI.
+function displayToolName(data) {
+  const toolID = String(data.id || '')
+  const incoming = String(data.name || '')
+  if (!toolNames[toolID] || genericToolName(toolNames[toolID])) {
+    if (!genericToolName(incoming)) toolNames[toolID] = incoming
+    else if (!toolNames[toolID]) toolNames[toolID] = incoming || 'tool'
+  }
+  return toolNames[toolID] || 'tool'
+}
+
+function handleToolEvent(type, data) {
+  const messageID = String(data.assistantMessageID || '')
+  const toolID = String(data.id || '')
+  const name = displayToolName(data)
+  const event = {
+    type: 'tool',
+    sessionID: String(data.sessionID || ''),
+    messageID: messageID,
+    toolID: toolID,
+    name: name,
+    input: parseToolInput(data),
+    status: 'running'
+  }
+  if (type === 'session.tool.success') {
+    event.status = 'completed'
+    event.output = toolOutput(data.content)
+  } else if (type === 'session.tool.failed') {
+    event.status = 'error'
+    event.error = structuredError(data.error) || 'Tool failed'
+    event.output = toolOutput(data.content)
+  }
+  send(event)
+}
+
+// ------------------------------------------------------------- session ops
+
+async function loadHistory(sessionID, quiet) {
+  const response = await api('GET', '/api/session/' + encodeURIComponent(sessionID) + '/message')
+  const raw = response && Array.isArray(response.data) ? response.data : []
+  const messages = normaliseHistory(raw)
+  if (sessionID !== currentSessionID) return messages
+  resetTranscriptParts()
+  send({
+    type: 'history',
+    sessionID: sessionID,
+    title: sessionTitle(sessionID),
+    messages: messages
+  })
+  // A reconnect can miss the execution-succeeded event. OpenCode appends an
+  // idle marker when a run finishes, so the last raw message tells us whether
+  // the Stop button should stay up.
+  let idle = true
+  if (raw.length > 0) idle = raw[raw.length - 1].type === 'idle'
+  send({ type: 'status', sessionID: sessionID, status: idle ? 'idle' : 'running' })
+  return messages
+}
+
+async function startSession(title) {
+  const body = { agent: agent, location: { directory: dataRoot } }
+  const wanted = String(title || '').trim()
+  if (wanted) body.title = wanted
+  const response = await api('POST', '/api/session', body)
+  const info = response && response.data ? response.data : null
+  if (!info || !info.id) throw new Error('OpenCode did not return a session')
+  const item = normaliseSession(info)
+  sessionInfo[item.id] = item
+  currentSessionID = item.id
+  resetTranscriptParts()
+  send({ type: 'opened', sessionID: item.id, title: item.title, agent: item.agent })
+  send({ type: 'history', sessionID: item.id, title: item.title, messages: [] })
+  refreshSessionsSoon()
+  log('created session ' + item.id)
+  return item
+}
+
+async function openSession(sessionID) {
+  const id = String(sessionID || '')
+  if (!id) throw new Error('No session selected')
+  let info = sessionInfo[id]
+  if (!info) {
+    const response = await api('GET', '/api/session/' + encodeURIComponent(id))
+    if (response && response.data) {
+      info = normaliseSession(response.data)
+      sessionInfo[id] = info
+    }
+  }
+  currentSessionID = id
+  resetTranscriptParts()
+  send({
+    type: 'opened',
+    sessionID: id,
+    title: info ? info.title : 'Chat',
+    agent: info ? info.agent : agent
+  })
+  await loadHistory(id, false)
+}
+
+async function sendPrompt(sessionID, text) {
+  const id = String(sessionID || '')
+  const prompt = String(text === undefined || text === null ? '' : text)
+  if (!id) throw new Error('No chat is open')
+  if (prompt.trim() === '') return
+  try {
+    await api('POST', '/api/session/' + encodeURIComponent(id) + '/prompt', { text: prompt })
+  } catch (error) {
+    if (error.status === 409) {
+      emitError('prompt', 'This chat is still answering; wait for it to finish')
+      send({ type: 'status', sessionID: id, status: 'running' })
+      return
+    }
+    throw error
+  }
+  send({ type: 'status', sessionID: id, status: 'running' })
+  maybePatchTitle(id, prompt).catch(function(error) {
+    log('title patch failed: ' + messageOf(error))
+  })
+}
+
+// A new OpenCode session starts as "New chat" (or with no title at all).
+// Name it from the first prompt exactly once; later prompts never rewrite a
+// title the user has chosen in the session picker.
+async function maybePatchTitle(sessionID, prompt) {
+  if (titlePatched[sessionID]) return
+  if (!sessionInfo[sessionID]) {
+    try {
+      const response = await api('GET', '/api/session/' + encodeURIComponent(sessionID))
+      if (response && response.data) sessionInfo[sessionID] = normaliseSession(response.data)
+    } catch (error) { /* title is best-effort */ }
+  }
+  const title = String((sessionInfo[sessionID] && sessionInfo[sessionID].title) || '').trim()
+  if (title !== '' && title.toLowerCase() !== 'new chat') return
+  titlePatched[sessionID] = true
+  const oneLine = String(prompt).replace(/\s+/g, ' ').trim().slice(0, 60)
+  if (!oneLine) return
+  await api('PATCH', '/api/session/' + encodeURIComponent(sessionID), { title: oneLine })
+  if (sessionInfo[sessionID]) sessionInfo[sessionID].title = oneLine
+  refreshSessionsSoon()
+}
+
+async function renameSession(sessionID, title) {
+  const id = String(sessionID || '')
+  const next = String(title || '').replace(/\s+/g, ' ').trim()
+  if (!id || !next) return
+  await api('PATCH', '/api/session/' + encodeURIComponent(id), { title: next })
+  if (sessionInfo[id]) sessionInfo[id].title = next
+  titlePatched[id] = true
+  await fetchSessions(true)
+}
+
+async function deleteSession(sessionID) {
+  const id = String(sessionID || '')
+  if (!id) return
+  await api('DELETE', '/api/session/' + encodeURIComponent(id))
+  if (currentSessionID === id) {
+    currentSessionID = ''
+    resetTranscriptParts()
+    send({ type: 'history', sessionID: '', title: '', messages: [] })
+  }
+  delete sessionInfo[id]
+  await fetchSessions(true)
+}
+
+function writeContext(context) {
+  if (!dataRoot) throw new Error('No Quill data directory')
+  fs.mkdirSync(dataRoot, { recursive: true })
+  const target = path.join(dataRoot, '.quill-context.json')
+  const temp = path.join(dataRoot, '.quill-context.' + process.pid + '.' + Date.now() + '.tmp')
+  const payload = JSON.stringify(context === undefined ? {} : context)
+  fs.writeFileSync(temp, payload, { mode: 0o644 })
+  fs.renameSync(temp, target)
+}
+
+async function replyPermission(sessionID, requestID, reply) {
+  const id = String(sessionID || '')
+  const request = String(requestID || '')
+  const decision = ['once', 'always', 'reject'].indexOf(String(reply)) >= 0 ? String(reply) : 'reject'
+  if (!id || !request) throw new Error('Permission request is no longer available')
+  await api('POST',
+    '/api/session/' + encodeURIComponent(id) + '/permission/' + encodeURIComponent(request) + '/reply',
+    { decision: decision })
+}
+
+// ----------------------------------------------------------------- command
+
+async function handleCommand(command) {
+  const type = String(command && command.type ? command.type : '')
+  switch (type) {
+    case 'start': {
+      stopping = false
+      dataRoot = expandHome(command.dataRoot || DEFAULT_DATA_ROOT) || DEFAULT_DATA_ROOT
+      agent = String(process.env.QUILL_AGENT || DEFAULT_AGENT)
+      try { fs.mkdirSync(dataRoot, { recursive: true }) } catch (error) {
+        emitError('bridge', 'Cannot create the Quill data directory')
+      }
+      resolveService()
+      resolvePassword()
+      lastServiceError = ''
+      send({ type: 'ready', service: serviceURL, directory: dataRoot, agent: agent })
+      if (!password) {
+        emitError('service', 'OpenCode service password was not found')
+        return
+      }
+      toolNames = {}
+      if (sseReconnectTimer) {
+        clearTimeout(sseReconnectTimer)
+        sseReconnectTimer = null
+      }
+      if (sseRequest) {
+        const old = sseRequest
+        sseRequest = null
+        try { old.destroy() } catch (error) { /* already closed */ }
+      }
+      sseGeneration += 1
+      connectSSE()
+      break
+    }
+    case 'sessions':
+      await fetchSessions(true)
+      break
+    case 'new':
+      await startSession(command.title)
+      break
+    case 'open':
+      await openSession(command.sessionID)
+      break
+    case 'prompt':
+      await sendPrompt(command.sessionID, command.text)
+      break
+    case 'interrupt':
+      await api('POST', '/api/session/' + encodeURIComponent(String(command.sessionID || '')) + '/interrupt')
+      break
+    case 'rename':
+      await renameSession(command.sessionID, command.title)
+      break
+    case 'delete':
+      await deleteSession(command.sessionID)
+      break
+    case 'context':
+      writeContext(command.context)
+      break
+    case 'reply':
+      await replyPermission(command.sessionID, command.requestID, command.reply)
+      send({ type: 'permission-cleared', sessionID: String(command.sessionID || ''), requestID: String(command.requestID || '') })
+      break
+    case 'stop':
+      shutdown()
+      break
+    default:
+      emitError('bridge', 'Unknown chat command: ' + type)
+  }
+}
+
+function scopeFor(command) {
+  const type = String(command && command.type ? command.type : '')
+  if (type === 'start' || type === 'sessions') return 'service'
+  if (type === 'prompt') return 'prompt'
+  if (type === 'open' || type === 'new' || type === 'interrupt' ||
+    type === 'rename' || type === 'delete' || type === 'reply') return 'session'
+  return 'bridge'
+}
+
+function enqueueCommand(command) {
+  commandChain = commandChain.then(function() {
+    return handleCommand(command)
+  }).catch(function(error) {
+    emitError(scopeFor(command), messageOf(error))
+  })
+}
+
+// --------------------------------------------------------------- lifecycle
+
+function shutdown() {
+  stopping = true
+  clearTimeout(sseReconnectTimer)
+  sseReconnectTimer = null
+  clearTimeout(sessionsTimer)
+  sessionsTimer = null
+  if (sseRequest) {
+    try { sseRequest.destroy() } catch (error) { /* already gone */ }
+    sseRequest = null
+  }
+  setTimeout(function() { process.exit(0) }, 30)
+}
+
+function readStdin() {
+  let buffer = ''
+  process.stdin.setEncoding('utf8')
+  process.stdin.on('data', function(chunk) {
+    buffer += chunk
+    let index = buffer.indexOf('\n')
+    while (index >= 0) {
+      const line = buffer.slice(0, index).trim()
+      buffer = buffer.slice(index + 1)
+      if (line !== '') {
+        let command = null
+        try {
+          command = JSON.parse(line)
+        } catch (error) {
+          emitError('bridge', 'Malformed JSON command')
+        }
+        if (command) enqueueCommand(command)
+      }
+      index = buffer.indexOf('\n')
+    }
+  })
+  process.stdin.on('end', function() { shutdown() })
+  process.stdin.on('error', function() { shutdown() })
+}
+
+process.stdout.on('error', function(error) {
+  if (error && error.code === 'EPIPE') {
+    stdoutBroken = true
+    shutdown()
+    return
+  }
+  log('stdout error: ' + messageOf(error))
+})
+
+process.on('uncaughtException', function(error) {
+  log('uncaught: ' + (error && error.stack ? error.stack : messageOf(error)))
+  emitError('bridge', messageOf(error))
+})
+process.on('unhandledRejection', function(error) {
+  log('unhandled: ' + messageOf(error))
+  emitError('bridge', messageOf(error))
+})
+
+readStdin()
