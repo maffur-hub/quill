@@ -16,10 +16,12 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import mimetypes
 import os
 import re
 import shutil
 import sqlite3
+import stat
 import sys
 import tempfile
 import time
@@ -459,9 +461,13 @@ def normalize_newlines(text: str, newline: str) -> str:
 # --------------------------------------------------------------------------
 # attachments
 #
-# Images live in <data>/attachments, deliberately outside notes/ so they are
-# never enumerated as notes or folders. Names are content-addressed
-# (<sha256>.<ext>), so pasting the same image twice reuses one file.
+# Attachments live in <data>/attachments, deliberately outside notes/ so they
+# are never enumerated as notes or folders. Names are content-addressed
+# (<sha256>.<ext>), so saving the same bytes twice reuses one file. Images are
+# sniffed from magic bytes; any other regular file is accepted as a generic
+# attachment and keeps a sanitised version of its original extension.
+
+ATTACHMENT_EXTENSION_RE = re.compile(r"^[a-z0-9]{1,10}$")
 
 
 def attachments_dir() -> Path:
@@ -492,22 +498,36 @@ def sniff_image(data: bytes) -> tuple[str, str] | None:
     return None
 
 
-def attachment_alt(raw: str) -> str:
+def attachment_extension(source_name: str) -> str:
+    """Keep a safe lowercase suffix from the source name, else ``bin``."""
+    suffix = Path(source_name).suffix.lower().lstrip(".")
+    return suffix if ATTACHMENT_EXTENSION_RE.match(suffix) else "bin"
+
+
+def attachment_alt(raw: str, default: str = "image") -> str:
     value = unicodedata.normalize("NFC", str(raw or ""))
     value = re.sub(r"[\x00-\x1f\x7f]+", " ", value)
     value = value.replace("[", "").replace("]", "").replace("(", "").replace(")", "")
     value = re.sub(r"\s+", " ", value).strip()
     if not value:
-        value = "image"
+        value = default
     return value[:120]
 
 
-def attachment_markdown(alt: str, path: Path) -> str:
+def markdown_destination(path: Path) -> str:
     destination = path.as_posix()
     # Parentheses and whitespace would end the Markdown destination early.
     if re.search(r"[\s()]", destination):
         destination = "<" + destination + ">"
-    return f"![{alt}]({destination})"
+    return destination
+
+
+def attachment_markdown(alt: str, path: Path) -> str:
+    return f"![{alt}]({markdown_destination(path)})"
+
+
+def attachment_link(alt: str, path: Path) -> str:
+    return f"[{alt}]({markdown_destination(path)})"
 
 
 def attachment_files() -> list[Path]:
@@ -2117,34 +2137,57 @@ def command_index(args) -> dict:
 
 def command_attachment_save(args) -> dict:
     ensure_store()
-    if getattr(args, "file", None):
-        source = Path(os.path.expanduser(args.file))
+    source: Path | None = None
+    raw_file = getattr(args, "file", None)
+    if raw_file:
+        source = Path(os.path.expanduser(raw_file))
         try:
-            if not source.is_file():
-                raise StoreError(f"image not found: {args.file}")
+            info = source.stat()
+        except FileNotFoundError:
+            raise StoreError(f"file not found: {raw_file}") from None
+        except OSError as error:
+            raise StoreError(f"cannot read file {raw_file}: {error}") from None
+        if stat.S_ISDIR(info.st_mode):
+            raise StoreError(f"not a file: {raw_file} (directory)")
+        if not stat.S_ISREG(info.st_mode):
+            raise StoreError(f"not a regular file: {raw_file}")
+        if info.st_size > MAX_ATTACHMENT_BYTES:
+            raise StoreError("file is larger than 20 MiB")
+        try:
             with source.open("rb") as handle:
                 payload = handle.read(MAX_ATTACHMENT_BYTES + 1)
         except FileNotFoundError:
-            raise StoreError(f"image not found: {args.file}") from None
+            raise StoreError(f"file not found: {raw_file}") from None
         except IsADirectoryError:
-            raise StoreError(f"not a file: {args.file}") from None
+            raise StoreError(f"not a file: {raw_file} (directory)") from None
+        except OSError as error:
+            raise StoreError(f"cannot read file {raw_file}: {error}") from None
     else:
         payload = sys.stdin.buffer.read(MAX_ATTACHMENT_BYTES + 1)
 
     if not payload:
-        raise StoreError("image is empty")
+        raise StoreError("file is empty")
     if len(payload) > MAX_ATTACHMENT_BYTES:
-        raise StoreError("image is larger than 20 MiB")
-    kind = sniff_image(payload)
-    if kind is None:
-        raise StoreError("unsupported image type (expected PNG, JPEG, GIF, WebP or BMP)")
-    extension, mime = kind
-    alt = attachment_alt(getattr(args, "name", "") or "")
+        raise StoreError("file is larger than 20 MiB")
+
+    image = sniff_image(payload)
+    if image is not None:
+        extension, mime = image
+        kind = "image"
+    else:
+        extension = attachment_extension(source.name if source else "")
+        kind = "file"
 
     digest = hashlib.sha256(payload).hexdigest()
+    name = f"{digest}.{extension}"
+    if kind == "file":
+        mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+    default_alt = "image" if kind == "image" else (source.stem if source else "file")
+    alt = attachment_alt(getattr(args, "name", "") or "", default_alt)
+
     with locked():
         directory = attachments_dir()
-        target = directory / f"{digest}.{extension}"
+        target = directory / name
         deduped = (
             target.is_file()
             and not target.is_symlink()
@@ -2155,10 +2198,17 @@ def command_attachment_save(args) -> dict:
             with contextlib.suppress(OSError):
                 os.chmod(target, 0o644)
 
+    markdown = (
+        attachment_markdown(alt, target)
+        if kind == "image"
+        else attachment_link(alt, target)
+    )
     return {
         "id": digest,
         "path": str(target),
-        "markdown": attachment_markdown(alt, target),
+        "markdown": markdown,
+        "kind": kind,
+        "name": name,
         "size": len(payload),
         "mime": mime,
         "deduped": bool(deduped),
@@ -2411,9 +2461,9 @@ def build_parser() -> argparse.ArgumentParser:
     attachment_sub = attachment.add_subparsers(dest="attachment_command", required=True)
     attachment_save = attachment_sub.add_parser("save")
     attachment_source = attachment_save.add_mutually_exclusive_group(required=True)
-    attachment_source.add_argument("--file", help="read the image from this path")
-    attachment_source.add_argument("--stdin", action="store_true", help="read the image from stdin")
-    attachment_save.add_argument("--name", default="", help="alt text for the Markdown image")
+    attachment_source.add_argument("--file", help="read the file from this path")
+    attachment_source.add_argument("--stdin", action="store_true", help="read the file from stdin")
+    attachment_save.add_argument("--name", default="", help="alt text for the Markdown link")
     attachment_save.set_defaults(func=command_attachment_save)
     attachment_sub.add_parser("list").set_defaults(func=command_attachment_list)
     attachment_gc = attachment_sub.add_parser("gc")
