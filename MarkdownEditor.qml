@@ -614,14 +614,12 @@ TextArea {
       textFormat: root.richTextVisible ? Text.RichText : Text.PlainText
       wrapMode: Text.Wrap
       lineHeightMode: Text.FixedHeight
-      // TextEdit lays its lines out at the rounded height of the font metrics
-      // (16 px for the 15.83 px body font), while FontMetrics.height keeps the
-      // fraction. Using the latter accumulated ~0.17 px per line and put the
-      // caret a full line below the underlay glyphs after a long note. Match
-      // the caret's actual TextArea line height instead.
-      lineHeight: root.cursorRectangle.height > 0
-        ? root.cursorRectangle.height
-        : Math.ceil(editorMetrics.height)
+      // One fixed line height for the whole underlay. Do not follow
+      // cursorRectangle.height: TextEdit shrinks a line that contains only
+      // emoji to the emoji font's metrics (12 px at the body size). Feeding
+      // that back made every underlay line 4 px shorter, so in a long note the
+      // painted text drifted hundreds of pixels above the real caret.
+      lineHeight: Math.max(1, Math.round(editorMetrics.height))
       color: root.foregroundColor
       font.family: root.font.family
       font.pixelSize: root.font.pixelSize
