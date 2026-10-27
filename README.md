@@ -142,6 +142,24 @@ Split is the default when the library is at least 1000 px wide; narrow layouts
 open in Edit mode. The mode choice is remembered for the session once you click
 a mode button or press `Ctrl+E`.
 
+## Creating notes and templates
+
+**New note** (and `Ctrl+N`) creates a blank `# Untitled` note immediately.
+`Ctrl+Shift+N` does the same in the current folder. The small `▾` beside the
+The chevron beside **New note** offers built-in templates; like the New note button, they create the note in the Inbox:
+
+| Template | Starting point |
+| --- | --- |
+| Meeting notes | attendees, agenda, notes, decisions, action items |
+| Daily log | focus, log, tomorrow |
+| Project spec | goal, scope, milestones, risks, links |
+| Task list | three empty checkboxes |
+
+Templates fill `{{date}}`, `{{time}}` and `{{datetime}}` with the local time
+when the note is created. The menu also has a **Blank note** row. Templates are
+plain Markdown; edit or delete any section after creation. Built-in templates
+cannot be changed from the UI.
+
 ## Bar / IPC
 
 The manifest declares `aliases: ["notes", "quill"]` and the widget's IpcHandler
@@ -709,6 +727,7 @@ printf '# Hello\n' | $S write <id> --stdin
 printf '# Hello\n' | $S write <id> --create --stdin   # create a missing mapped id
 $S draft discard <id>                      # delete <note>.draft, keep the note
 $S create [--folder F] [--title T] [--content-stdin]
+$S create --template <meeting|daily|project|tasks> [--folder F]
 $S rename <id> --title "New title"
 $S move <id> --folder "Work/Projects"
 $S pin <id>; $S trash <id>; $S restore <id>; $S delete <id>

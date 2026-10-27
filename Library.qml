@@ -1002,6 +1002,20 @@ Item {
     return options
   }
 
+  function afterCreate(result, folder, focusEditor) {
+    root.pendingSelectId = String(result.id || "")
+    root.pendingFocusEditor = !!focusEditor
+    root.pendingCaretToEnd = true
+    if (folder) root.category = "folder:" + folder
+    else if (root.category === "trash" || root.category === "pinned" || root.category === "recent" || root.category.indexOf("tag:") === 0) root.category = "all"
+    root.searchText = ""
+    root.searchResults = []
+    root.searching = false
+    if (noteList) noteList.clearSearch()
+    root.refreshAll()
+    root.statusText = "Created a note"
+  }
+
   function createNote(inCurrentFolder, focusEditor) {
     flushSave()
     var folder = ""
@@ -1009,19 +1023,19 @@ Item {
     enqueue({
       args: ["create", "--folder", folder],
       silent: true,
-      onSuccess: function(result) {
-        root.pendingSelectId = String(result.id || "")
-        root.pendingFocusEditor = !!focusEditor
-        root.pendingCaretToEnd = true
-        if (folder) root.category = "folder:" + folder
-        else if (root.category === "trash" || root.category === "pinned" || root.category === "recent" || root.category.indexOf("tag:") === 0) root.category = "all"
-        root.searchText = ""
-        root.searchResults = []
-        root.searching = false
-        if (noteList) noteList.clearSearch()
-        root.refreshAll()
-        root.statusText = "Created a note"
-      },
+      onSuccess: function(result) { root.afterCreate(result, folder, focusEditor) },
+      onError: function(message) { root.statusText = message }
+    })
+  }
+
+  function createNoteFromTemplate(templateId, inCurrentFolder) {
+    flushSave()
+    var folder = ""
+    if (inCurrentFolder && category.indexOf("folder:") === 0) folder = category.slice(7)
+    enqueue({
+      args: ["create", "--folder", folder, "--template", String(templateId)],
+      silent: true,
+      onSuccess: function(result) { root.afterCreate(result, folder, false) },
       onError: function(message) { root.statusText = message }
     })
   }
@@ -1889,15 +1903,32 @@ Item {
           verticalPadding: Style.space(5)
           onClicked: root.openLibraryWindow()
         }
-        Button {
-          text: "New note"
-          iconText: "+"
-          active: true
-          fontSize: Style.font.bodySmall
-          horizontalPadding: Style.space(9)
-          verticalPadding: Style.space(5)
-          tooltipText: "New note (Ctrl+N)"
-          onClicked: root.createNote(false, false)
+        Row {
+          spacing: Style.space(2)
+          anchors.verticalCenter: parent.verticalCenter
+
+          Button {
+            text: "New note"
+            iconText: "+"
+            active: true
+            fontSize: Style.font.bodySmall
+            horizontalPadding: Style.space(9)
+            verticalPadding: Style.space(5)
+            tooltipText: "New note (Ctrl+N)"
+            onClicked: root.createNote(false, false)
+          }
+          Button {
+            id: newNoteTemplateButton
+            objectName: "newNoteTemplateButton"
+            text: "▾"
+            fontSize: Style.font.bodySmall
+            horizontalPadding: Style.space(4)
+            verticalPadding: Style.space(5)
+            tooltipText: "New note from template"
+            onClicked: newNoteTemplateMenu.popup(
+              newNoteTemplateButton, 0,
+              newNoteTemplateButton.height + Style.space(4))
+          }
         }
         Button {
           id: viewButton
@@ -2569,6 +2600,61 @@ Item {
           onClicked: root.performExport()
         }
       }
+    }
+  }
+
+  // ------------------------------------------------------- template menu
+  // Kept out of the main New note button: Ctrl+N and the button itself stay
+  // an instant blank note. The chevron opts in to a built-in template.
+  Menu {
+    id: newNoteTemplateMenu
+    objectName: "newNoteTemplateMenu"
+    width: Style.space(220)
+    padding: Style.space(4)
+    popupType: Qt.platform.pluginName !== "wayland" ? Popup.Window : Popup.Item
+    palette.window: Commons.Color.menu.background
+    palette.windowText: Commons.Color.menu.text
+    palette.text: Commons.Color.menu.text
+    palette.buttonText: Commons.Color.menu.text
+    palette.light: Commons.Color.menu.selectedBackground
+    palette.midlight: Util.alpha(Commons.Color.foreground, 0.12)
+    palette.mid: Util.alpha(Commons.Color.foreground, 0.16)
+    palette.dark: Commons.Color.menu.border
+
+    background: BorderSurface {
+      color: Commons.Color.menu.background
+      borderSpec: Border.controlSpec("normal", Commons.Color.menu.border,
+        Commons.Color.accent)
+      radius: Style.cornerRadius
+    }
+
+    ContextMenuItem {
+      objectName: "templateBlankItem"
+      text: "Blank note"
+      onTriggered: root.createNote(false, false)
+    }
+
+    MenuSeparator {}
+
+    ContextMenuItem {
+      objectName: "templateMeetingItem"
+      text: "Meeting notes"
+      onTriggered: root.createNoteFromTemplate("meeting")
+    }
+    ContextMenuItem {
+      objectName: "templateDailyItem"
+      text: "Daily log"
+      onTriggered: root.createNoteFromTemplate("daily")
+    }
+    ContextMenuItem {
+      objectName: "templateProjectItem"
+      text: "Project spec"
+      onTriggered: root.createNoteFromTemplate("project")
+    }
+    ContextMenuItem {
+      objectName: "templateTasksItem"
+      text: "Task list"
+      onTriggered: root.createNoteFromTemplate("tasks")
     }
   }
 

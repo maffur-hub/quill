@@ -52,6 +52,76 @@ MD_DEST_RE = re.compile(r"\]\(\s*([^\s()]+)")
 HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+")
 LIST_RE = re.compile(r"^\s{0,3}(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s*)?")
 
+# Built-in new-note templates. Ids are part of the CLI contract (the Library
+# menu and ``create --template`` both use them), so keep them stable. Bodies
+# end with a newline and use literal Markdown: callers may edit the result
+# immediately without a second render step.
+TEMPLATES = {
+    "meeting": {
+        "name": "Meeting notes",
+        "content": (
+            "# Meeting notes — {{date}}\n\n"
+            "**Attendees:**\n- \n\n"
+            "**Agenda**\n- [ ] \n\n"
+            "**Notes**\n\n"
+            "## Decisions\n- \n\n"
+            "## Action items\n- [ ] \n"
+        ),
+    },
+    "daily": {
+        "name": "Daily log",
+        "content": (
+            "# {{date}}\n\n"
+            "## Focus\n- [ ] \n\n"
+            "## Log\n- \n\n"
+            "## Tomorrow\n- [ ] \n"
+        ),
+    },
+    "project": {
+        "name": "Project spec",
+        "content": (
+            "# Project spec\n\n"
+            "## Goal\n\n"
+            "## Scope\n- \n\n"
+            "## Milestones\n- [ ] \n\n"
+            "## Risks\n- \n\n"
+            "## Links\n- \n"
+        ),
+    },
+    "tasks": {
+        "name": "Task list",
+        "content": (
+            "# Tasks — {{date}}\n\n"
+            "- [ ] \n- [ ] \n- [ ] \n"
+        ),
+    },
+}
+
+
+def render_template(template_id, now=None) -> str:
+    """Render a built-in template with local date/time placeholders.
+
+    ``now`` accepts a ``datetime`` or ``time.struct_time`` for tests; the
+    default is the current local time. Unknown ids are a caller error.
+    """
+    template = TEMPLATES.get(str(template_id or ""))
+    if template is None:
+        choices = ", ".join(TEMPLATES)
+        raise StoreError(
+            f"unknown template: {template_id} (choose from {choices})")
+    stamp = now if now is not None else time.localtime()
+    if hasattr(stamp, "timetuple"):
+        stamp = stamp.timetuple()
+    values = {
+        "date": time.strftime("%Y-%m-%d", stamp),
+        "time": time.strftime("%H:%M", stamp),
+        "datetime": time.strftime("%Y-%m-%d %H:%M", stamp),
+    }
+    content = template["content"]
+    for key, value in values.items():
+        content = content.replace("{{" + key + "}}", value)
+    return content
+
 
 def data_root() -> Path:
     raw = os.environ.get("QUILL_DATA_DIR") or "~/.local/share/quill"
@@ -1191,8 +1261,13 @@ def command_draft(args) -> dict:
 def command_create(args) -> dict:
     ensure_store()
     folder = clean_folder(args.folder)
-    title = str(args.title or "").strip() or "Untitled"
-    if args.content_stdin:
+    template_id = str(getattr(args, "template", "") or "").strip()
+    if template_id:
+        if args.content_stdin:
+            raise StoreError("--template cannot be combined with --content-stdin")
+        # The template owns its H1, so --title is ignored for its content.
+        content = render_template(template_id)
+    elif args.content_stdin:
         payload = sys.stdin.buffer.read(MAX_NOTE_BYTES + 1)
         if len(payload) > MAX_NOTE_BYTES:
             raise StoreError(f"note exceeds {MAX_NOTE_BYTES} bytes")
@@ -1201,7 +1276,14 @@ def command_create(args) -> dict:
         except UnicodeDecodeError as error:
             raise StoreError("note content is not valid UTF-8") from error
     else:
+        title = str(args.title or "").strip() or "Untitled"
         content = f"# {title}\n\n"
+    try:
+        encoded = normalize_newlines(content, "\n").encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise StoreError("note content is not valid UTF-8") from error
+    if len(encoded) > MAX_NOTE_BYTES:
+        raise StoreError(f"note exceeds {MAX_NOTE_BYTES} bytes")
     with locked():
         parent = NOTES / folder
         parent.mkdir(parents=True, exist_ok=True)
@@ -1210,7 +1292,7 @@ def command_create(args) -> dict:
         while path.exists():
             identifier = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}.md"
             path = parent / identifier
-        atomic_write(path, normalize_newlines(content, "\n").encode("utf-8"))
+        atomic_write(path, encoded)
         conn = index_connect()
         try:
             index_file(conn, path, False, pinned_set())
@@ -2249,6 +2331,8 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--folder", default="")
     create.add_argument("--title", default="")
     create.add_argument("--content-stdin", action="store_true")
+    create.add_argument("--template", choices=list(TEMPLATES), default=None,
+                        help="start from a built-in template (ignores --title)")
     create.set_defaults(func=command_create)
 
     rename = sub.add_parser("rename")
