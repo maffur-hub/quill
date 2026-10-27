@@ -1148,11 +1148,21 @@ TextArea {
 
     function showAt(px, py) {
       var gap = Style.space(6)
-      var nx = Math.max(0, Math.min(root.width - width, px - width / 2))
-      var ny = py - height - gap
-      if (ny < 0) ny = Math.min(Math.max(0, root.height - height), py + gap)
-      x = nx
-      y = ny
+      var margin = Style.space(6)
+      // Position in window space so a scrolled editor (whose item is taller
+      // than the viewport) still keeps the strip inside the visible window.
+      var win = root.Window.window
+      var winWidth = win ? win.width : root.width
+      var winHeight = win ? win.height : root.height
+      var point = root.mapToItem(null, px, py)
+      var nx = Math.max(margin,
+        Math.min(winWidth - width - margin, point.x - width / 2))
+      var ny = point.y - height - gap
+      if (ny < margin) ny = point.y + gap
+      ny = Math.max(margin, Math.min(winHeight - height - margin, ny))
+      var origin = root.mapFromItem(null, nx, ny)
+      x = origin.x
+      y = origin.y
       open()
     }
 
