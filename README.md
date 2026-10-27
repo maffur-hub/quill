@@ -24,6 +24,7 @@ backlinks. Deleting `index.db` is safe; it is rebuilt automatically.
   ContextMenuItem.qml  one themed row for Quill's menus
   DraftBanner.qml      recover/discard prompt for an adjacent crash draft
   DraftWriter.qml      serialized atomic writer for adjacent crash drafts
+  ExternalChangeBanner.qml  reload/keep prompt when a dirty note changed on disk
   MarkdownFormat.js    pure formatting edit planner (shared, node-testable)
   Detached.qml         one note in its own Quickshell window (Ctrl+Return)
   Sidebar.qml          saved views, tag counts, folder tree
@@ -124,6 +125,7 @@ Draft writes never wake the Joplin sync. Only the normal note save does.
 | `Ctrl+E` | Cycle Edit → Split → Preview |
 | `Ctrl+T` | Insert a 3×3 table at the caret and open the grid |
 | `Ctrl+S` | Flush the 600 ms autosave now |
+| `Ctrl+Shift+O` | Open the current note in Omarchy's editor (pencil button) |
 | `Ctrl+Shift+E` | Export the current buffer as Markdown or HTML |
 | `Ctrl+B` / `Ctrl+I` | Bold / italic |
 | `Ctrl+U` / `Ctrl+Shift+X` | Underline / strikethrough |
@@ -340,6 +342,28 @@ from the environment as defaults. A standalone `quickshell -p` process resolves
 forbids symlinks inside a plugin, so `quill-window` stages a copy in
 `~/.cache/quill/detached/` with links to `/usr/share/omarchy/shell/{Commons,Ui}`
 and runs that. Re-running the launcher refreshes stale copies.
+
+## External editor
+
+The pencil button in the note header (or `Ctrl+Shift+O`) opens the current
+note's Markdown file in Omarchy's configured editor. It calls
+`omarchy-launch-editor` without `--inline`, so `$EDITOR` opens in a terminal
+rather than inside the GUI process, and Omarchy's GUI editor choice is respected
+when one is configured. Pending edits are flushed first; the editor is launched
+only after the save lands, so it never starts from stale bytes.
+
+The open note is watched for changes on disk. Saves made by that editor, Git,
+Syncthing or another Quill window reload the note silently when the buffer is
+clean, keeping the caret position and scroll offset. The library and detached
+note windows therefore live-reload each other's saves. A too-large note can
+still be opened externally as an escape hatch, but it is not watched while
+Quill shows it read-only.
+
+If the note changed on disk **and** the buffer has unsaved edits, Quill does not
+choose for you: it shows a **This note changed on disk** banner (and refuses
+autosaves so the external text is not overwritten). **Reload** replaces the
+buffer with the disk text; **Keep mine** keeps the local text and saves it over
+the external change.
 
 ## Tables
 
@@ -867,10 +891,12 @@ overwrites an existing note. OmaNano's files are never moved or modified.
 
 ## Known limits
 
-- No filesystem watcher: edits made outside Quill show up the next time the
-  library refreshes (open, save, or a note action). A detached window and the
-  library do not live-reload each other's saves; reopen the note to pick up
-  outside edits.
+- Only the note currently open in the library or a detached window is watched.
+  Notes that are not open are picked up by the normal index refresh (open, save,
+  or a note action) rather than a filesystem watcher.
+- Too-large notes are not watched while Quill shows them read-only; editing one
+  externally requires closing and reopening it (or another refresh) to see the
+  change.
 - The desktop window and the detached note window are normal toplevels;
   Hyprland may tile them unless you add a float rule for `class:org.quickshell`.
 - `folder delete --force` moves `.md` notes to the root and deletes other file

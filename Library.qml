@@ -60,6 +60,16 @@ Item {
   property string saveState: "Ready"
   property string statusText: "Ready"
 
+  // External-editor support. The open note is watched for writes made outside
+  // Quill; a clean note reloads silently, a dirty one asks first.
+  property bool diskChangePending: false
+  property string diskChangeText: ""
+  property bool pendingEditorOpen: false
+  property string inFlightSaveText: ""
+  readonly property string watchPath: (root.selectedNote && root.loaded
+    && !root.tooLarge && !root.loadingNote)
+    ? root.notePath(root.selectedNote) : ""
+
   // Crash-draft recovery. While a differing adjacent draft exists, the stored
   // note stays on screen and editing is disabled until Recover or Discard.
   property bool draftPending: false
@@ -372,6 +382,10 @@ Item {
     draftText = ""
     draftModified = 0
     draftNoteId = ""
+    diskChangePending = false
+    diskChangeText = ""
+    pendingEditorOpen = false
+    inFlightSaveText = ""
     selectedId = next
     scheduleChatContext()
     if (!next) {
@@ -388,6 +402,10 @@ Item {
     draftText = ""
     draftModified = 0
     draftNoteId = ""
+    diskChangePending = false
+    diskChangeText = ""
+    pendingEditorOpen = false
+    inFlightSaveText = ""
     suppressDirty = true
     editor.text = ""
     editor.cursorPosition = 0
@@ -493,8 +511,7 @@ Item {
 
   // ------------------------------------------------------------ draft saving
   // Adjacent to the note and invisible to rglob("*.md"). Store ids already
-  // include folders, so never use notePath(note) here: it would prepend the
-  // folder twice for nested notes.
+  // include their folder, so the draft path is the id plus a suffix.
   function draftPath(id) {
     return root.dataRoot + "/notes/" + String(id || "") + ".draft"
   }
@@ -565,6 +582,18 @@ Item {
     }
   }
 
+  // Watches the open note for writes from outside Quill: the external editor,
+  // Git, Syncthing, another Quill window. watchChanges follows atomic renames
+  // but does not re-read, so reload explicitly and handle fresh text on load.
+  FileView {
+    id: noteWatch
+    path: root.watchPath
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: root.handleExternalContent(String(text()))
+  }
+
   // One-shot export writer. Used for the Markdown destination and for the
   // temporary source file that feeds the HTML renderer.
   Component {
@@ -592,6 +621,11 @@ Item {
       return
     }
     if (tableOpen && tableEditor) tableEditor.flushWrite()
+    if (dirty && diskChangePending) {
+      // Never overwrite the external text that the banner is asking about.
+      statusText = "Note changed on disk — choose Reload or Keep mine"
+      return
+    }
     if (!dirty || !loaded || tooLarge || !selectedNote || selectedNote.trashed) return
     saveSeq += 1
     var path = dataRoot + "/.quill-save-" + saveSeq + "-" + Date.now() + ".md"
@@ -599,13 +633,16 @@ Item {
     if (!view) {
       saveState = "Save failed"
       statusText = "Could not prepare a save"
+      pendingEditorOpen = false
       return
     }
+    var text = String(editor.text)
+    inFlightSaveText = text
     view.targetNoteId = selectedId
     view.targetVersion = editVersion
-    view.targetText = String(editor.text)
+    view.targetText = text
     saveState = "Saving…"
-    view.setText(editor.text)
+    view.setText(text)
   }
 
   function bufferSaved(view) {
@@ -621,6 +658,8 @@ Item {
       version: version,
       onSuccess: function(result) { root.afterWrite(noteId, version, result, savedText) },
       onError: function(message) {
+        if (root.inFlightSaveText === savedText) root.inFlightSaveText = ""
+        root.pendingEditorOpen = false
         if (noteId === root.selectedId) {
           root.saveState = "Save failed"
           root.dirty = true
@@ -632,7 +671,10 @@ Item {
 
   function bufferFailed(view) {
     var noteId = view.targetNoteId
+    var failedText = String(view.targetText || "")
     view.destroy()
+    if (inFlightSaveText === failedText) inFlightSaveText = ""
+    pendingEditorOpen = false
     if (noteId === root.selectedId) {
       saveState = "Save failed"
       dirty = true
@@ -642,6 +684,9 @@ Item {
   }
 
   function afterWrite(noteId, version, result, savedText) {
+    // Only the matching save clears the in-flight text: a newer edit may have
+    // started another save while this one was running.
+    if (inFlightSaveText === savedText) inFlightSaveText = ""
     // A write that did not change the stored bytes is a no-op. Only a real
     // change wakes the Joplin sync, and only after the write succeeded.
     var previousText = root.savedTextById[noteId]
@@ -674,6 +719,12 @@ Item {
     refreshTimer.restart()
     if (changed) notifyJoplinSync()
     if (pendingDetach && !dirty && noteId === selectedId) launchDetachedWindow()
+    // An editor launch requested while dirty waits for a successful save of
+    // the current buffer. A newer edit leaves the flag set for its own save.
+    if (pendingEditorOpen && noteId === selectedId && !dirty) {
+      pendingEditorOpen = false
+      launchExternalEditor()
+    }
   }
 
   // Debounced: a burst of autosaves produces one --notify call.
@@ -717,6 +768,151 @@ Item {
     ]
     detachedProcess.running = true
     statusText = "Opened “" + String(note.title || "note") + "” in a detached window"
+  }
+
+  // ------------------------------------------------------- external editor
+  // Open the current note in Omarchy's configured editor. Pending local edits
+  // are flushed first, so the editor never starts from stale bytes.
+  function openInEditor() {
+    if (!root.selectedNote) {
+      root.statusText = "Select a note first"
+      return
+    }
+    if (root.selectedNote.trashed) {
+      root.statusText = "Restore this note before opening it in an editor"
+      return
+    }
+    if (!root.writesAllowed) {
+      root.statusText = WritableGuard.refusalMessage()
+      return
+    }
+    if (root.loadingNote) {
+      root.statusText = "Wait for the note to finish loading"
+      return
+    }
+    if (root.diskChangePending) {
+      root.statusText = "Note changed on disk — choose Reload or Keep mine"
+      return
+    }
+    if (root.draftPending) {
+      root.statusText = "Recover or discard the draft first"
+      return
+    }
+    // Too-large notes are read-only in Quill but can still be opened in an
+    // external editor; they are deliberately not watched.
+    if (root.tooLarge) {
+      root.launchExternalEditor()
+      return
+    }
+    if (root.dirty || root.saveState === "Saving…") {
+      root.pendingEditorOpen = true
+      if (root.dirty) root.flushSave()
+      return
+    }
+    root.launchExternalEditor()
+  }
+
+  function launchExternalEditor() {
+    var note = root.selectedNote
+    if (!note) return
+    var path = root.notePath(note)
+    if (!path) return
+    Quickshell.execDetached(["omarchy-launch-editor", path])
+    root.statusText = "Opened in external editor"
+  }
+
+  // A watched FileView tells us the file changed, but not what it now says.
+  // Reload explicitly and feed the fresh text through the conflict check.
+  function handleExternalContent(content) {
+    var value = String(content === undefined || content === null ? "" : content)
+    if (noteWatch.path !== root.watchPath) return
+    if (!root.loaded || root.loadingNote || root.tooLarge
+      || root.draftPending || root.selectedId === "") return
+    if (value === String(editor.text)) {
+      // The file already holds what we have. A conflict captured for an older
+      // disk state is stale now, so clear it instead of offering a reload that
+      // would resurrect text the file no longer contains.
+      if (root.diskChangePending) {
+        root.diskChangePending = false
+        root.diskChangeText = ""
+        root.statusText = "Your version is on disk"
+      }
+      return
+    }
+    if (root.inFlightSaveText !== "" && value === root.inFlightSaveText) {
+      if (root.diskChangePending) {
+        root.diskChangePending = false
+        root.diskChangeText = ""
+        root.statusText = "Your version is on disk"
+      }
+      return
+    }
+    var known = root.savedTextById[root.selectedId]
+    if (known !== undefined && value === known) {
+      // Stale notification for content we already have (for example the
+      // rename half of our own atomic save).
+      root.diskChangePending = false
+      root.diskChangeText = ""
+      return
+    }
+    if (root.dirty || root.saveState === "Saving…") {
+      root.diskChangePending = true
+      root.diskChangeText = value
+      root.statusText = "Note changed on disk"
+      return
+    }
+    root.applyExternalContent(value)
+  }
+
+  function applyExternalContent(content) {
+    if (!root.loaded || root.loadingNote || root.tooLarge || root.selectedId === "") return
+    var id = root.selectedId
+    var value = String(content === undefined || content === null ? "" : content)
+    var caret = editor.cursorPosition
+    var scrollY = editorScroll.contentY
+    root.suppressDirty = true
+    editor.text = value
+    editor.cursorPosition = Math.min(caret, value.length)
+    root.suppressDirty = false
+    root.savedTextById[id] = value
+    root.dirty = false
+    root.editVersion = 0
+    root.diskChangePending = false
+    root.diskChangeText = ""
+    root.loadedModified = Date.now()
+    // A clean external reload is a saved state: there is nothing to write.
+    root.saveState = "Saved " + Qt.formatTime(new Date(root.loadedModified), "HH:mm")
+    root.statusText = "Reloaded from disk"
+    saveTimer.stop()
+    draftTimer.stop()
+    draftWriter.drop(root.draftPath(id))
+    root.requestPreview()
+    root.requestBacklinks()
+    root.scheduleChatContext()
+    refreshTimer.restart()
+    root.notifyJoplinSync()
+    Qt.callLater(function() {
+      var maxY = Math.max(0, editorScroll.contentHeight - editorScroll.height)
+      editorScroll.contentY = Math.min(scrollY, maxY)
+      editor.cursorPosition = Math.min(caret, String(editor.text).length)
+    })
+  }
+
+  function reloadFromDisk() {
+    if (!root.diskChangePending) return
+    root.applyExternalContent(root.diskChangeText)
+  }
+
+  function keepDiskChange() {
+    if (!root.diskChangePending) return
+    var id = root.selectedId
+    var diskText = root.diskChangeText
+    root.diskChangePending = false
+    root.diskChangeText = ""
+    // Remember what is on disk so the watcher does not re-raise the conflict.
+    if (id !== "") root.savedTextById[id] = diskText
+    root.statusText = "Keeping your version"
+    if (root.dirty) saveTimer.restart()
   }
 
   function onEditorEdited() {
@@ -1155,8 +1351,15 @@ Item {
 
   function notePath(note) {
     if (!note || !dataRoot) return ""
+    var id = String(note.id || "")
+    if (id === "") return ""
+    // Store ids already include their folder ("Work/plan.md"). Only prepend a
+    // folder for an id that does not carry it, so nested notes never double up.
     var folder = String(note.folder || "")
-    return dataRoot + "/notes/" + (folder !== "" ? folder + "/" : "") + String(note.id || "")
+    if (folder !== "" && id.indexOf(folder + "/") !== 0 && id.indexOf("/") < 0) {
+      return dataRoot + "/notes/" + folder + "/" + id
+    }
+    return dataRoot + "/notes/" + id
   }
 
   // ---------------------------------------------------------------- export
@@ -1751,6 +1954,7 @@ Item {
   Shortcut { sequence: "Ctrl+P"; enabled: root.active; onActivated: root.togglePin() }
   Shortcut { sequence: "Ctrl+E"; enabled: root.active; onActivated: root.cycleMode() }
   Shortcut { sequence: "Ctrl+S"; enabled: root.active; onActivated: root.flushSave() }
+  Shortcut { sequence: "Ctrl+Shift+O"; enabled: root.active; onActivated: root.openInEditor() }
   Shortcut { sequence: "Ctrl+Shift+E"; enabled: root.active; onActivated: root.openExport() }
   Shortcut {
     sequence: "Ctrl+T"
@@ -2087,6 +2291,13 @@ Item {
             onDiscardRequested: root.discardDraft()
           }
 
+          ExternalChangeBanner {
+            width: parent.width
+            visible: root.diskChangePending
+            onReloadRequested: root.reloadFromDisk()
+            onKeepRequested: root.keepDiskChange()
+          }
+
           FormatBar {
             id: formatBar
             // Full pane width: the surrounding column has 11 px margins for
@@ -2132,6 +2343,7 @@ Item {
 
               MarkdownEditor {
                 id: editor
+                objectName: "markdownEditor"
                 width: editorScroll.width
                 height: Math.max(editorScroll.height, implicitHeight)
                 storePath: root.storePath
@@ -2734,6 +2946,20 @@ Item {
               : Util.alpha(Commons.Color.foreground, 0.42)
             font.family: Style.font.family
             font.pixelSize: Style.font.caption
+          }
+
+          Button {
+            objectName: "externalEditorButton"
+            visible: !!root.selectedNote && !root.selectedNote.trashed
+            width: Style.space(23)
+            height: Style.space(23)
+            text: ""
+            iconText: "\uf044"
+            iconSize: Style.font.bodySmall
+            tooltipText: "Open in editor (Ctrl+Shift+O)"
+            horizontalPadding: 0
+            verticalPadding: 0
+            onClicked: root.openInEditor()
           }
 
           Dropdown {

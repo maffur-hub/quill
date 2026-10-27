@@ -51,6 +51,17 @@ ShellRoot {
   property int previewLineOffset: 0
   property string statusText: "Loading note…"
 
+  // External-editor support, mirroring Library.qml for a single note.
+  property bool diskChangePending: false
+  property string diskChangeText: ""
+  property bool pendingEditorOpen: false
+  property string inFlightSaveText: ""
+  // Last content known to be on disk, used to recognise our own saves and
+  // stale change notifications.
+  property string savedText: ""
+  readonly property string watchPath: (root.loaded && !root.tooLarge && root.noteId !== "")
+    ? root.dataRoot + "/notes/" + root.noteId : ""
+
   // Crash-draft recovery, mirroring Library.qml for a single note.
   property bool draftPending: false
   property string draftText: ""
@@ -116,6 +127,11 @@ ShellRoot {
     suppressDirty = false
     loaded = !tooLarge
     dirty = false
+    savedText = tooLarge ? "" : String(result.content || "")
+    diskChangePending = false
+    diskChangeText = ""
+    pendingEditorOpen = false
+    inFlightSaveText = ""
     statusText = tooLarge ? "This note is too large to edit safely" : "Saved"
     if (result.draft && root.writesAllowed) {
       draftPending = true
@@ -182,8 +198,132 @@ ShellRoot {
     discardProcess.running = true
   }
 
+  // ------------------------------------------------------- external editor
+  function openInEditor() {
+    if (root.noteId === "") {
+      root.statusText = "No note is open"
+      return
+    }
+    if (!root.writesAllowed) {
+      root.statusText = WritableGuard.refusalMessage()
+      return
+    }
+    if (root.loading) {
+      root.statusText = "Wait for the note to finish loading"
+      return
+    }
+    if (root.diskChangePending) {
+      root.statusText = "Note changed on disk — choose Reload or Keep mine"
+      return
+    }
+    if (root.draftPending) {
+      root.statusText = "Recover or discard the draft first"
+      return
+    }
+    if (root.tooLarge) {
+      root.launchExternalEditor()
+      return
+    }
+    if (root.dirty || root.saving) {
+      root.pendingEditorOpen = true
+      if (root.dirty) root.save()
+      return
+    }
+    root.launchExternalEditor()
+  }
+
+  function launchExternalEditor() {
+    if (root.noteId === "") return
+    var path = root.dataRoot + "/notes/" + root.noteId
+    Quickshell.execDetached(["omarchy-launch-editor", path])
+    root.statusText = "Opened in external editor"
+  }
+
+  // watchChanges reports the change but does not re-read, so reload and sort
+  // the fresh text out here. Own saves and stale notifications are ignored.
+  function handleExternalContent(content) {
+    var value = String(content === undefined || content === null ? "" : content)
+    if (noteWatch.path !== root.watchPath) return
+    if (!root.loaded || root.loading || root.tooLarge
+      || root.draftPending || root.noteId === "") return
+    if (value === String(editor.text)) {
+      // Our own save (or an identical external write) has landed. A conflict
+      // captured for an older disk state is stale now.
+      if (root.diskChangePending) {
+        root.diskChangePending = false
+        root.diskChangeText = ""
+        root.statusText = "Your version is on disk"
+      }
+      return
+    }
+    if (root.inFlightSaveText !== "" && value === root.inFlightSaveText) {
+      if (root.diskChangePending) {
+        root.diskChangePending = false
+        root.diskChangeText = ""
+        root.statusText = "Your version is on disk"
+      }
+      return
+    }
+    if (value === root.savedText) {
+      root.diskChangePending = false
+      root.diskChangeText = ""
+      return
+    }
+    if (root.dirty || root.saving) {
+      root.diskChangePending = true
+      root.diskChangeText = value
+      root.statusText = "Note changed on disk"
+      return
+    }
+    root.applyExternalContent(value)
+  }
+
+  function applyExternalContent(content) {
+    if (!root.loaded || root.loading || root.tooLarge || root.noteId === "") return
+    var value = String(content === undefined || content === null ? "" : content)
+    var caret = editor.cursorPosition
+    var scrollY = editorScroll.contentY
+    root.suppressDirty = true
+    editor.text = value
+    editor.cursorPosition = Math.min(caret, value.length)
+    root.suppressDirty = false
+    root.savedText = value
+    root.dirty = false
+    root.diskChangePending = false
+    root.diskChangeText = ""
+    root.statusText = "Reloaded from disk"
+    saveTimer.stop()
+    draftTimer.stop()
+    draftWriter.drop(root.draftPath())
+    root.requestPreview()
+    root.notifyJoplinSync()
+    Qt.callLater(function() {
+      var maxY = Math.max(0, editorScroll.contentHeight - editorScroll.height)
+      editorScroll.contentY = Math.min(scrollY, maxY)
+      editor.cursorPosition = Math.min(caret, String(editor.text).length)
+    })
+  }
+
+  function reloadFromDisk() {
+    if (!root.diskChangePending) return
+    root.applyExternalContent(root.diskChangeText)
+  }
+
+  function keepDiskChange() {
+    if (!root.diskChangePending) return
+    root.savedText = root.diskChangeText
+    root.diskChangePending = false
+    root.diskChangeText = ""
+    root.statusText = "Keeping your version"
+    if (root.dirty) saveTimer.restart()
+  }
+
   function save() {
     saveTimer.stop()
+    if (root.diskChangePending) {
+      root.statusText = "Note changed on disk — choose Reload or Keep mine"
+      return
+    }
     if (!loaded || tooLarge || !dirty || saving) return
     if (!root.writesAllowed) {
       saving = false
@@ -200,10 +340,12 @@ ShellRoot {
     var view = saveFileComponent.createObject(root, { path: path })
     if (!view) {
       saving = false
+      pendingEditorOpen = false
       statusText = "Could not prepare a save"
       return
     }
     view.targetText = editor.text
+    root.inFlightSaveText = String(editor.text)
     view.setText(editor.text)
   }
 
@@ -220,20 +362,25 @@ ShellRoot {
     view.destroy()
     saving = false
     dirty = true
+    inFlightSaveText = ""
+    pendingEditorOpen = false
     statusText = "Could not write the note"
     quitAfterSave = false
   }
 
   function afterWrite(exitCode, errorText) {
     saving = false
+    if (inFlightSaveText === writeProcess.savedText) inFlightSaveText = ""
     if (exitCode !== 0) {
       dirty = true
+      pendingEditorOpen = false
       statusText = String(errorText || "").trim() || "Save failed"
       quitAfterSave = false
       saveTimer.restart()
       return
     }
     savedOnce = true
+    savedText = String(writeProcess.savedText)
     notifyJoplinSync()
     if (editor.text === writeProcess.savedText) {
       draftTimer.stop()
@@ -246,7 +393,14 @@ ShellRoot {
       statusText = "Unsaved"
       saveTimer.restart()
     }
-    if (quitAfterSave) Qt.quit()
+    if (quitAfterSave) {
+      Qt.quit()
+      return
+    }
+    if (pendingEditorOpen && !dirty) {
+      pendingEditorOpen = false
+      launchExternalEditor()
+    }
   }
 
   function requestPreview() {
@@ -355,6 +509,17 @@ ShellRoot {
     }
   }
 
+  // Watches the open note for writes made by an external editor, Git,
+  // Syncthing or the library window. See handleExternalContent().
+  FileView {
+    id: noteWatch
+    path: root.watchPath
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: root.handleExternalContent(String(text()))
+  }
+
   Component {
     id: saveFileComponent
     FileView {
@@ -444,7 +609,7 @@ ShellRoot {
         spacing: Style.space(10)
 
         Column {
-          width: parent.width - status.width - parent.spacing
+          width: parent.width - headerActions.width - parent.spacing
           anchors.verticalCenter: parent.verticalCenter
           spacing: Style.space(1)
           Text {
@@ -468,16 +633,36 @@ ShellRoot {
           }
         }
 
-        Text {
-          id: status
+        Row {
+          id: headerActions
           anchors.verticalCenter: parent.verticalCenter
-          text: root.statusText
-          textFormat: Text.PlainText
-          color: root.saving || root.dirty
-            ? Commons.Color.accent
-            : Util.alpha(Commons.Color.foreground, 0.55)
-          font.family: Style.font.family
-          font.pixelSize: Style.font.bodySmall
+          spacing: Style.space(6)
+
+          Text {
+            id: status
+            anchors.verticalCenter: parent.verticalCenter
+            text: root.statusText
+            textFormat: Text.PlainText
+            color: root.saving || root.dirty
+              ? Commons.Color.accent
+              : Util.alpha(Commons.Color.foreground, 0.55)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.bodySmall
+          }
+
+          Button {
+            objectName: "externalEditorButton"
+            visible: root.noteId !== ""
+            width: Style.space(24)
+            height: Style.space(24)
+            text: ""
+            iconText: "\uf044"
+            iconSize: Style.font.bodySmall
+            tooltipText: "Open in editor (Ctrl+Shift+O)"
+            horizontalPadding: 0
+            verticalPadding: 0
+            onClicked: root.openInEditor()
+          }
         }
       }
 
@@ -510,6 +695,13 @@ ShellRoot {
         onDiscardRequested: root.discardDraft()
       }
 
+      ExternalChangeBanner {
+        width: parent.width
+        visible: root.diskChangePending
+        onReloadRequested: root.reloadFromDisk()
+        onKeepRequested: root.keepDiskChange()
+      }
+
       Row {
         width: parent.width
         height: parent.height - y
@@ -539,6 +731,7 @@ ShellRoot {
 
             MarkdownEditor {
               id: editor
+              objectName: "markdownEditor"
               width: editorScroll.width
               height: Math.max(editorScroll.height, implicitHeight)
               storePath: root.storePath
@@ -603,6 +796,7 @@ ShellRoot {
     }
 
     Shortcut { sequence: "Ctrl+S"; onActivated: root.save() }
+    Shortcut { sequence: "Ctrl+Shift+O"; onActivated: root.openInEditor() }
     Shortcut { sequence: "Escape"; onActivated: window.visible = false }
   }
 }
