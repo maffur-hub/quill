@@ -20,6 +20,15 @@ ShellRoot {
   readonly property string dataRoot: Quickshell.env("QUILL_DATA_DIR") || (home + "/.local/share/quill")
   readonly property string storePath: Quickshell.env("QUILL_STORE_PATH")
     || (home + "/.config/omarchy/plugins/matt.quill/scripts/quill-store")
+  // Save-triggered Joplin sync. A QUILL_JOPLIN_SYNC_PATH override opts in
+  // explicitly (tests); otherwise the installed tool is used in production.
+  readonly property string joplinSyncPath: {
+    var override = Quickshell.env("QUILL_JOPLIN_SYNC_PATH") || ""
+    if (override.length > 0) return override
+    if (Quickshell.env("QUILL_JOPLIN_AUTOSYNC") === "0") return ""
+    if (Quickshell.env("QUILL_E2E") === "1") return ""
+    return home + "/.local/bin/quill-joplin-sync"
+  }
   // Writable only when scripts/quill-window passes the per-launch production
   // opt-in, and never when a test suite has marked the process with QUILL_E2E=1.
   property bool allowRealData: Quickshell.env("QUILL_ALLOW_REAL_DATA") === "1"
@@ -156,6 +165,7 @@ ShellRoot {
       return
     }
     savedOnce = true
+    notifyJoplinSync()
     if (editor.text === writeProcess.savedText) {
       dirty = false
       statusText = "Saved " + Qt.formatTime(new Date(), "HH:mm")
@@ -172,6 +182,12 @@ ShellRoot {
     if (!loaded || tooLarge) return
     previewProcess.command = [storePath, "preview", noteId]
     previewProcess.running = true
+  }
+
+  // Debounced: several autosaves in a row produce one --notify call.
+  function notifyJoplinSync() {
+    if (!writesAllowed || joplinSyncPath === "") return
+    joplinNotifyTimer.restart()
   }
 
   // Replace one line in place so the caret/selection is preserved as far as
@@ -220,6 +236,16 @@ ShellRoot {
   }
 
   Timer { id: saveTimer; interval: 450; onTriggered: root.save() }
+  Timer {
+    id: joplinNotifyTimer
+    interval: 2500
+    repeat: false
+    onTriggered: {
+      if (root.joplinSyncPath === "" || !root.writesAllowed) return
+      joplinNotifyProcess.command = [root.joplinSyncPath, "--notify"]
+      joplinNotifyProcess.running = true
+    }
+  }
   Timer {
     id: closeFallback
     interval: 2500
@@ -272,6 +298,13 @@ ShellRoot {
         }
       }
     }
+    stderr: StdioCollector { waitForEnd: true }
+  }
+
+  // Fire-and-forget queue notification; failures stay out of the status bar.
+  Process {
+    id: joplinNotifyProcess
+    stdout: StdioCollector { waitForEnd: true }
     stderr: StdioCollector { waitForEnd: true }
   }
 

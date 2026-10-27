@@ -1,9 +1,9 @@
 [Unit]
-Description=Periodically mirror Quill notes into Joplin
+Description=Drain pending Quill notes into Joplin
 
 [Timer]
 OnBootSec=2min
-OnUnitActiveSec=5min
+OnUnitActiveSec=15min
 Persistent=true
 Unit=quill-joplin-sync.service
 

@@ -38,6 +38,15 @@ Item {
     return home + "/.config/omarchy/plugins/" + pluginId
   }
   readonly property string storePath: pluginDir + "/scripts/quill-store"
+  // Empty means save-triggered Joplin sync is off. A test harness that sets
+  // QUILL_JOPLIN_SYNC_PATH opts in explicitly even under QUILL_E2E=1.
+  readonly property string joplinSyncPath: {
+    var override = Quickshell.env("QUILL_JOPLIN_SYNC_PATH") || ""
+    if (override.length > 0) return override
+    if (Quickshell.env("QUILL_JOPLIN_AUTOSYNC") === "0") return ""
+    if (Quickshell.env("QUILL_E2E") === "1") return ""
+    return home + "/.local/bin/quill-joplin-sync"
+  }
 
   function parsePayload(payloadJson) {
     if (!payloadJson) return ({})
@@ -188,6 +197,7 @@ Item {
     anchors.fill: parent
     storePath: root.storePath
     dataRoot: root.dataRoot
+    joplinSyncPath: root.joplinSyncPath
     // Production shell only. Tests set QUILL_E2E=1, which forces read-only
     // even if this file is instantiated by a harness against the live root.
     allowRealData: Quickshell.env("QUILL_E2E") !== "1"

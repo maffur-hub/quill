@@ -533,13 +533,39 @@ tags on a Quill note are removed if Quill no longer has them. The tag pass is
 best-effort and never changes the sync's exit status.
 
 **Joplin must be running with `Options → Web Clipper → Enable web clipper
-service` turned on.** When it is not, the sync exits with status 3 (the wrapper
-and systemd unit treat that as "nothing to do", not a failure).
+service` turned on** to receive notes. When it is not, the sync exits with
+status 3 and the pending work stays queued; nothing is lost. No API call is
+made while the queue is empty, so a closed Joplin costs nothing until the next
+save.
 
-A systemd user timer runs the sync `2 min` after boot and every `5 min` after the
-previous run. `--quiet` is used so journal output stays to one summary line.
+Sync is **save-triggered**. After Quill saves a note, it waits `2.5 s` for
+further autosaves (debounce) and then calls `quill-joplin-sync --notify`, which
+writes a pending marker and starts one detached worker. The worker syncs
+immediately, repeats the normal tag pass, and then exits once the queue is
+drained. If Joplin is unreachable (exit 3) it retries only while work is
+pending, using `10 30 60 120 300 600 900` second backoff (the last delay
+repeats), up to 8 attempts. Other failures are logged and deferred rather than
+retried in a tight loop. A new save during a sync queues exactly one more run.
+
+A systemd user timer wakes `2 min` after boot and every `15 min` after the
+previous run, but it runs `--flush`, which does nothing (and makes no network
+call) unless a pending marker exists. It is a safety net for work deferred
+after the retry limit or while the shell was not running, not the primary
+trigger.
+
+The queue lives in `~/.local/share/quill-joplin/queue/` (override with
+`QUILL_JOPLIN_QUEUE_DIR`): `pending` is the marker, `queue.lock` enforces one
+worker, and `queue.log` records attempts and is rotated at 256 KiB. The worker
+also retries after the retry budget on the next timer wake. Set
+`QUILL_JOPLIN_QUEUE_BACKOFF` and `QUILL_JOPLIN_QUEUE_MAX_ATTEMPTS` to tune it,
+or `QUILL_JOPLIN_AUTOSYNC=0` to disable save-triggered sync entirely (the
+timer then stays idle until you run the sync by hand).
 
 ```bash
+quill-joplin-sync                      # sync now
+quill-joplin-sync --notify             # queue a sync after a save (Quill's call)
+quill-joplin-sync --flush              # start the worker only if work is pending
+quill-joplin-sync --work               # run the worker loop in the foreground
 quill-joplin-sync --dry-run            # show what would change, write nothing
 quill-joplin-sync --verbose            # per-note detail
 quill-joplin-sync --force              # overwrite edits made in Joplin
@@ -547,8 +573,10 @@ quill-joplin-sync --prune              # also trash notes deleted locally
 systemctl --user start quill-joplin-sync.service
 systemctl --user list-timers quill-joplin-sync.timer
 journalctl --user -u quill-joplin-sync.service -n 20
+tail -f ~/.local/share/quill-joplin/queue/queue.log
 quill-joplin-tags --dry-run            # tag pass on its own
 ```
+
 
 ### Reading a note back
 
@@ -578,8 +606,10 @@ unreachable). The token is read from config/Joplin settings and never printed.
 and path defaults for discoverability. It is **not read** by the shared sync
 tool: the flags in `quill-joplin-sync` are the source of truth. The wrapper's
 environment overrides are `QUILL_JOPLIN_NOTES_DIR`, `QUILL_JOPLIN_STATE`,
-`QUILL_JOPLIN_NOTEBOOK`, `QUILL_JOPLIN_API_URL` and
-`QUILL_JOPLIN_BACKUP_DIR`.
+`QUILL_JOPLIN_NOTEBOOK`, `QUILL_JOPLIN_API_URL`, `QUILL_JOPLIN_BACKUP_DIR`,
+`QUILL_JOPLIN_QUEUE_DIR`, `QUILL_JOPLIN_QUEUE_BACKOFF` and
+`QUILL_JOPLIN_QUEUE_MAX_ATTEMPTS`; Quill's QML side also honours
+`QUILL_JOPLIN_SYNC_PATH` and `QUILL_JOPLIN_AUTOSYNC` (see above).
 
 One quirk comes from the shared tool and is deliberately not patched there:
 

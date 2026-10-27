@@ -13,6 +13,17 @@
 #   quill-joplin-sync --json          # machine-readable summary
 #   quill-joplin-sync --prune         # also trash Joplin notes deleted locally
 #
+# Save-triggered queue (used by Quill and by the systemd timer):
+#   quill-joplin-sync --notify        # mark work pending, start a worker, exit
+#   quill-joplin-sync --flush         # start a worker only if work is pending
+#   quill-joplin-sync --work          # worker loop (internal; safe to run)
+#
+# Quill calls --notify after a debounced save. The worker syncs immediately,
+# retries only while the pending marker exists, and exits once the queue is
+# drained. When nothing is pending --flush exits without touching the Joplin
+# API, so an idle timer wakes locally and does nothing. Mode flags are consumed
+# here and never forwarded to the shared tool.
+#
 # Before replacing a Joplin note (or trashing one with --prune), the shared
 # tool saves the remote body under
 #   ~/.local/share/quill/backups/joplin/<joplin-note-id>/
@@ -20,13 +31,18 @@
 # Pass --backup-dir DIR to use another location.
 #
 # Environment overrides:
-#   QUILL_JOPLIN_NOTES_DIR   default ~/.local/share/quill/notes
-#   QUILL_JOPLIN_STATE       default ~/.local/share/quill-joplin/state.json
-#   QUILL_JOPLIN_NOTEBOOK    default Quill
-#   QUILL_JOPLIN_API_URL     default http://127.0.0.1:41184
-#   QUILL_JOPLIN_BACKUP_DIR  default ~/.local/share/quill/backups/joplin
+#   QUILL_JOPLIN_NOTES_DIR        default ~/.local/share/quill/notes
+#   QUILL_JOPLIN_STATE            default ~/.local/share/quill-joplin/state.json
+#   QUILL_JOPLIN_NOTEBOOK         default Quill
+#   QUILL_JOPLIN_API_URL          default http://127.0.0.1:41184
+#   QUILL_JOPLIN_BACKUP_DIR       default ~/.local/share/quill/backups/joplin
+#   QUILL_JOPLIN_QUEUE_DIR        default ~/.local/share/quill-joplin/queue
+#   QUILL_JOPLIN_QUEUE_BACKOFF    default "10 30 60 120 300 600 900" (seconds;
+#                                 the last value repeats)
+#   QUILL_JOPLIN_QUEUE_MAX_ATTEMPTS default 8
 #
 # Exit status is the shared sync tool's: 0 ok, 1 failure, 3 Joplin unreachable.
+# The queue modes always exit 0 (a worker defers failures to the timer).
 # Tag mirroring (quill-joplin-tags) runs afterwards, is best-effort, and never
 # changes that status.
 set -uo pipefail
@@ -38,59 +54,264 @@ state="${QUILL_JOPLIN_STATE:-$HOME/.local/share/quill-joplin/state.json}"
 notebook="${QUILL_JOPLIN_NOTEBOOK:-Quill}"
 api_url="${QUILL_JOPLIN_API_URL:-http://127.0.0.1:41184}"
 backup_dir="${QUILL_JOPLIN_BACKUP_DIR:-$HOME/.local/share/quill/backups/joplin}"
+queue_dir="${QUILL_JOPLIN_QUEUE_DIR:-$HOME/.local/share/quill-joplin/queue}"
+backoff_spec="${QUILL_JOPLIN_QUEUE_BACKOFF:-10 30 60 120 300 600 900}"
+max_attempts="${QUILL_JOPLIN_QUEUE_MAX_ATTEMPTS:-8}"
 
-if [[ ! -x "$sync_tool" ]]; then
-  echo "error: sync tool not found or not executable: $sync_tool" >&2
-  exit 1
-fi
+pending="$queue_dir/pending"
+lock_file="$queue_dir/queue.lock"
+log_file="$queue_dir/queue.log"
+attempts_file="$queue_dir/queue.attempts"
+log_max_bytes=$((256 * 1024))
 
-# Preserve an explicit --backup-dir (either spelling) from the caller.
-backup_args=()
-caller_backup=0
+self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+
+# --------------------------------------------------------------- queue modes
+# Consume the mode flags so the shared tool never sees them. Any other flag is
+# forwarded exactly as before.
+queue_mode=""
+engine_args=()
 for arg in "$@"; do
   case "$arg" in
-    --backup-dir|--backup-dir=*) caller_backup=1 ;;
+    --notify|--flush|--work)
+      if [[ -n "$queue_mode" && "$queue_mode" != "$arg" ]]; then
+        echo "error: only one of --notify, --flush or --work may be used" >&2
+        exit 2
+      fi
+      queue_mode="$arg"
+      ;;
+    *)
+      engine_args+=("$arg")
+      ;;
   esac
 done
-if (( caller_backup == 0 )); then
-  backup_args=(--backup-dir "$backup_dir")
-fi
 
-"$sync_tool" \
-  --notes-dir "$notes_dir" \
-  --state "$state" \
-  --notebook "$notebook" \
-  --api-url "$api_url" \
-  "${backup_args[@]}" \
-  "$@"
-status=$?
+function ensure_queue() {
+  mkdir -p "$queue_dir" 2>/dev/null || return 1
+  chmod 700 "$queue_dir" 2>/dev/null || true
+}
 
-# Tags are a follow-up pass, only after a sync that actually wrote to Joplin.
-# A dry run made no changes, and a failed/unreachable sync has nothing to tag.
-dry_run=0
-for arg in "$@"; do
-  [[ "$arg" == "--dry-run" ]] && dry_run=1
-done
+# Markers are written to a temporary file in the queue directory and renamed,
+# so a reader never sees a partial `pending`.
+function write_atomic() {
+  local target="$1"
+  local content="${2-}"
+  local tmp
+  tmp="$(mktemp "$queue_dir/.$(basename "$target").XXXXXX")" || return 1
+  if [[ -n "$content" ]]; then
+    printf '%s\n' "$content" >"$tmp" || { rm -f "$tmp"; return 1; }
+  fi
+  mv -f "$tmp" "$target"
+}
 
-if (( status == 0 && dry_run == 0 )) && [[ -x "$tags_tool" ]]; then
-  # Forward only the options the tag helper understands. --api-url/--token may
-  # appear after the wrapper's own defaults (argparse: last one wins).
-  tag_args=(--notes-dir "$notes_dir" --state "$state" --api-url "$api_url")
-  args=("$@")
-  for ((i = 0; i < ${#args[@]}; i++)); do
-    case "${args[i]}" in
-      --api-url|--token)
-        if (( i + 1 < ${#args[@]} )); then
-          tag_args+=("${args[i]}" "${args[i + 1]}")
-          ((i++))
-        fi
-        ;;
-      --quiet|--json)
-        tag_args+=("${args[i]}")
-        ;;
+function mark_pending() {
+  write_atomic "$pending" ""
+}
+
+function set_attempts() {
+  write_atomic "$attempts_file" "$1"
+}
+
+function clear_attempts() {
+  rm -f -- "$attempts_file"
+}
+
+# True when another worker already holds the lock. Opening the lock file here
+# creates it, so this is only called after ensure_queue.
+function worker_running() {
+  [[ -e "$lock_file" ]] || return 1
+  if ( exec 9>>"$lock_file" && flock -n 9 ); then
+    return 1
+  fi
+  return 0
+}
+
+function rotate_log() {
+  local size=0
+  [[ -f "$log_file" ]] || return 0
+  size="$(stat -c %s "$log_file" 2>/dev/null || echo 0)"
+  if (( size >= log_max_bytes )); then
+    mv -f "$log_file" "$log_file.1" 2>/dev/null || true
+  fi
+}
+
+# Detach exactly one worker. The worker takes the lock itself, so a spawn that
+# races with a running worker exits silently.
+function spawn_worker() {
+  local -a quiet=()
+  local arg
+  for arg in "${engine_args[@]}"; do
+    [[ "$arg" == "--quiet" ]] && quiet=(--quiet)
+  done
+  ensure_queue || return 1
+  rotate_log
+  setsid --fork "$self" --work "${quiet[@]}" </dev/null >>"$log_file" 2>&1
+}
+
+function log_line() {
+  printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*"
+}
+
+# Run the normal sync and, on success, the tag pass. This is the original CLI
+# behaviour factored out so the worker and a one-shot call share it exactly.
+function run_sync() {
+  if [[ ! -x "$sync_tool" ]]; then
+    echo "error: sync tool not found or not executable: $sync_tool" >&2
+    return 1
+  fi
+
+  # Preserve an explicit --backup-dir (either spelling) from the caller.
+  local backup_args=()
+  local caller_backup=0
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --backup-dir|--backup-dir=*) caller_backup=1 ;;
     esac
   done
-  "$tags_tool" "${tag_args[@]}" >/dev/null 2>&1 || true
+  if (( caller_backup == 0 )); then
+    backup_args=(--backup-dir "$backup_dir")
+  fi
+
+  "$sync_tool" \
+    --notes-dir "$notes_dir" \
+    --state "$state" \
+    --notebook "$notebook" \
+    --api-url "$api_url" \
+    "${backup_args[@]}" \
+    "$@"
+  local status=$?
+
+  # Tags are a follow-up pass, only after a sync that actually wrote to Joplin.
+  # A dry run made no changes, and a failed/unreachable sync has nothing to tag.
+  local dry_run=0
+  for arg in "$@"; do
+    [[ "$arg" == "--dry-run" ]] && dry_run=1
+  done
+
+  if (( status == 0 && dry_run == 0 )) && [[ -x "$tags_tool" ]]; then
+    # Forward only the options the tag helper understands. --api-url/--token may
+    # appear after the wrapper's own defaults (argparse: last one wins).
+    local tag_args=(--notes-dir "$notes_dir" --state "$state" --api-url "$api_url")
+    local args=("$@")
+    local i
+    for ((i = 0; i < ${#args[@]}; i++)); do
+      case "${args[i]}" in
+        --api-url|--token)
+          if (( i + 1 < ${#args[@]} )); then
+            tag_args+=("${args[i]}" "${args[i + 1]}")
+            ((i++))
+          fi
+          ;;
+        --quiet|--json)
+          tag_args+=("${args[i]}")
+          ;;
+      esac
+    done
+    "$tags_tool" "${tag_args[@]}" >/dev/null 2>&1 || true
+  fi
+
+  return "$status"
+}
+
+function run_worker() {
+  ensure_queue || { echo "error: cannot create queue directory: $queue_dir" >&2; return 1; }
+
+  # One worker per queue. A second --work exits 0 without logging anything.
+  exec 9>>"$lock_file" || { echo "error: cannot open queue lock: $lock_file" >&2; return 1; }
+  flock -n 9 || return 0
+
+  local -a backoff=()
+  local value
+  read -r -a backoff <<<"$backoff_spec"
+  for value in "${backoff[@]}"; do
+    if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+      backoff=(10 30 60 120 300 600 900)
+      break
+    fi
+  done
+  if [[ ${#backoff[@]} -eq 0 ]]; then
+    backoff=(10 30 60 120 300 600 900)
+  fi
+
+  local max="$max_attempts"
+  [[ "$max" =~ ^[0-9]+$ ]] || max=8
+  (( max < 1 )) && max=1
+
+  local attempt=0
+  clear_attempts
+  log_line "worker started (pid $$)"
+
+  while :; do
+    if [[ ! -e "$pending" ]]; then
+      log_line "queue empty; worker exiting"
+      return 0
+    fi
+    rm -f -- "$pending"
+    log_line "sync attempt $((attempt + 1))"
+
+    run_sync "${engine_args[@]}"
+    local status=$?
+
+    if (( status == 0 )); then
+      attempt=0
+      clear_attempts
+      log_line "sync ok"
+      if [[ -e "$pending" ]]; then
+        log_line "work arrived during sync; syncing again"
+        continue
+      fi
+      return 0
+    fi
+
+    # Failure: put the work back and decide whether another attempt is useful.
+    mark_pending
+    attempt=$((attempt + 1))
+    set_attempts "$attempt"
+    log_line "sync failed with exit $status (attempt $attempt/$max); work retained"
+
+    # Only an unreachable Joplin is worth retrying in-process. Any other
+    # failure (bad config, permissions, ...) keeps the marker for the timer
+    # instead of hammering the API.
+    if (( status != 3 )); then
+      log_line "non-3 failure; deferring to the timer"
+      return 0
+    fi
+    if (( attempt >= max )); then
+      log_line "attempt limit reached; deferring to the timer"
+      return 0
+    fi
+
+    local index=$((attempt - 1))
+    (( index >= ${#backoff[@]} )) && index=$((${#backoff[@]} - 1))
+    local delay="${backoff[index]}"
+    log_line "retrying in ${delay}s"
+    sleep "$delay"
+  done
+}
+
+if [[ "$queue_mode" == "--notify" ]]; then
+  ensure_queue || exit 0
+  mark_pending || exit 0
+  if ! worker_running; then
+    spawn_worker >/dev/null 2>&1 || true
+  fi
+  exit 0
 fi
 
-exit "$status"
+if [[ "$queue_mode" == "--flush" ]]; then
+  # No marker means no network access at all: the idle timer is a local no-op.
+  [[ -e "$pending" ]] || exit 0
+  if ! worker_running; then
+    spawn_worker >/dev/null 2>&1 || true
+  fi
+  exit 0
+fi
+
+if [[ "$queue_mode" == "--work" ]]; then
+  run_worker
+  exit $?
+fi
+
+run_sync "$@"
+exit $?

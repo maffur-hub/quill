@@ -1,11 +1,13 @@
 [Unit]
-Description=Mirror Quill notes into Joplin
+Description=Drain pending Quill notes into Joplin
 Documentation=file://%h/.config/omarchy/plugins/matt.quill/README.md
 After=network.target
 
 [Service]
 Type=oneshot
-ExecStart=%h/.local/bin/quill-joplin-sync --quiet
+# --flush only starts the detached sync worker when a save left a pending
+# marker. An idle timer therefore touches no network at all.
+ExecStart=%h/.local/bin/quill-joplin-sync --flush --quiet
 # Exit 3 means Joplin (or its Web Clipper service) is not running. Joplin is
 # often closed on a desktop, so that is not a failure worth alarming about.
 SuccessExitStatus=3

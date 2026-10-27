@@ -16,6 +16,10 @@ Item {
 
   property string storePath: ""
   property string dataRoot: ""
+  // Save-triggered Joplin sync. Empty disables it; a non-empty path is an
+  // explicit opt-in by the caller (Panel in production, a harness in tests),
+  // so tests can point this at a stub even with QUILL_E2E=1.
+  property string joplinSyncPath: ""
   // Production hosts opt in explicitly. Harnesses leave this false so an
   // accidental real data root can never be written to.
   property bool allowRealData: false
@@ -74,6 +78,9 @@ Item {
   property bool pendingCaretToEnd: false
   property bool pendingDetach: false
   property int saveSeq: 0
+  // Last content written per note id. A save whose bytes equal this is a
+  // no-op and must not wake the Joplin sync.
+  property var savedTextById: ({})
 
   // Chat is remembered for this library session only: no config file, and it
   // starts closed every time the shell launches.
@@ -396,6 +403,7 @@ Item {
         root.tooLarge = !!result.tooLarge
         root.loaded = !result.tooLarge
         root.loadedModified = Number(result.modified || 0)
+        root.savedTextById[requestedId] = root.tooLarge ? "" : String(result.content || "")
         root.dirty = false
         root.editVersion = 0
         root.backlinksOpen = false
@@ -436,6 +444,7 @@ Item {
       id: saveView
       property string targetNoteId: ""
       property int targetVersion: 0
+      property string targetText: ""
       atomicWrites: true
       blockAllReads: true
       printErrors: false
@@ -463,6 +472,7 @@ Item {
     }
     view.targetNoteId = selectedId
     view.targetVersion = editVersion
+    view.targetText = String(editor.text)
     saveState = "Saving…"
     view.setText(editor.text)
   }
@@ -471,13 +481,14 @@ Item {
     var noteId = view.targetNoteId
     var version = view.targetVersion
     var contentPath = view.path
+    var savedText = String(view.targetText || "")
     view.destroy()
     enqueue({
       args: ["write", noteId, "--content-file", contentPath],
       silent: true,
       noteId: noteId,
       version: version,
-      onSuccess: function(result) { root.afterWrite(noteId, version, result) },
+      onSuccess: function(result) { root.afterWrite(noteId, version, result, savedText) },
       onError: function(message) {
         if (noteId === root.selectedId) {
           root.saveState = "Save failed"
@@ -499,7 +510,13 @@ Item {
     }
   }
 
-  function afterWrite(noteId, version, result) {
+  function afterWrite(noteId, version, result, savedText) {
+    // A write that did not change the stored bytes is a no-op. Only a real
+    // change wakes the Joplin sync, and only after the write succeeded.
+    var previousText = root.savedTextById[noteId]
+    var changed = previousText === undefined || savedText !== previousText
+    root.savedTextById[noteId] = savedText
+
     if (noteId === selectedId) {
       loadedModified = Number(result.modified || Date.now())
       if (editVersion === version) {
@@ -519,7 +536,14 @@ Item {
       root.scheduleChatContext()
     }
     refreshTimer.restart()
+    if (changed) notifyJoplinSync()
     if (pendingDetach && !dirty && noteId === selectedId) launchDetachedWindow()
+  }
+
+  // Debounced: a burst of autosaves produces one --notify call.
+  function notifyJoplinSync() {
+    if (!writesAllowed || joplinSyncPath === "") return
+    joplinNotifyTimer.restart()
   }
 
   // ------------------------------------------------------- detached window
@@ -1224,6 +1248,16 @@ Item {
   }
 
   Timer { id: saveTimer; interval: 600; onTriggered: root.flushSave() }
+  Timer {
+    id: joplinNotifyTimer
+    interval: 2500
+    repeat: false
+    onTriggered: {
+      if (root.joplinSyncPath === "" || !root.writesAllowed) return
+      joplinNotifyProcess.command = [root.joplinSyncPath, "--notify"]
+      joplinNotifyProcess.running = true
+    }
+  }
   Timer { id: searchTimer; interval: 170; onTriggered: root.runSearch() }
   Timer { id: refreshTimer; interval: 1100; onTriggered: if (!root.dirty) root.refreshAll() }
   Timer { id: armTimer; interval: 3200; onTriggered: { root.deleteArmed = false; root.deleteArmId = "" } }
@@ -1323,6 +1357,14 @@ Item {
         root.statusText = String(detachedError.text || "").trim() || "Could not open a detached window"
       }
     }
+  }
+
+  // Fire-and-forget: the sync tool queues the work and returns immediately.
+  // Failures (including a missing tool) are deliberately not surfaced.
+  Process {
+    id: joplinNotifyProcess
+    stdout: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector { waitForEnd: true }
   }
 
   Column {
