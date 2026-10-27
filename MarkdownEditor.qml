@@ -1,6 +1,8 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Templates as T
+import Qt.labs.folderlistmodel
+import Quickshell
 import Quickshell.Io
 import qs.Commons
 import qs.Commons as Commons
@@ -28,6 +30,23 @@ TextArea {
   property string pasteOutput: ""
   property string pasteError: ""
 
+  // "Attach file…": a themed in-app file browser rather than a portal,
+  // zenity or QtQuick.Dialogs. The store copies the chosen file into the data
+  // root and returns the Markdown to insert. attachPath/attachChosenPath are
+  // the scripted entry points (Enter in the picker's path field uses them too).
+  readonly property var attachPickerRef: attachPicker
+  readonly property bool attachPickerOpen: attachPicker.visible
+  property string attachPath: ""
+  property string attachFolder: ""
+  property string attachFilter: ""
+  property bool attachShowHidden: false
+  property string attachSelected: ""
+  property string attachOutput: ""
+  property string attachError: ""
+  property bool attaching: false
+  readonly property string attachHome: Quickshell.env("HOME") || "/"
+  readonly property bool attachCanConfirm: root.attachPath.trim() !== ""
+
   // Replaces the stock white Qt text menu. Exposed for the e2e harness.
   readonly property var contextMenuRef: editorMenu
   T.ContextMenu.menu: editorMenu
@@ -48,6 +67,8 @@ TextArea {
 
   signal imagePasted(string path)
   signal pasteFailed(string message)
+  signal attachmentAdded(string path)
+  signal attachFailed(string message)
   signal linkRequested()
   signal noteLinkRequested()
   signal formatRejected(string message)
@@ -508,6 +529,180 @@ TextArea {
     forceActiveFocus()
   }
 
+  // ------------------------------------------------------------ attachments
+
+  // Editing is blocked while the note is read-only, disabled, or a crash-draft
+  // banner is pending: Library/Detached fold draftPending into readOnly or
+  // enabled, so this is the same guard Ctrl+V uses.
+  function attachAllowed() {
+    return root.enabled && !root.readOnly && !root.pastingImage
+  }
+
+  function attachBasename(path) {
+    var value = String(path || "")
+    var cut = value.lastIndexOf("/")
+    var name = cut >= 0 ? value.slice(cut + 1) : value
+    return name === "" ? "file" : name
+  }
+
+  function attachParentFolder(path) {
+    var value = String(path || "")
+    while (value.length > 1 && value.charAt(value.length - 1) === "/") {
+      value = value.slice(0, -1)
+    }
+    var cut = value.lastIndexOf("/")
+    return cut <= 0 ? "/" : value.slice(0, cut)
+  }
+
+  // Expand ~, make relative paths relative to the current folder, and collapse
+  // duplicate/trailing separators so the store always sees an absolute path.
+  function attachResolvePath(value) {
+    var path = String(value === undefined || value === null ? "" : value).trim()
+    if (path === "") return ""
+    if (path === "~") path = root.attachHome
+    else if (path.slice(0, 2) === "~/") path = root.attachHome + path.slice(1)
+    else if (path.charAt(0) !== "/") path = (root.attachFolder || root.attachHome) + "/" + path
+    path = path.replace(/\/{2,}/g, "/")
+    while (path.length > 1 && path.charAt(path.length - 1) === "/") {
+      path = path.slice(0, -1)
+    }
+    return path
+  }
+
+  function attachFolderUrl(path) {
+    return "file://" + String(path || "/").replace(/ /g, "%20")
+      .replace(/#/g, "%23").replace(/\?/g, "%3F")
+  }
+
+  function attachEntryFor(path) {
+    var target = String(path || "")
+    var entries = root.attachFolderEntries
+    for (var i = 0; i < entries.length; i++) {
+      if (entries[i].path === target) return entries[i]
+    }
+    return null
+  }
+
+  function attachNavigate(folder) {
+    var path = root.attachResolvePath(folder)
+    if (path === "") return false
+    root.attachFolder = path
+    root.attachFilter = ""
+    root.attachPath = ""
+    root.attachSelected = ""
+    return true
+  }
+
+  function openAttachPicker() {
+    if (!root.attachAllowed()) return false
+    if (root.attachFolder === "") root.attachFolder = root.attachHome
+    root.attachFilter = ""
+    root.attachPath = ""
+    root.attachSelected = ""
+    root.attachOutput = ""
+    root.attachError = ""
+    attachPicker.open()
+    attachFilterField.forceActiveFocus()
+    return true
+  }
+
+  function closeAttachPicker() {
+    attachPicker.close()
+    root.attachSelected = ""
+  }
+
+  function chooseAttachEntry(entry) {
+    if (!entry) return false
+    if (entry.isDir) return root.attachNavigate(entry.path)
+    root.attachSelected = entry.path
+    root.attachPath = entry.path
+    return true
+  }
+
+  // Enter in the path field / the footer's Attach button. A known directory
+  // navigates; a known file attaches; anything else is probed with test(1) so
+  // a hand-typed directory navigates instead of failing inside the store.
+  function attachChosenPath() {
+    if (!root.attachAllowed()) return false
+    var target = root.attachResolvePath(root.attachPath)
+    if (target === "") return false
+    var entry = root.attachEntryFor(target)
+    if (entry !== null) return root.chooseAttachEntry(entry)
+    if (target === "/") return root.attachNavigate("/")
+    attachProbe.target = target
+    attachProbe.command = ["/usr/bin/test", "-d", target]
+    attachProbe.running = true
+    return true
+  }
+
+  function finishAttachProbe(exitCode) {
+    var target = attachProbe.target
+    if (exitCode === 0) root.attachNavigate(target)
+    else root.attachFile(target)
+  }
+
+  function attachFile(path) {
+    if (!root.attachAllowed() || root.attaching) return false
+    var target = root.attachResolvePath(path)
+    if (target === "") return false
+    if (root.storePath === "") {
+      root.attachFailed("No store configured for attachments")
+      return false
+    }
+    root.attachOutput = ""
+    root.attachError = ""
+    root.attaching = true
+    root.attachSelected = ""
+    attachPicker.close()
+    attachProcess.command = [root.storePath, "attachment", "save",
+      "--file", target, "--name", root.attachBasename(target)]
+    attachProcess.running = true
+    attachTimer.restart()
+    return true
+  }
+
+  function insertAttachmentMarkdown(markdown) {
+    var position = Math.max(0, Math.min(cursorPosition, text.length))
+    var leading = (position > 0 && text.charAt(position - 1) !== "\n") ? "\n" : ""
+    var trailing = (position < text.length && text.charAt(position) !== "\n") ? "\n" : ""
+    var insertion = leading + markdown + trailing
+    insert(position, insertion)
+    cursorPosition = position + insertion.length
+    forceActiveFocus()
+  }
+
+  function finishAttach(exitCode) {
+    attachTimer.stop()
+    if (!root.attaching) return
+    root.attaching = false
+
+    var payload = null
+    try {
+      payload = JSON.parse(String(root.attachOutput || "").trim() || "{}")
+    } catch (error) {
+      payload = null
+    }
+
+    if (exitCode === 0 && payload && payload.markdown) {
+      root.insertAttachmentMarkdown(String(payload.markdown))
+      root.attachmentAdded(String(payload.path || ""))
+      return
+    }
+
+    // The store reports failures as JSON on stderr; show its message rather
+    // than the JSON wrapper, but never lose unexpected stderr output.
+    var message = ""
+    try {
+      var failure = JSON.parse(String(root.attachError || "").trim() || "{}")
+      if (failure && failure.error) message = String(failure.error)
+    } catch (error) {
+      message = String(root.attachError || "").trim()
+    }
+    if (!message) message = String(root.attachError || "").trim()
+    if (!message) message = "Could not attach file"
+    root.attachFailed(message)
+  }
+
   function pasteAsText() {
     if (typeof root.paste === "function") {
       root.paste()
@@ -602,6 +797,336 @@ TextArea {
       pasteProcess.running = false
       root.pasteAsText()
       root.pasteFailed("Image paste timed out")
+    }
+  }
+
+  // ---------------------------------------------------------- attach picker
+
+  // Backing model for the picker. FolderListModel is synchronous for local
+  // directories, so the list is ready as soon as the popup opens.
+  FolderListModel {
+    id: attachFolderModel
+    folder: root.attachFolderUrl(root.attachFolder === "" ? root.attachHome : root.attachFolder)
+    showDirs: true
+    showFiles: true
+    showHidden: root.attachShowHidden
+    showDirsFirst: true
+    sortField: FolderListModel.Name
+    nameFilters: ["*"]
+  }
+
+  // Every row of the current folder (used for hit-testing typed paths).
+  readonly property var attachFolderEntries: {
+    var output = []
+    var folder = root.attachFolder === "" ? root.attachHome : root.attachFolder
+    var total = attachFolderModel.count
+    for (var i = 0; i < total; i++) {
+      var name = String(attachFolderModel.get(i, "fileName") || "")
+      if (name === "") continue
+      output.push({
+        name: name,
+        path: folder === "/" ? "/" + name : folder + "/" + name,
+        isDir: !!attachFolderModel.get(i, "fileIsDir")
+      })
+    }
+    return output
+  }
+
+  // The visible rows: hidden files only when asked for, plus the quick filter.
+  readonly property var attachEntries: {
+    var all = root.attachFolderEntries
+    var query = String(root.attachFilter || "").trim().toLowerCase()
+    var output = []
+    for (var i = 0; i < all.length; i++) {
+      var entry = all[i]
+      if (!root.attachShowHidden && entry.name.charAt(0) === ".") continue
+      if (query !== "" && entry.name.toLowerCase().indexOf(query) < 0) continue
+      output.push(entry)
+    }
+    return output
+  }
+
+  Process {
+    id: attachProcess
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.attachOutput = String(text || "")
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.attachError = String(text || "")
+    }
+    onExited: function(exitCode) { root.finishAttach(exitCode) }
+  }
+
+  Process {
+    id: attachProbe
+    property string target: ""
+    stdout: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: function(exitCode) { root.finishAttachProbe(exitCode) }
+  }
+
+  Timer {
+    id: attachTimer
+    interval: 20000
+    onTriggered: {
+      if (!root.attaching) return
+      root.attaching = false
+      attachProcess.running = false
+      root.attachFailed("Attaching the file timed out")
+    }
+  }
+
+  Popup {
+    id: attachPicker
+    objectName: "quillAttachPicker"
+    width: Style.space(360)
+    height: Style.space(440)
+    padding: Style.space(8)
+    focus: true
+    closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+    x: Math.max(Style.space(4), Math.round((root.width - width) / 2))
+    y: Math.max(Style.space(4), Math.round((root.height - height) / 2))
+    onClosed: root.attachSelected = ""
+
+    background: BorderSurface {
+      color: Commons.Color.background
+      borderSpec: Border.controlSpec("normal", Commons.Color.foreground, Commons.Color.accent)
+      radius: Style.cornerRadius
+    }
+
+    contentItem: Column {
+      spacing: Style.space(6)
+
+      Text {
+        objectName: "attachFolderLabel"
+        width: parent.width
+        text: root.attachFolder === "" ? root.attachHome : root.attachFolder
+        textFormat: Text.PlainText
+        elide: Text.ElideMiddle
+        color: Util.alpha(Commons.Color.foreground, 0.62)
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
+      }
+
+      // "Up" row and the hidden-files toggle share one compact line.
+      Row {
+        width: parent.width
+        spacing: Style.space(4)
+
+        BorderSurface {
+          id: attachUpRow
+          objectName: "attachUp"
+          width: Style.space(56)
+          height: Style.space(22)
+          color: attachUpMouse.containsMouse
+            ? Style.hoverFillFor(Commons.Color.foreground, Commons.Color.accent)
+            : "transparent"
+          borderSpec: Border.controlSpec("normal", Commons.Color.foreground,
+            Commons.Color.accent)
+          radius: Style.cornerRadius
+
+          Text {
+            anchors.centerIn: parent
+            text: "↑ Up"
+            textFormat: Text.PlainText
+            color: Commons.Color.foreground
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+          }
+
+          MouseArea {
+            id: attachUpMouse
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.attachNavigate(root.attachParentFolder(
+              root.attachFolder === "" ? root.attachHome : root.attachFolder))
+          }
+        }
+
+        BorderSurface {
+          id: attachHiddenRow
+          objectName: "attachHiddenToggle"
+          width: Style.space(112)
+          height: Style.space(22)
+          color: attachHiddenMouse.containsMouse
+            ? Style.hoverFillFor(Commons.Color.foreground, Commons.Color.accent)
+            : "transparent"
+          borderSpec: Border.none
+          radius: Style.cornerRadius
+
+          Text {
+            anchors.centerIn: parent
+            text: root.attachShowHidden ? "☑ Hidden files" : "☐ Hidden files"
+            textFormat: Text.PlainText
+            color: Util.alpha(Commons.Color.foreground, root.attachShowHidden ? 0.92 : 0.62)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+          }
+
+          MouseArea {
+            id: attachHiddenMouse
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.attachShowHidden = !root.attachShowHidden
+          }
+        }
+      }
+
+      TextField {
+        id: attachFilterField
+        objectName: "attachFilterField"
+        width: parent.width
+        height: Style.space(24)
+        text: root.attachFilter
+        placeholderText: "Filter…"
+        font.pixelSize: Style.font.bodySmall
+        leftPadding: Style.space(6)
+        rightPadding: Style.space(6)
+        topPadding: Style.space(3)
+        bottomPadding: Style.space(3)
+        onTextChanged: if (root.attachFilter !== text) root.attachFilter = text
+      }
+
+      Item {
+        // The list takes whatever height the rows above leave inside the
+        // popup, so the path field and footer stay visible at the bottom
+        // (24 px path field + 26 px footer + one 6 px gap each).
+        width: parent.width
+        height: Math.max(Style.space(80), attachPicker.availableHeight - y
+          - Style.space(24) - Style.space(6) - Style.space(26) - Style.space(6))
+
+        ListView {
+          id: attachList
+          objectName: "attachList"
+          anchors.fill: parent
+          clip: true
+          model: root.attachEntries
+          boundsBehavior: Flickable.StopAtBounds
+          ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+          delegate: Rectangle {
+            id: attachRow
+            required property var modelData
+
+            width: attachList.width
+            height: Style.space(23)
+            radius: Style.cornerRadius
+            color: root.attachSelected === modelData.path
+              ? Style.hoverFillFor(Commons.Color.foreground, Commons.Color.accent)
+              : attachRowMouse.containsMouse
+                ? Style.hoverFillFor(Commons.Color.foreground, Commons.Color.accent)
+                : "transparent"
+
+            Text {
+              id: attachGlyph
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(6)
+              anchors.verticalCenter: parent.verticalCenter
+              text: modelData.isDir ? "📁" : "📄"
+              textFormat: Text.PlainText
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+            }
+
+            Text {
+              anchors.left: attachGlyph.right
+              anchors.leftMargin: Style.space(6)
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(6)
+              anchors.verticalCenter: parent.verticalCenter
+              text: modelData.name
+              textFormat: Text.PlainText
+              elide: Text.ElideRight
+              color: Commons.Color.foreground
+              font.family: Style.font.family
+              font.pixelSize: Style.font.bodySmall
+            }
+
+            MouseArea {
+              id: attachRowMouse
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.chooseAttachEntry(modelData)
+              onDoubleClicked: {
+                if (!modelData.isDir) root.attachFile(modelData.path)
+              }
+            }
+          }
+        }
+
+        Text {
+          anchors.centerIn: parent
+          visible: root.attachEntries.length === 0
+          text: "No files here"
+          textFormat: Text.PlainText
+          color: Util.alpha(Commons.Color.foreground, 0.5)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.bodySmall
+        }
+      }
+
+      TextField {
+        id: attachPathField
+        objectName: "attachPathField"
+        width: parent.width
+        height: Style.space(24)
+        text: root.attachPath
+        placeholderText: "Path to a file or folder…"
+        font.pixelSize: Style.font.bodySmall
+        leftPadding: Style.space(6)
+        rightPadding: Style.space(6)
+        topPadding: Style.space(3)
+        bottomPadding: Style.space(3)
+        onTextChanged: if (root.attachPath !== text) root.attachPath = text
+        onAccepted: root.attachChosenPath()
+      }
+
+      Row {
+        width: parent.width
+        height: Style.space(26)
+        spacing: Style.space(5)
+
+        Text {
+          anchors.verticalCenter: parent.verticalCenter
+          width: parent.width - attachCancel.width - attachConfirm.width
+            - parent.spacing * 2
+          text: root.attaching ? "Attaching…" : ""
+          textFormat: Text.PlainText
+          elide: Text.ElideRight
+          color: Util.alpha(Commons.Color.foreground, 0.55)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+        }
+
+        Button {
+          id: attachCancel
+          objectName: "attachCancel"
+          text: "Cancel"
+          fontSize: Style.font.bodySmall
+          horizontalPadding: Style.space(7)
+          verticalPadding: Style.space(4)
+          anchors.verticalCenter: parent.verticalCenter
+          onClicked: root.closeAttachPicker()
+        }
+
+        Button {
+          id: attachConfirm
+          objectName: "attachConfirm"
+          text: "Attach"
+          active: root.attachCanConfirm && !root.attaching
+          enabled: root.attachCanConfirm && !root.attaching
+          fontSize: Style.font.bodySmall
+          horizontalPadding: Style.space(7)
+          verticalPadding: Style.space(4)
+          anchors.verticalCenter: parent.verticalCenter
+          onClicked: root.attachChosenPath()
+        }
+      }
     }
   }
 

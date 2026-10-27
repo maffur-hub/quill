@@ -57,6 +57,7 @@ Item {
   readonly property var colorPalettePopup: colorPopup
   readonly property var colorPickerPopup: colorPicker
   readonly property var noteLinkPopupRef: noteLinkPopup
+  readonly property var insertPopupRef: insertPopup
   readonly property Item emojiInput: emojiSearch
   readonly property var emojiPopupRef: emojiPopup
   readonly property Item emojiInsertItem: insertEmojiItem
@@ -1187,6 +1188,14 @@ Item {
         onActivated: {
           insertPopup.close()
           root.openEmojiPopover()
+        }
+      }
+      MenuButton {
+        objectName: "formatInsertAttach"
+        label: "Attach file…"
+        onActivated: {
+          insertPopup.close()
+          root.invoke("attach", "")
         }
       }
       MenuButton {

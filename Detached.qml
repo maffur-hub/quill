@@ -66,6 +66,17 @@ ShellRoot {
     return Qt.rgba(colorValue.r, colorValue.g, colorValue.b, opacity)
   }
 
+  // Local Markdown links are absolute paths; Qt.openUrlExternally needs a URL.
+  // Anything that already has a scheme is passed through unchanged.
+  function externalLinkUrl(link) {
+    var value = String(link === undefined || link === null ? "" : link).trim()
+    if (value === "") return ""
+    if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(value)) return value
+    if (value.slice(0, 2) === "~/") value = root.home + value.slice(1)
+    if (value.charAt(0) === "/") return "file://" + value
+    return value
+  }
+
   function loadNote() {
     if (!noteId) {
       tooLarge = true
@@ -476,6 +487,21 @@ ShellRoot {
         color: Util.alpha(Commons.Color.foreground, 0.14)
       }
 
+      FormatBar {
+        id: formatBar
+        width: parent.width
+        visible: !root.tooLarge
+        available: root.loaded && !root.tooLarge && !root.draftPending
+        canUndo: editor ? editor.canUndo : false
+        canRedo: editor ? editor.canRedo : false
+        linkValue: editor ? editor.currentLinkURL() : ""
+        onAction: function(name, value) {
+          if (!editor) return
+          if (name === "attach") editor.openAttachPicker()
+          else editor.applyFormat(name, value)
+        }
+      }
+
       DraftBanner {
         width: parent.width
         visible: root.draftPending
@@ -535,8 +561,13 @@ ShellRoot {
                   : "Start writing Markdown…"
               placeholderTextColor: Util.alpha(Commons.Color.foreground, 0.28)
               onTextChanged: root.markDirty()
+              onLinkRequested: formatBar.openLinkPopover()
+              onNoteLinkRequested: formatBar.openNoteLink()
+              onFormatRejected: function(message) { root.statusText = message }
               onImagePasted: function(path) { root.statusText = "Image added" }
               onPasteFailed: function(message) { root.statusText = message }
+              onAttachmentAdded: function(path) { root.statusText = "File attached" }
+              onAttachFailed: function(message) { root.statusText = message }
             }
           }
         }
@@ -559,7 +590,10 @@ ShellRoot {
             editable: root.loaded && !root.tooLarge && !root.draftPending
             tableEditing: false
             lineOffset: root.previewLineOffset
-            onLinkActivated: function(link) { Qt.openUrlExternally(link) }
+            onLinkActivated: function(link) {
+              var target = root.externalLinkUrl(link)
+              if (target !== "") Qt.openUrlExternally(target)
+            }
             onImageResized: function(line, width) { root.setImageWidth(line, width) }
             onImageReset: function(line) { root.clearImageSize(line) }
             onTaskToggled: function(line) { root.toggleTaskAt(line) }

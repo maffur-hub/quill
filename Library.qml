@@ -978,6 +978,21 @@ Item {
     })
   }
 
+  // Local Markdown links are stored as absolute paths (`[spec](/home/me/spec.pdf)`).
+  // Qt.openUrlExternally needs a URL, not a bare path, so local paths get a
+  // file:// prefix (already-percent-encoded hrefs stay encoded). Anything with
+  // a scheme is passed through untouched.
+  function externalLinkUrl(link) {
+    var value = String(link === undefined || link === null ? "" : link).trim()
+    if (value === "") return ""
+    if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(value)) return value
+    if (value.slice(0, 2) === "~/") {
+      value = (Quickshell.env("HOME") || "") + value.slice(1)
+    }
+    if (value.charAt(0) === "/") return "file://" + value
+    return value
+  }
+
   function openLink(link) {
     var value = String(link || "")
     if (value.indexOf("quill://note/") === 0) {
@@ -988,10 +1003,9 @@ Item {
       selectCategory("tag:" + tag)
     } else if (value.indexOf("quill://missing/") === 0) {
       statusText = "No note matches “" + decodeURIComponent(value.slice("quill://missing/".length)) + "”"
-    } else if (value.indexOf("http://") === 0 || value.indexOf("https://") === 0) {
-      Qt.openUrlExternally(value)
-    } else if (value !== "") {
-      Qt.openUrlExternally(value)
+    } else {
+      var target = root.externalLinkUrl(value)
+      if (target !== "") Qt.openUrlExternally(target)
     }
   }
 
@@ -2088,7 +2102,9 @@ Item {
             linkValue: editor ? editor.currentLinkURL() : ""
             noteTitles: root.noteTitleList
             onAction: function(name, value) {
-              if (editor) editor.applyFormat(name, value)
+              if (!editor) return
+              if (name === "attach") editor.openAttachPicker()
+              else editor.applyFormat(name, value)
             }
           }
 
@@ -2147,6 +2163,8 @@ Item {
                 onFormatRejected: function(message) { root.statusText = message }
                 onImagePasted: function(path) { root.statusText = "Image added" }
                 onPasteFailed: function(message) { root.statusText = message }
+                onAttachmentAdded: function(path) { root.statusText = "File attached" }
+                onAttachFailed: function(message) { root.statusText = message }
               }
             }
 
