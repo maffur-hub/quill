@@ -14,14 +14,23 @@ BorderSurface {
   property bool searching: false
   property bool showTrash: false
   property bool loading: false
+  property var folderOptions: []
 
   readonly property bool searchFocused: searchField.activeFocus
+  // The array bound to the list model. Library binds this to visibleNotes, so
+  // filtered/search views are already the right source for row lookups.
+  readonly property var visibleNotes: notes
+  property real menuAnchorX: 0
+  property real menuAnchorY: 0
 
   signal noteSelected(string id)
   signal searchQueryChanged(string text)
   signal escapePressed()
   signal editorFocusRequested()
   signal collapseRequested()
+  signal noteActionRequested(string id, string action)
+  signal noteRenameRequested(string id)
+  signal noteMoveRequested(string id, string folder)
 
   function focusSearch() {
     searchField.forceActiveFocus()
@@ -74,6 +83,60 @@ BorderSurface {
   onSelectedIdChanged: Qt.callLater(scrollToSelection)
   onNotesChanged: Qt.callLater(scrollToSelection)
 
+  // Position a popup at a point in overlay coordinates, flipping it above or
+  // to the left of the pointer when the window edge is close.
+  function popupPoint(menu, point) {
+    var overlay = Overlay.overlay
+    if (!overlay) return Qt.point(0, 0)
+    var margin = Style.space(4)
+    var width = menu.width > 0 ? menu.width : menu.implicitWidth
+    var height = menu.implicitHeight
+    var x = Number(point.x || 0)
+    var y = Number(point.y || 0)
+    if (x + width + margin > overlay.width) x -= width
+    if (y + height + margin > overlay.height) y -= height
+    x = Math.max(margin, Math.min(x, overlay.width - width - margin))
+    y = Math.max(margin, Math.min(y, overlay.height - height - margin))
+    return Qt.point(x, y)
+  }
+
+  function openNoteMenu(note, point) {
+    if (!note) return
+    var trashed = !!root.showTrash || !!note.trashed
+    var menu = trashed ? trashMenu : noteMenu
+    menu.menuNoteId = String(note.id || "")
+    if (!trashed) menu.menuPinned = !!note.pinned
+    root.menuAnchorX = Number(point.x || 0)
+    root.menuAnchorY = Number(point.y || 0)
+    var target = root.popupPoint(menu, point)
+    menu.popup(target.x, target.y)
+  }
+
+  function openMenuForSelection() {
+    var list = root.visibleNotes
+    if (list.length === 0 || root.selectedId === "") return
+    var index = -1
+    for (var i = 0; i < list.length; i++) {
+      if (String(list[i].id) === root.selectedId) { index = i; break }
+    }
+    if (index < 0) return
+    var overlay = Overlay.overlay
+    if (!overlay) return
+    var row = noteList.itemAtIndex(index)
+    var point = row
+      ? row.mapToItem(overlay, Style.space(12), row.height)
+      : noteList.mapToItem(overlay, Style.space(12), noteList.height / 2)
+    root.openNoteMenu(list[index], point)
+  }
+
+  function openMoveMenu() {
+    if (noteMenu.menuNoteId === "") return
+    folderMenu.menuNoteId = noteMenu.menuNoteId
+    folderMenu.rebuild()
+    var target = root.popupPoint(folderMenu, Qt.point(root.menuAnchorX, root.menuAnchorY))
+    folderMenu.popup(target.x, target.y)
+  }
+
   color: Util.alpha(Commons.Color.foreground, 0.016)
   borderSpec: Border.controlSpec("normal", Commons.Color.foreground, Commons.Color.accent)
   radius: Style.cornerRadius
@@ -88,6 +151,10 @@ BorderSurface {
       event.accepted = true
     } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
       root.editorFocusRequested()
+      event.accepted = true
+    } else if (event.key === Qt.Key_Menu
+      || (event.key === Qt.Key_F10 && (event.modifiers & Qt.ShiftModifier))) {
+      root.openMenuForSelection()
       event.accepted = true
     } else if (event.text === "/") {
       root.focusSearch()
@@ -140,6 +207,7 @@ BorderSurface {
 
       ListView {
         id: noteList
+        objectName: "noteList"
         anchors.fill: parent
         clip: true
         spacing: Style.space(3)
@@ -156,6 +224,10 @@ BorderSurface {
           } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
             root.editorFocusRequested()
             event.accepted = true
+          } else if (event.key === Qt.Key_Menu
+            || (event.key === Qt.Key_F10 && (event.modifiers & Qt.ShiftModifier))) {
+            root.openMenuForSelection()
+            event.accepted = true
           } else if (event.text === "/") {
             root.focusSearch()
             event.accepted = true
@@ -169,6 +241,7 @@ BorderSurface {
 
           readonly property bool rowSelected: String(modelData.id) === root.selectedId
 
+          objectName: "noteRow-" + String(modelData.id)
           width: noteList.width
           height: Style.space(80)
           color: rowSelected
@@ -277,12 +350,25 @@ BorderSurface {
             id: rowMouse
             anchors.fill: parent
             hoverEnabled: true
+            acceptedButtons: Qt.LeftButton | Qt.RightButton
             cursorShape: Qt.PointingHandCursor
-            onClicked: {
+            onPressed: function(mouse) {
+              if (mouse.button !== Qt.RightButton) return
+              root.noteSelected(String(noteRow.modelData.id))
+              root.forceActiveFocus()
+              var overlay = Overlay.overlay
+              if (!overlay) return
+              var point = noteRow.mapToItem(overlay, mouse.x, mouse.y)
+              root.openNoteMenu(noteRow.modelData, point)
+              mouse.accepted = true
+            }
+            onClicked: function(mouse) {
+              if (mouse.button !== Qt.LeftButton) return
               root.noteSelected(String(noteRow.modelData.id))
               root.forceActiveFocus()
             }
-            onDoubleClicked: {
+            onDoubleClicked: function(mouse) {
+              if (mouse.button !== Qt.LeftButton) return
               root.noteSelected(String(noteRow.modelData.id))
               root.editorFocusRequested()
             }
@@ -322,6 +408,162 @@ BorderSurface {
         color: Util.alpha(Commons.Color.foreground, 0.3)
         font.family: Style.font.family
         font.pixelSize: Style.font.caption
+      }
+    }
+  }
+
+  // -------------------------------------------------------- context menus
+  Menu {
+    id: noteMenu
+    objectName: "noteListMenu"
+    parent: Overlay.overlay
+    property string menuNoteId: ""
+    property bool menuPinned: false
+    width: Style.space(220)
+    padding: Style.space(4)
+    popupType: Qt.platform.pluginName !== "wayland" ? Popup.Window : Popup.Item
+    palette.window: Commons.Color.menu.background
+    palette.windowText: Commons.Color.menu.text
+    palette.text: Commons.Color.menu.text
+    palette.buttonText: Commons.Color.menu.text
+    palette.light: Commons.Color.menu.selectedBackground
+    palette.midlight: Util.alpha(Commons.Color.foreground, 0.12)
+    palette.mid: Util.alpha(Commons.Color.foreground, 0.16)
+    palette.dark: Commons.Color.menu.border
+
+    background: BorderSurface {
+      color: Commons.Color.menu.background
+      borderSpec: Border.controlSpec("normal", Commons.Color.menu.border,
+        Commons.Color.accent)
+      radius: Style.cornerRadius
+    }
+
+    ContextMenuItem {
+      objectName: "noteMenuPin"
+      text: noteMenu.menuPinned ? "Unpin" : "Pin"
+      onTriggered: root.noteActionRequested(noteMenu.menuNoteId, "pin")
+    }
+    ContextMenuItem {
+      objectName: "noteMenuRename"
+      text: "Rename…"
+      onTriggered: root.noteRenameRequested(noteMenu.menuNoteId)
+    }
+    ContextMenuItem {
+      objectName: "noteMenuDuplicate"
+      text: "Duplicate"
+      onTriggered: root.noteActionRequested(noteMenu.menuNoteId, "duplicate")
+    }
+    ContextMenuItem {
+      objectName: "noteMenuMove"
+      text: "Move to folder…"
+      onTriggered: root.openMoveMenu()
+    }
+
+    MenuSeparator {
+      objectName: "noteMenuSeparator"
+    }
+
+    ContextMenuItem {
+      objectName: "noteMenuTrash"
+      text: "Move to Trash"
+      onTriggered: root.noteActionRequested(noteMenu.menuNoteId, "trash")
+    }
+  }
+
+  Menu {
+    id: trashMenu
+    objectName: "noteListTrashMenu"
+    parent: Overlay.overlay
+    property string menuNoteId: ""
+    width: Style.space(220)
+    padding: Style.space(4)
+    popupType: Qt.platform.pluginName !== "wayland" ? Popup.Window : Popup.Item
+    palette.window: Commons.Color.menu.background
+    palette.windowText: Commons.Color.menu.text
+    palette.text: Commons.Color.menu.text
+    palette.buttonText: Commons.Color.menu.text
+    palette.light: Commons.Color.menu.selectedBackground
+    palette.midlight: Util.alpha(Commons.Color.foreground, 0.12)
+    palette.mid: Util.alpha(Commons.Color.foreground, 0.16)
+    palette.dark: Commons.Color.menu.border
+
+    background: BorderSurface {
+      color: Commons.Color.menu.background
+      borderSpec: Border.controlSpec("normal", Commons.Color.menu.border,
+        Commons.Color.accent)
+      radius: Style.cornerRadius
+    }
+
+    ContextMenuItem {
+      objectName: "trashNoteMenuRestore"
+      text: "Restore"
+      onTriggered: root.noteActionRequested(trashMenu.menuNoteId, "restore")
+    }
+
+    MenuSeparator {
+      objectName: "trashNoteMenuSeparator"
+    }
+
+    ContextMenuItem {
+      objectName: "trashNoteMenuDelete"
+      text: "Delete forever…"
+      onTriggered: root.noteActionRequested(trashMenu.menuNoteId, "delete-forever")
+    }
+  }
+
+  // A real submenu cannot be built from a dynamic folder list in QML, so the
+  // folder chooser is a second themed menu opened beside the pointer.
+  Menu {
+    id: folderMenu
+    objectName: "noteListFolderMenu"
+    parent: Overlay.overlay
+    property string menuNoteId: ""
+    width: Style.space(220)
+    padding: Style.space(4)
+    popupType: Qt.platform.pluginName !== "wayland" ? Popup.Window : Popup.Item
+    palette.window: Commons.Color.menu.background
+    palette.windowText: Commons.Color.menu.text
+    palette.text: Commons.Color.menu.text
+    palette.buttonText: Commons.Color.menu.text
+    palette.light: Commons.Color.menu.selectedBackground
+    palette.midlight: Util.alpha(Commons.Color.foreground, 0.12)
+    palette.mid: Util.alpha(Commons.Color.foreground, 0.16)
+    palette.dark: Commons.Color.menu.border
+
+    background: BorderSurface {
+      color: Commons.Color.menu.background
+      borderSpec: Border.controlSpec("normal", Commons.Color.menu.border,
+        Commons.Color.accent)
+      radius: Style.cornerRadius
+    }
+
+    function rebuild() {
+      while (count > 0) removeItem(itemAt(count - 1))
+      for (var i = 0; i < root.folderOptions.length; i++) {
+        var option = root.folderOptions[i] || {}
+        var value = option.value === undefined || option.value === null
+          ? "" : String(option.value)
+        var label = option.label === undefined || option.label === null
+          ? value : String(option.label)
+        var item = folderMenuItemComponent.createObject(null, {
+          "text": label,
+          "objectName": "noteMoveFolderItem-" + i,
+          "folderValue": value
+        })
+        if (item) addItem(item)
+      }
+    }
+  }
+
+  Component {
+    id: folderMenuItemComponent
+    ContextMenuItem {
+      id: folderItem
+      property string folderValue: ""
+      onTriggered: {
+        var noteId = folderMenu.menuNoteId
+        folderMenu.close()
+        if (noteId !== "") root.noteMoveRequested(noteId, folderItem.folderValue)
       }
     }
   }

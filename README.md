@@ -136,6 +136,7 @@ Draft writes never wake the Joplin sync. Only the normal note save does.
 | `Ctrl+Shift+Enter` | Open the library in its own window |
 | `Ctrl+Return` | Open the selected note in a detached window |
 | `Ctrl+Delete` | Trash (press twice; again to delete forever in Trash) |
+| `Shift+F10`, `Menu` | Note actions menu for the selected note |
 | `Ctrl+1` / `Ctrl+2` / `Ctrl+3` | Focus sidebar / list / editor |
 | `Esc` | Clear search, then close |
 | `Tab` | Insert two spaces |
@@ -162,6 +163,25 @@ Templates fill `{{date}}`, `{{time}}` and `{{datetime}}` with the local time
 when the note is created. The menu also has a **Blank note** row. Templates are
 plain Markdown; edit or delete any section after creation. Built-in templates
 cannot be changed from the UI.
+
+## Note actions
+
+Right-click a row in the note list (or select it and press `Shift+F10` or the
+`Menu` key) to open a themed context menu at the pointer. It flips and clamps
+to stay inside the window. On an active note the menu offers **Pin** /
+**Unpin**, **Rename…**, **Duplicate**, **Move to folder…** and **Move to
+Trash**; the folder chooser lists Inbox and every folder. In Trash it offers
+**Restore** and **Delete forever…**.
+
+**Rename** opens a modal with the current title prefilled and keeps the same
+file id. A frontmatter `title` is updated when present, otherwise the first
+heading is. **Duplicate** copies the note bytes and tags into the same folder
+under a fresh id and picks the first free title suffix: `<title> copy`,
+`<title> copy 2`, and so on. A trailing ` copy` / ` copy N` is replaced, pins
+are not copied, and the new copy is selected after the list refreshes.
+
+**Delete forever…** always opens a confirmation dialog naming the note.
+Closing the menu is not a confirmation.
 
 ## Bar / IPC
 
@@ -831,6 +851,7 @@ $S draft discard <id>                      # delete <note>.draft, keep the note
 $S create [--folder F] [--title T] [--content-stdin]
 $S create --template <meeting|daily|project|tasks> [--folder F]
 $S rename <id> --title "New title"
+$S duplicate <id>                          # same folder, "<title> copy" title
 $S move <id> --folder "Work/Projects"
 $S pin <id>; $S trash <id>; $S restore <id>; $S delete <id>
 $S empty-trash

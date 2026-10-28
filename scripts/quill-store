@@ -1357,6 +1357,84 @@ def rewrite_title(content: str, title: str) -> str:
     return prefix + content
 
 
+COPY_SUFFIX_RE = re.compile(r"\s+copy(?:\s+\d+)?$", re.IGNORECASE)
+
+
+def copy_title(base: str, used: set[str]) -> str:
+    """Return the next unused "<base> copy" / "<base> copy N" title."""
+    stem = COPY_SUFFIX_RE.sub("", str(base or "").strip()).strip() or "Untitled"
+    counter = 1
+    while True:
+        title = f"{stem} copy" if counter == 1 else f"{stem} copy {counter}"
+        if title.casefold() not in used:
+            return title
+        counter += 1
+
+
+def command_duplicate(args) -> dict:
+    ensure_store()
+    identifier = safe_relative(args.id)
+    with locked():
+        source = note_path(identifier)
+        if not source.is_file():
+            trashed = note_path(identifier, trashed=True)
+            if trashed.is_file():
+                raise StoreError(
+                    f"note is in Trash: {identifier} (restore it before duplicating)")
+            raise StoreError(f"note not found: {identifier}")
+        try:
+            source_stat = source.stat()
+        except OSError as error:
+            raise StoreError(f"could not read the note: {error}") from error
+        if source_stat.st_size > MAX_NOTE_BYTES:
+            raise StoreError(f"note exceeds {MAX_NOTE_BYTES} bytes")
+        try:
+            data = source.read_bytes()
+        except OSError as error:
+            raise StoreError(f"could not read the note: {error}") from error
+        if len(data) > MAX_NOTE_BYTES:
+            raise StoreError(f"note exceeds {MAX_NOTE_BYTES} bytes")
+        content = data.decode("utf-8", errors="replace")
+        folder_path = source.parent.relative_to(NOTES)
+        folder = "" if str(folder_path) == "." else folder_path.as_posix()
+        conn = index_connect()
+        try:
+            sync_index(conn)
+            used = {
+                str(row[0]).casefold()
+                for row in conn.execute(
+                    "SELECT title FROM notes WHERE folder=? AND trashed=0", (folder,)
+                ).fetchall()
+            }
+            base, _snippet = title_and_snippet(content)
+            title = copy_title(base, used)
+            updated = rewrite_title(content, title)
+            try:
+                encoded = normalize_newlines(updated, detect_newline(content)).encode("utf-8")
+            except UnicodeEncodeError as error:
+                raise StoreError("note content is not valid UTF-8") from error
+            if len(encoded) > MAX_NOTE_BYTES:
+                raise StoreError(f"note exceeds {MAX_NOTE_BYTES} bytes")
+            target_dir = NOTES / folder_path
+            target_dir.mkdir(parents=True, exist_ok=True)
+            new_id = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}.md"
+            target = target_dir / new_id
+            while target.exists():
+                new_id = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}.md"
+                target = target_dir / new_id
+            atomic_write(target, encoded)
+            index_file(conn, target, False, pinned_set())
+            resolve_links(conn)
+            conn.commit()
+        finally:
+            conn.close()
+        stat = target.stat()
+    return {
+        "id": target.relative_to(NOTES).as_posix(),
+        "modified": int(stat.st_mtime * 1000),
+    }
+
+
 def command_rename(args) -> dict:
     ensure_store()
     identifier = safe_relative(args.id)
@@ -2447,6 +2525,7 @@ def command_stats(_args) -> dict:
 MUTATING_COMMANDS = {
     "write",
     "create",
+    "duplicate",
     "rename",
     "move",
     "trash",
@@ -2528,6 +2607,10 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--template", choices=list(TEMPLATES), default=None,
                         help="start from a built-in template (ignores --title)")
     create.set_defaults(func=command_create)
+
+    duplicate = sub.add_parser("duplicate")
+    duplicate.add_argument("id")
+    duplicate.set_defaults(func=command_duplicate)
 
     rename = sub.add_parser("rename")
     rename.add_argument("id")

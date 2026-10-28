@@ -83,6 +83,7 @@ function isMutatingArgs(args) {
   var mutating = {
     "write": 1,
     "create": 1,
+    "duplicate": 1,
     "rename": 1,
     "move": 1,
     "trash": 1,

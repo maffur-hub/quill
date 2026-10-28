@@ -95,6 +95,11 @@ Item {
   property bool pendingFocusEditor: false
   property bool pendingCaretToEnd: false
   property bool pendingDetach: false
+  property var pendingNoteAction: null
+  property string renameTargetId: ""
+  property string renameNoteText: ""
+  property string deleteNoteTargetId: ""
+  property string deleteNoteTargetTitle: ""
   property int saveSeq: 0
   // Last content written per note id. A save whose bytes equal this is a
   // no-op and must not wake the Joplin sync.
@@ -613,6 +618,28 @@ Item {
     }
   }
 
+  // Run a note action only after the selected buffer has been written. A
+  // backend command that reads the file (duplicate, rename, move) must not
+  // race the asynchronous temp-file save that flushSave() starts.
+  function afterSave(id, action) {
+    var note = findAny(id)
+    if (!note || note.trashed) return
+    if (id === selectedId && dirty && loaded && !tooLarge) {
+      if (!writesAllowed) {
+        statusText = WritableGuard.refusalMessage()
+        return
+      }
+      if (diskChangePending) {
+        statusText = "Note changed on disk — choose Reload or Keep mine"
+        return
+      }
+      pendingNoteAction = { id: String(id), run: action }
+      flushSave()
+      return
+    }
+    action()
+  }
+
   function flushSave() {
     saveTimer.stop()
     if (!root.writesAllowed) {
@@ -660,6 +687,10 @@ Item {
       onError: function(message) {
         if (root.inFlightSaveText === savedText) root.inFlightSaveText = ""
         root.pendingEditorOpen = false
+        if (root.pendingNoteAction
+            && String(root.pendingNoteAction.id) === String(noteId)) {
+          root.pendingNoteAction = null
+        }
         if (noteId === root.selectedId) {
           root.saveState = "Save failed"
           root.dirty = true
@@ -675,6 +706,9 @@ Item {
     view.destroy()
     if (inFlightSaveText === failedText) inFlightSaveText = ""
     pendingEditorOpen = false
+    if (pendingNoteAction && String(pendingNoteAction.id) === String(noteId)) {
+      pendingNoteAction = null
+    }
     if (noteId === root.selectedId) {
       saveState = "Save failed"
       dirty = true
@@ -718,6 +752,12 @@ Item {
     }
     refreshTimer.restart()
     if (changed) notifyJoplinSync()
+    if (pendingNoteAction && String(pendingNoteAction.id) === String(noteId)
+        && (noteId !== selectedId || !dirty)) {
+      var pending = pendingNoteAction
+      pendingNoteAction = null
+      if (pending.run) pending.run()
+    }
     if (pendingDetach && !dirty && noteId === selectedId) launchDetachedWindow()
     // An editor launch requested while dirty waits for a successful save of
     // the current buffer. A newer edit leaves the flag set for its own save.
@@ -864,7 +904,7 @@ Item {
     root.applyExternalContent(value)
   }
 
-  function applyExternalContent(content) {
+  function applyExternalContent(content, modified, message) {
     if (!root.loaded || root.loadingNote || root.tooLarge || root.selectedId === "") return
     var id = root.selectedId
     var value = String(content === undefined || content === null ? "" : content)
@@ -879,10 +919,10 @@ Item {
     root.editVersion = 0
     root.diskChangePending = false
     root.diskChangeText = ""
-    root.loadedModified = Date.now()
+    root.loadedModified = Number(modified || Date.now())
     // A clean external reload is a saved state: there is nothing to write.
     root.saveState = "Saved " + Qt.formatTime(new Date(root.loadedModified), "HH:mm")
-    root.statusText = "Reloaded from disk"
+    root.statusText = message || "Reloaded from disk"
     saveTimer.stop()
     draftTimer.stop()
     draftWriter.drop(root.draftPath(id))
@@ -1751,6 +1791,195 @@ Item {
     })
   }
 
+  function setPinnedNote(id) {
+    var note = findAny(id)
+    if (!note || note.trashed) return
+    enqueue({
+      args: ["pin", id],
+      silent: true,
+      onSuccess: function(result) {
+        root.statusText = result.pinned ? "Pinned" : "Unpinned"
+        root.refreshAll()
+      },
+      onError: function(message) { root.statusText = message }
+    })
+  }
+
+  function beginRenameNote(id) {
+    var note = findAny(id)
+    if (!note || note.trashed) return
+    root.renameTargetId = String(id)
+    root.renameNoteText = String(note.title || "Untitled")
+    renameNotePopup.open()
+  }
+
+  function confirmRenameNote() {
+    var id = root.renameTargetId
+    var title = String(root.renameNoteText || "").replace(/\s+/g, " ").trim()
+    if (id === "" || title === "") return
+    root.renameTargetId = ""
+    renameNotePopup.close()
+    root.afterSave(id, function() {
+      enqueue({
+        args: ["rename", id, "--title", title],
+        silent: true,
+        onSuccess: function(result) {
+          root.pendingSelectId = String(result.id || id)
+          root.statusText = "Renamed"
+          root.refreshAll()
+          root.reloadRenamedNote(id)
+        },
+        onError: function(message) { root.statusText = message }
+      })
+    })
+  }
+
+  // Rename rewrites the title on disk. Reload it into the open editor at once,
+  // otherwise the next keystroke autosaves the old title back over it.
+  function reloadRenamedNote(id) {
+    if (id !== root.selectedId) return
+    enqueue({
+      args: ["read", id],
+      silent: true,
+      onSuccess: function(result) {
+        if (id !== root.selectedId || !root.loaded || root.loadingNote
+            || root.tooLarge) return
+        var content = String(result.content || "")
+        if (root.dirty || root.saveState === "Saving…") {
+          root.diskChangePending = true
+          root.diskChangeText = content
+          root.statusText = "Note changed on disk"
+          return
+        }
+        root.applyExternalContent(content, result.modified, "Renamed")
+      },
+      onError: function(message) { root.statusText = message }
+    })
+  }
+
+  function duplicateNote(id) {
+    var note = findAny(id)
+    if (!note || note.trashed) return
+    var folder = String(note.folder || "")
+    var targetCategory = folder === "" ? "all" : "folder:" + folder
+    root.afterSave(id, function() {
+      enqueue({
+        args: ["duplicate", id],
+        silent: true,
+        onSuccess: function(result) {
+          var newId = String(result.id || "")
+          if (root.category !== "all" && root.category !== targetCategory) {
+            root.category = targetCategory
+          }
+          root.pendingSelectId = newId
+          root.searchText = ""
+          root.searchResults = []
+          root.searching = false
+          if (noteList) noteList.clearSearch()
+          root.statusText = "Duplicated"
+          root.refreshAll()
+        },
+        onError: function(message) { root.statusText = message }
+      })
+    })
+  }
+
+  function moveNoteTo(id, folder) {
+    var note = findAny(id)
+    if (!note || note.trashed) return
+    var targetFolder = String(folder || "")
+    if (String(note.folder || "") === targetFolder) return
+    root.afterSave(id, function() {
+      enqueue({
+        args: ["move", id, "--folder", targetFolder],
+        silent: true,
+        onSuccess: function(result) {
+          root.pendingSelectId = String(result.id || id)
+          root.category = targetFolder === "" ? "all" : "folder:" + targetFolder
+          root.searchText = ""
+          root.searchResults = []
+          root.searching = false
+          if (noteList) noteList.clearSearch()
+          root.statusText = "Moved"
+          root.refreshAll()
+        },
+        onError: function(message) { root.statusText = message }
+      })
+    })
+  }
+
+  function trashNote(id) {
+    var note = findAny(id)
+    if (!note || note.trashed) return
+    root.afterSave(id, function() {
+      if (tableOpen && id === root.selectedId) closeTable(false)
+      enqueue({
+        args: ["trash", id],
+        silent: true,
+        onSuccess: function() {
+          if (root.selectedId === id) root.selectedId = ""
+          root.pendingSelectId = ""
+          root.statusText = "Moved to Trash"
+          root.refreshAll()
+          root.refreshTrash()
+        },
+        onError: function(message) { root.statusText = message }
+      })
+    })
+  }
+
+  function restoreNote(id) {
+    var note = findAny(id)
+    if (!note || !note.trashed) return
+    enqueue({
+      args: ["restore", id],
+      silent: true,
+      onSuccess: function(result) {
+        root.pendingSelectId = String(result.id || "")
+        root.category = "all"
+        root.statusText = "Restored"
+        root.refreshAll()
+        root.refreshTrash()
+      },
+      onError: function(message) { root.statusText = message }
+    })
+  }
+
+  function requestDeleteNote(id) {
+    var note = findAny(id)
+    if (!note || !note.trashed) return
+    root.deleteNoteTargetId = String(id)
+    root.deleteNoteTargetTitle = String(note.title || "Untitled")
+    deleteNotePopup.open()
+  }
+
+  function confirmDeleteNote() {
+    var id = root.deleteNoteTargetId
+    if (id === "") return
+    root.deleteNoteTargetId = ""
+    deleteNotePopup.close()
+    enqueue({
+      args: ["delete", id],
+      silent: true,
+      onSuccess: function() {
+        if (root.selectedId === id) root.selectedId = ""
+        root.pendingSelectId = ""
+        root.statusText = "Deleted forever"
+        root.refreshTrash()
+        root.refreshAll()
+      },
+      onError: function(message) { root.statusText = message }
+    })
+  }
+
+  function handleNoteAction(id, action) {
+    if (action === "pin") root.setPinnedNote(id)
+    else if (action === "duplicate") root.duplicateNote(id)
+    else if (action === "trash") root.trashNote(id)
+    else if (action === "restore") root.restoreNote(id)
+    else if (action === "delete-forever") root.requestDeleteNote(id)
+  }
+
   function createFolder(path) {
     enqueue({
       args: ["folder", "create", path],
@@ -2223,7 +2452,11 @@ Item {
         searching: root.searching
         showTrash: root.category === "trash"
         loading: root.loadingList
+        folderOptions: root.folderOptions
         onNoteSelected: function(id) { root.selectNote(id) }
+        onNoteActionRequested: function(id, action) { root.handleNoteAction(id, action) }
+        onNoteRenameRequested: function(id) { root.beginRenameNote(id) }
+        onNoteMoveRequested: function(id, folder) { root.moveNoteTo(id, folder) }
         onSearchQueryChanged: function(text) {
           root.searchText = text
           if (text.trim() !== "") {
@@ -2695,6 +2928,172 @@ Item {
           label: "Reset layout"
           showCheck: false
           onActivated: root.resetLayout()
+        }
+      }
+    }
+  }
+
+  // ---------------------------------------------------------- rename dialog
+  Popup {
+    id: renameNotePopup
+    objectName: "renameNotePopup"
+    parent: Overlay.overlay
+    anchors.centerIn: Overlay.overlay
+    width: Style.space(360)
+    padding: Style.space(12)
+    modal: true
+    dim: true
+    focus: true
+    closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+    onOpened: {
+      // Set the text explicitly: typing can break the initial binding, and a
+      // second rename must show the newly selected note's title.
+      renameNoteField.text = root.renameNoteText
+      renameNoteField.forceActiveFocus()
+      renameNoteField.selectAll()
+    }
+    background: BorderSurface {
+      color: Commons.Color.background
+      borderSpec: Border.controlSpec("normal", Commons.Color.foreground, Commons.Color.accent)
+      radius: Style.cornerRadius
+    }
+
+    contentItem: Column {
+      width: renameNotePopup.availableWidth
+      spacing: Style.space(10)
+
+      Text {
+        width: parent.width
+        text: "Rename note"
+        textFormat: Text.PlainText
+        color: Commons.Color.foreground
+        font.family: Style.font.family
+        font.pixelSize: Style.font.title
+        font.bold: true
+      }
+
+      TextField {
+        id: renameNoteField
+        objectName: "renameNoteField"
+        width: parent.width
+        text: root.renameNoteText
+        font.pixelSize: Style.font.bodySmall
+        onTextEdited: root.renameNoteText = text
+        onAccepted: root.confirmRenameNote()
+      }
+
+      Row {
+        width: parent.width
+        spacing: Style.space(6)
+
+        Item {
+          width: Math.max(0, parent.width - renameCancelButton.width
+            - renameConfirmButton.width - parent.spacing * 2)
+          height: 1
+        }
+
+        Button {
+          id: renameCancelButton
+          objectName: "renameCancelButton"
+          text: "Cancel"
+          fontSize: Style.font.bodySmall
+          horizontalPadding: Style.space(10)
+          verticalPadding: Style.space(5)
+          onClicked: {
+            root.renameTargetId = ""
+            renameNotePopup.close()
+          }
+        }
+        Button {
+          id: renameConfirmButton
+          objectName: "renameConfirmButton"
+          text: "Rename"
+          active: true
+          enabled: String(root.renameNoteText).trim() !== ""
+          fontSize: Style.font.bodySmall
+          horizontalPadding: Style.space(10)
+          verticalPadding: Style.space(5)
+          onClicked: root.confirmRenameNote()
+        }
+      }
+    }
+  }
+
+  // ------------------------------------------------------- delete forever
+  // Permanent deletion always goes through this modal; a menu row alone is
+  // never the confirmation.
+  Popup {
+    id: deleteNotePopup
+    objectName: "deleteNotePopup"
+    parent: Overlay.overlay
+    anchors.centerIn: Overlay.overlay
+    width: Style.space(380)
+    padding: Style.space(12)
+    modal: true
+    dim: true
+    focus: true
+    closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+    background: BorderSurface {
+      color: Commons.Color.background
+      borderSpec: Border.controlSpec("normal", Commons.Color.foreground, Commons.Color.accent)
+      radius: Style.cornerRadius
+    }
+
+    contentItem: Column {
+      width: deleteNotePopup.availableWidth
+      spacing: Style.space(10)
+
+      Text {
+        width: parent.width
+        text: "Delete note forever?"
+        textFormat: Text.PlainText
+        color: Commons.Color.foreground
+        font.family: Style.font.family
+        font.pixelSize: Style.font.title
+        font.bold: true
+      }
+
+      Text {
+        objectName: "deleteNoteTitle"
+        width: parent.width
+        text: "“" + root.deleteNoteTargetTitle + "” will be permanently deleted. This cannot be undone."
+        textFormat: Text.PlainText
+        wrapMode: Text.WordWrap
+        color: Util.alpha(Commons.Color.foreground, 0.56)
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
+      }
+
+      Row {
+        width: parent.width
+        spacing: Style.space(6)
+
+        Item {
+          width: Math.max(0, parent.width - deleteNoteCancelButton.width
+            - deleteNoteConfirmButton.width - parent.spacing * 2)
+          height: 1
+        }
+
+        Button {
+          id: deleteNoteCancelButton
+          objectName: "deleteNoteCancelButton"
+          text: "Cancel"
+          fontSize: Style.font.bodySmall
+          horizontalPadding: Style.space(10)
+          verticalPadding: Style.space(5)
+          onClicked: {
+            root.deleteNoteTargetId = ""
+            deleteNotePopup.close()
+          }
+        }
+        Button {
+          id: deleteNoteConfirmButton
+          objectName: "deleteNoteConfirmButton"
+          text: "Delete forever"
+          fontSize: Style.font.bodySmall
+          horizontalPadding: Style.space(10)
+          verticalPadding: Style.space(5)
+          onClicked: root.confirmDeleteNote()
         }
       }
     }
