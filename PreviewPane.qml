@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls
+import Quickshell
 import qs.Commons
 import qs.Commons as Commons
 import "ImageSizing.js" as ImageSizing
@@ -13,15 +14,16 @@ import "MarkdownFormat.js" as MarkdownFormat
 // the backend first.
 //
 // Qt's Text.MarkdownText does not draw images or real tables, so the preview
-// is split into blocks: contiguous text lines go to a MarkdownText Text,
-// image-only lines become Image blocks, and GFM tables become interactive
-// table blocks. Everything else (headings, wiki links, tags, linkActivated)
-// still goes through MarkdownText exactly as before.
+// is split into blocks: contiguous text lines go to a read-only TextEdit so
+// they can be selected and copied, image-only lines become Image blocks, and
+// GFM tables become interactive table blocks. Headings, wiki links, tags and
+// link activation still go through Qt's Markdown renderer.
 //
 // Display maths ($$…$$ / \[…\]) becomes its own centred Image block.
-// A text block that contains inline maths switches to Text.RichText with
-// MathText.js's HTML, because MarkdownText pins images to the text baseline
-// and makes inline formulas float upwards.
+// A text block that contains inline maths, Quill formatting or links switches
+// to RichText with MathText.js's HTML, because MarkdownText pins images to the
+// text baseline and makes inline formulas float upwards, and TextEdit has no
+// link colour of its own.
 //
 // Image-only lines and tables keep their source line numbers so edits can
 // target exactly the block they came from, even when the same content appears
@@ -48,6 +50,35 @@ Item {
   signal tableActivated(int startLine, int endLine)
   // line is an absolute note line: task block line + lineOffset.
   signal taskToggled(int line)
+  // Plain text copied from the current preview selection.
+  signal selectionCopied(string text)
+
+  // Rendered prose and task labels are read-only TextEdits so they can be
+  // selected with the mouse. Qt 6's plain Text item has no selection API.
+  property string previewSelection: ""
+  property string lastCopiedText: ""
+  // The block that owns previewSelection, so moving to another block can
+  // clear the old highlight without late selectedTextChanged signals
+  // resurrecting stale text.
+  property var selectionOwner: null
+  // Overridable in offscreen probes; production writes to the Wayland
+  // clipboard without a shell.
+  property var clipboardWriter: function(text) {
+    Quickshell.execDetached(["wl-copy", "--", String(text)])
+  }
+
+  // True only while focus is inside this preview. The library and detached
+  // window share one PreviewPane each, so Ctrl+C reaches the editor untouched
+  // whenever the editor owns focus.
+  readonly property bool hasPreviewFocus: {
+    var win = Window.window
+    var item = win ? win.activeFocusItem : null
+    while (item) {
+      if (item === root) return true
+      item = item.parent
+    }
+    return false
+  }
 
   readonly property var blocks: buildBlocks(markdown)
 
@@ -64,6 +95,56 @@ Item {
 
   function maxContentWidth() {
     return Math.max(60, Math.floor(flick.width) - 2)
+  }
+
+  // A selectable block reports its selection here. Empty text for the owning
+  // block means the highlight was cleared; a non-empty value from a new block
+  // drops the previous block's highlight first.
+  function trackSelection(source, text) {
+    var value = String(text === undefined || text === null ? "" : text)
+    if (value.length === 0) {
+      if (selectionOwner === source) {
+        selectionOwner = null
+        previewSelection = ""
+      }
+      return
+    }
+    if (selectionOwner !== source) {
+      var previous = selectionOwner
+      selectionOwner = null
+      if (previous && typeof previous.deselect === "function") previous.deselect()
+    }
+    selectionOwner = source
+    previewSelection = value
+  }
+
+  function clearPreviewSelection() {
+    var previous = selectionOwner
+    selectionOwner = null
+    previewSelection = ""
+    if (previous && typeof previous.deselect === "function") previous.deselect()
+  }
+
+  function copySelection() {
+    var value = String(previewSelection || "")
+    if (value.length === 0) return false
+    clipboardWriter(value)
+    lastCopiedText = value
+    selectionCopied(value)
+    return true
+  }
+
+  // TextEdit paints anchors with its own default blue, so link-bearing blocks
+  // go through the HTML converter and get the theme accent inline.
+  function hasMarkdownLink(value) {
+    var text = String(value === undefined || value === null ? "" : value)
+    return /\[[^\]]*\]\([^)]*\)/.test(text) || /<a\s[^>]*href=/i.test(text)
+  }
+
+  function previewHtml(value) {
+    var html = MathText.toHtml(String(value === undefined || value === null ? "" : value),
+      root.mathResolver, MathSyntax)
+    return html.replace(/<a href="/g, '<a style="color:' + String(Commons.Color.accent) + '" href="')
   }
 
   // Split markdown into text / image / table / maths / task blocks. Display
@@ -299,6 +380,9 @@ Item {
   }
 
   onMarkdownChanged: {
+    // The delegates are rebuilt for the new body; a selection from the old
+    // render must never be copyable, and its highlight should disappear too.
+    root.clearPreviewSelection()
     root.taskOverrides = ({})
     if (root.dragging) return
     root.overrides = ({})
@@ -330,6 +414,7 @@ Item {
 
   Flickable {
     id: flick
+    objectName: "previewFlick"
     anchors.fill: parent
     anchors.leftMargin: Style.space(14)
     anchors.rightMargin: Style.space(8)
@@ -411,7 +496,8 @@ Item {
           // maths is rendered as RichText so QML can baseline its SVGs.
           readonly property bool richText: isText
             && (MathSyntax.hasInlineMath(String(modelData.text || ""))
-              || MathText.hasFormatting(String(modelData.text || "")))
+              || MathText.hasFormatting(String(modelData.text || ""))
+              || root.hasMarkdownLink(String(modelData.text || "")))
 
           readonly property var mathResult: {
             // revision is the dependency: results arriving redraw the block.
@@ -431,8 +517,11 @@ Item {
             ? Math.max(1, Math.round(mathImage.implicitHeight * mathScale))
             : Style.space(36)
 
-          Text {
+          // TextEdit has no lineHeight property; QTextDocument's default
+          // leading replaces the 1.15 spacing the old Text block used.
+          TextEdit {
             id: textBlock
+            objectName: "previewText"
             visible: blockItem.isText
             width: blockItem.width
             text: {
@@ -440,17 +529,29 @@ Item {
               if (!blockItem.richText) return String(modelData.text || "")
               // Read revision so the HTML rebuilds when an SVG lands.
               var revision = mathService.revision
-              return MathText.toHtml(String(modelData.text || ""),
-                root.mathResolver, MathSyntax)
+              return root.previewHtml(String(modelData.text || ""))
             }
-            textFormat: blockItem.richText ? Text.RichText : Text.MarkdownText
-            wrapMode: Text.Wrap
+            textFormat: blockItem.richText ? TextEdit.RichText : TextEdit.MarkdownText
+            wrapMode: TextEdit.Wrap
             color: Commons.Color.foreground
-            linkColor: Commons.Color.accent
             font.family: Style.font.family
             font.pixelSize: Style.font.body
-            lineHeight: 1.15
-            onLinkActivated: function(link) { root.linkActivated(link) }
+            textMargin: 0
+            readOnly: true
+            selectByMouse: true
+            activeFocusOnPress: true
+            persistentSelection: false
+            cursorVisible: false
+            selectionColor: Util.alpha(Commons.Color.accent, 0.42)
+            selectedTextColor: Commons.Color.foreground
+            onSelectedTextChanged: root.trackSelection(textBlock, textBlock.selectedText)
+            onLinkActivated: function(link) {
+              // A link click can leave a word selected without emitting
+              // selectedTextChanged; never let that become a stale copy source.
+              textBlock.deselect()
+              root.trackSelection(textBlock, "")
+              root.linkActivated(link)
+            }
           }
 
           // ------------------------------------------------------- tasks
@@ -482,6 +583,9 @@ Item {
                 readonly property real boxSize: Style.space(13)
                 readonly property real boxY: Math.max(0,
                   (Math.max(boxSize, Math.ceil(Style.font.body * 1.15)) - boxSize) / 2)
+                readonly property string labelText: blockItem.isTasks
+                  ? String(modelData.content || "") : ""
+                readonly property bool labelRich: root.hasMarkdownLink(labelText)
 
                 Rectangle {
                   id: taskBox
@@ -509,20 +613,33 @@ Item {
                   }
                 }
 
-                Text {
+                TextEdit {
                   id: taskLabel
                   objectName: "previewTaskLabel"
                   x: taskRow.indent + taskRow.boxSize + Style.space(8)
                   width: Math.max(0, taskRow.width - x)
-                  text: blockItem.isTasks ? String(modelData.content || "") : ""
-                  textFormat: Text.MarkdownText
-                  wrapMode: Text.Wrap
+                  text: taskRow.labelRich
+                    ? root.previewHtml(taskRow.labelText) : taskRow.labelText
+                  textFormat: taskRow.labelRich
+                    ? TextEdit.RichText : TextEdit.MarkdownText
+                  wrapMode: TextEdit.Wrap
                   color: Commons.Color.foreground
-                  linkColor: Commons.Color.accent
                   font.family: Style.font.family
                   font.pixelSize: Style.font.body
-                  lineHeight: 1.15
-                  onLinkActivated: function(link) { root.linkActivated(link) }
+                  textMargin: 0
+                  readOnly: true
+                  selectByMouse: true
+                  activeFocusOnPress: true
+                  persistentSelection: false
+                  cursorVisible: false
+                  selectionColor: Util.alpha(Commons.Color.accent, 0.42)
+                  selectedTextColor: Commons.Color.foreground
+                  onSelectedTextChanged: root.trackSelection(taskLabel, taskLabel.selectedText)
+                  onLinkActivated: function(link) {
+                    taskLabel.deselect()
+                    root.trackSelection(taskLabel, "")
+                    root.linkActivated(link)
+                  }
                 }
 
                 MouseArea {
@@ -1075,6 +1192,15 @@ Item {
         }
       }
     }
+  }
+
+  // Only active while a preview block owns focus, so the editor keeps its own
+  // Ctrl+C copy when the caret is there.
+  Shortcut {
+    objectName: "previewCopyShortcut"
+    sequence: "Ctrl+C"
+    enabled: root.hasPreviewFocus && root.previewSelection.length > 0
+    onActivated: root.copySelection()
   }
 
   function openImage(source) {

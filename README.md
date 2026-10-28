@@ -141,6 +141,7 @@ Draft writes never wake the Joplin sync. Only the normal note save does.
 | `Esc` | Clear search, then close |
 | `Tab` | Insert two spaces |
 | `Ctrl+V` / `Ctrl+Shift+V` | Paste text, or store a clipboard image and insert it |
+| `Ctrl+C` | Copy selected preview text (when the preview has focus) |
 
 Split is the default when the library is at least 1000 px wide; narrow layouts
 open in Edit mode. The mode choice is remembered for the session once you click
@@ -421,6 +422,15 @@ checkboxes in the preview. Clicking a checkbox flips `[ ]` ↔ `[x]` in the note
 and the normal autosave mirrors the change to Joplin; read-only notes show the
 state without accepting clicks, and task-looking lines inside fenced code
 blocks stay as plain code.
+
+Select prose or a task label with the mouse, then press `Ctrl+C` to copy it to
+the Wayland clipboard. Selections are per rendered block: a prose block usually
+contains several paragraphs, and each task label is its own block. Moving the
+selection to another block clears the previous highlight, and `Ctrl+C` always
+belongs to the editor while the editor has focus. Table cells are not selected
+in the preview; click the table to open the grid, where cells can be selected,
+edited and copied. Dragging over prose selects text rather than scrolling the
+preview; use the wheel or trackpad to scroll.
 
 ### Grid
 
