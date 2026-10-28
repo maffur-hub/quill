@@ -92,14 +92,14 @@ TextArea {
   readonly property var contextMenuRef: editorMenu
   T.ContextMenu.menu: null
 
-  // A replacement edit becomes one native remove plus one native insert. Keep
-  // the operation count so the toolbar's Undo/Redo can replay the whole
-  // formatting action as a unit instead of stopping half-way.
+  // A replacement edit becomes one or more native remove/insert commands.
+  // Groups record how many commands a format/spell action issued so Undo can
+  // replay the action as a unit. A group stays open when the user types after
+  // it, so one Ctrl+Z removes the typing first and the next removes the format
+  // (instead of native undo landing half-way through a replacement).
   property bool suppressFormatHistory: false
-  property int formatUndoSteps: 1
-  property int formatRedoSteps: 1
-  property bool formatUndoPending: false
-  property bool formatRedoPending: false
+  property var formatUndoGroups: []
+  property var formatRedoGroups: []
 
   readonly property string pasteHelperPath: {
     var cut = storePath.lastIndexOf("/")
@@ -319,9 +319,12 @@ TextArea {
       spellTimer.restart()
       return false
     }
-    root.remove(start, end)
-    root.insert(start, replacement)
-    root.cursorPosition = start + replacement.length
+    var edits = MarkdownFormat.minimalEdits(root.text,
+      [{ start: start, end: end, text: replacement }])
+    var caret = start + replacement.length
+    root.applyFormatEdits(edits, root.selectionStart, root.selectionEnd, root.cursorPosition,
+      caret, caret, caret)
+    root.cursorPosition = caret
     root.spellSnapshot = ""
     root.spellIssues = []
     root.spellRevision += 1
@@ -716,6 +719,7 @@ TextArea {
     }
     var selection = text.slice(start, end)
     text = text.slice(0, start) + marker + selection + marker + text.slice(end)
+    root.resetFormatHistory()
     // Keep the original text selected between the new markers so a second
     // Ctrl+B/Ctrl+I (or typing) applies to the same span.
     select(start + marker.length, end + marker.length)
@@ -723,6 +727,176 @@ TextArea {
 
   function currentLinkURL() {
     return MarkdownFormat.currentLinkURL(root.text, root.selectionStart, root.selectionEnd)
+  }
+
+  // --------------------------------------------------------- format history
+  // Hashes keep the fast path cheap: length plus a djb2-xor hash tells "did the
+  // native undo land on the state this group recorded?". Each group also keeps
+  // the before/after snapshots purely as a content-safety fallback for cases
+  // where Qt merges or trims native commands.
+  function formatTextHash(value) {
+    var source = String(value === undefined || value === null ? "" : value)
+    var hash = 5381
+    for (var i = 0; i < source.length; i++) {
+      hash = (((hash * 33) >>> 0) ^ source.charCodeAt(i)) >>> 0
+    }
+    return hash
+  }
+
+  function formatGroupMatches(group, which, value) {
+    if (!group) return false
+    var source = String(value === undefined || value === null ? "" : value)
+    if (which === "before") {
+      return group.beforeLength === source.length
+        && group.beforeHash === root.formatTextHash(source)
+    }
+    return group.afterLength === source.length
+      && group.afterHash === root.formatTextHash(source)
+  }
+
+  function pushFormatGroup(steps, beforeText, beforeSelectionStart, beforeSelectionEnd,
+    beforeCursor, afterText, afterSelectionStart, afterSelectionEnd, afterCursor) {
+    if (steps <= 0 || beforeText === afterText) return false
+    var group = {
+      steps: Math.max(1, Math.round(steps)),
+      // The hashes detect "did the native stack land on this state?", while the
+      // full snapshots are the content-safety fallback when Qt merges or trims
+      // commands (for example when marker inserts coalesce with typing).
+      beforeText: String(beforeText),
+      afterText: String(afterText),
+      beforeHash: root.formatTextHash(beforeText),
+      beforeLength: String(beforeText).length,
+      afterHash: root.formatTextHash(afterText),
+      afterLength: String(afterText).length,
+      beforeSelectionStart: beforeSelectionStart,
+      beforeSelectionEnd: beforeSelectionEnd,
+      beforeCursor: beforeCursor,
+      afterSelectionStart: afterSelectionStart,
+      afterSelectionEnd: afterSelectionEnd,
+      afterCursor: afterCursor,
+      catchup: false
+    }
+    var undo = (root.formatUndoGroups || []).slice()
+    undo.push(group)
+    root.formatUndoGroups = undo
+    root.formatRedoGroups = []
+    return true
+  }
+
+  // Build the document the edits should produce without touching the editor.
+  // Used to skip no-op plans before any undo command is spent on them.
+  function formatResultText(source, ordered) {
+    var result = source
+    for (var i = 0; i < ordered.length; i++) {
+      var edit = ordered[i]
+      result = result.slice(0, edit.start) + edit.text + result.slice(edit.end)
+    }
+    return result
+  }
+
+  // One space inserted and removed mid-document. Qt coalesces adjacent typing
+  // commands, so without this barrier a marker inserted at the start of freshly
+  // typed text merges with the typing undo command and a format undo would
+  // swallow the typing too. The two edits are real native undo steps.
+  function applyFormatBarrier(source) {
+    var value = String(source)
+    var position = Math.floor(value.length / 2)
+    if (position >= value.length) position = Math.max(0, value.length - 1)
+    // Never split a surrogate pair; a low surrogate must stay with its high one.
+    while (position > 0) {
+      var code = value.charCodeAt(position)
+      if (code < 0xDC00 || code > 0xDFFF) break
+      position -= 1
+    }
+    root.insert(position, " ")
+    root.remove(position, position + 1)
+    return 2
+  }
+
+  // Apply minimalEdits through TextEdit.remove()/insert() so only the edited
+  // span is touched. Each call becomes one or more native undo commands; the
+  // group records how many so the whole action can be replayed later.
+  function applyFormatEdits(edits, beforeSelectionStart, beforeSelectionEnd, beforeCursor,
+    afterSelectionStart, afterSelectionEnd, afterCursor) {
+    var beforeText = root.text
+    var ordered = (edits || []).slice().sort(function(a, b) {
+      if (b.start !== a.start) return b.start - a.start
+      return b.end - a.end
+    })
+    // An edit list that reproduces the current text is a no-op: leave the
+    // native undo stack (and the redo branch) untouched.
+    if (root.formatResultText(beforeText, ordered) === beforeText) return 0
+    var steps = 0
+    root.suppressFormatHistory = true
+    // The barrier must be part of the suppressed operation: its temporary
+    // text change must not mark the group as catchup or clear the redo stack.
+    steps += root.applyFormatBarrier(beforeText)
+    for (var i = 0; i < ordered.length; i++) {
+      var edit = ordered[i]
+      // TextEdit.remove(start, end) takes an end offset, not a length.
+      if (edit.end > edit.start) {
+        root.remove(edit.start, edit.end)
+        steps += 1
+      }
+      if (edit.text !== "") {
+        root.insert(edit.start, edit.text)
+        steps += 1
+      }
+    }
+    root.suppressFormatHistory = false
+    root.pushFormatGroup(steps, beforeText, beforeSelectionStart, beforeSelectionEnd,
+      beforeCursor, root.text, afterSelectionStart, afterSelectionEnd, afterCursor)
+    return steps
+  }
+
+  function resetFormatHistory() {
+    root.formatUndoGroups = []
+    root.formatRedoGroups = []
+  }
+
+  function restoreFormatSelection(group, which) {
+    if (!group) return
+    if (which === "before") {
+      root.select(group.beforeSelectionStart, group.beforeSelectionEnd)
+      if (group.beforeSelectionStart === group.beforeSelectionEnd) {
+        root.cursorPosition = group.beforeCursor
+      }
+    } else {
+      root.select(group.afterSelectionStart, group.afterSelectionEnd)
+      if (group.afterSelectionStart === group.afterSelectionEnd) {
+        root.cursorPosition = group.afterCursor
+      }
+    }
+  }
+
+  // Replay exactly the recorded command count. Qt can merge adjacent commands,
+  // so if the native stack does not land on the snapshot the document is
+  // restored from the stored text instead. Content safety wins over preserving
+  // native history in that rare case.
+  function runFormatUndo(group) {
+    if (!group) return false
+    root.suppressFormatHistory = true
+    for (var i = 0; i < group.steps; i++) root.undo()
+    var restored = String(root.text) === String(group.beforeText)
+    if (!restored && group.beforeText !== undefined) {
+      root.text = group.beforeText
+      restored = true
+    }
+    root.suppressFormatHistory = false
+    return restored
+  }
+
+  function runFormatRedo(group) {
+    if (!group) return false
+    root.suppressFormatHistory = true
+    for (var i = 0; i < group.steps; i++) root.redo()
+    var restored = String(root.text) === String(group.afterText)
+    if (!restored && group.afterText !== undefined) {
+      root.text = group.afterText
+      restored = true
+    }
+    root.suppressFormatHistory = false
+    return restored
   }
 
   // Apply the pure formatter's minimal edit. The edit descriptor is derived by
@@ -746,55 +920,76 @@ TextArea {
       root.formatRejected(plan && plan.error ? plan.error : "Cannot apply formatting")
       return false
     }
-    var edits = (plan.edits || []).slice().sort(function(a, b) { return b.start - a.start })
-    var steps = 0
-    for (var e = 0; e < edits.length; e++) {
-      if (edits[e].end > edits[e].start) steps += 1
-      if (edits[e].text !== "") steps += 1
-    }
-    root.suppressFormatHistory = true
-    for (var i = 0; i < edits.length; i++) {
-      var edit = edits[i]
-      // TextEdit.remove(start, end) takes an end offset, not a length.
-      if (edit.end > edit.start) root.remove(edit.start, edit.end)
-      if (edit.text !== "") root.insert(edit.start, edit.text)
-    }
-    root.suppressFormatHistory = false
-    root.formatUndoSteps = Math.max(1, steps)
-    root.formatRedoSteps = Math.max(1, steps)
-    root.formatUndoPending = steps > 0
-    root.formatRedoPending = false
+    var edits = MarkdownFormat.minimalEdits(root.text, plan.edits || [])
+    root.applyFormatEdits(edits, root.selectionStart, root.selectionEnd, root.cursorPosition,
+      plan.selectionStart, plan.selectionEnd, plan.selectionEnd)
     root.select(plan.selectionStart, plan.selectionEnd)
     root.forceActiveFocus()
     return true
   }
 
   function undoFormat() {
-    if (root.formatUndoPending && root.formatUndoSteps > 0) {
-      root.suppressFormatHistory = true
-      for (var i = 0; i < root.formatUndoSteps; i++) root.undo()
-      root.suppressFormatHistory = false
-      root.formatUndoPending = false
-      root.formatRedoPending = true
+    var undo = root.formatUndoGroups || []
+    if (undo.length === 0) {
+      root.undo()
       return
     }
-    root.undo()
-    root.formatUndoPending = false
-    root.formatRedoPending = false
+    var group = undo[undo.length - 1]
+    // Typing after the format belongs to the same undo story: the first
+    // Ctrl+Z removes that typing, the next removes the format itself. Never
+    // drop the group here, or native undo lands half-way through it.
+    if (group.catchup && !root.formatGroupMatches(group, "after", root.text)) {
+      root.suppressFormatHistory = true
+      root.undo()
+      root.suppressFormatHistory = false
+      if (root.formatGroupMatches(group, "after", root.text)) group.catchup = false
+      return
+    }
+    if (!root.formatGroupMatches(group, "after", root.text)) {
+      // Stale history (external edit, Qt trimming its undo stack): one native
+      // undo is the only safe action.
+      root.suppressFormatHistory = true
+      root.undo()
+      root.suppressFormatHistory = false
+      return
+    }
+    group.catchup = false
+    if (!root.runFormatUndo(group)) {
+      // The native stack did not reach the recorded state. Keep the group so a
+      // later press can continue stepping back one command at a time.
+      group.catchup = true
+      return
+    }
+    var nextUndo = undo.slice()
+    nextUndo.pop()
+    var redo = (root.formatRedoGroups || []).slice()
+    redo.push(group)
+    root.formatUndoGroups = nextUndo
+    root.formatRedoGroups = redo
+    root.restoreFormatSelection(group, "before")
   }
 
   function redoFormat() {
-    if (root.formatRedoPending && root.formatRedoSteps > 0) {
-      root.suppressFormatHistory = true
-      for (var i = 0; i < root.formatRedoSteps; i++) root.redo()
-      root.suppressFormatHistory = false
-      root.formatRedoPending = false
-      root.formatUndoPending = true
+    var redo = root.formatRedoGroups || []
+    if (redo.length === 0) {
+      root.redo()
       return
     }
-    root.redo()
-    root.formatRedoPending = false
-    root.formatUndoPending = false
+    var group = redo[redo.length - 1]
+    if (!root.formatGroupMatches(group, "before", root.text)) {
+      root.suppressFormatHistory = true
+      root.redo()
+      root.suppressFormatHistory = false
+      return
+    }
+    if (!root.runFormatRedo(group)) return
+    var nextRedo = redo.slice()
+    nextRedo.pop()
+    var undo = (root.formatUndoGroups || []).slice()
+    undo.push(group)
+    root.formatUndoGroups = undo
+    root.formatRedoGroups = nextRedo
+    root.restoreFormatSelection(group, "after")
   }
 
   // Date/time are computed at menu click time. MarkdownFormat.planDate accepts
@@ -2235,8 +2430,14 @@ TextArea {
     }
     spellTimer.restart()
     if (root.suppressFormatHistory) return
-    root.formatUndoPending = false
-    root.formatRedoPending = false
+    // Typing after a format keeps that group on the stack but marks it as a
+    // catch-up boundary. Undo removes the typing first, then the format.
+    var undo = root.formatUndoGroups || []
+    if (undo.length > 0) undo[undo.length - 1].catchup = true
+    // Any fresh edit invalidates the redo branch.
+    if (root.formatRedoGroups && root.formatRedoGroups.length > 0) {
+      root.formatRedoGroups = []
+    }
   }
 
   onWidthChanged: {
@@ -2368,9 +2569,22 @@ TextArea {
     }
   }
 
+  // Right-click moves the caret to the click, except inside a non-empty
+  // selection where the selection is kept for Bold/Italic/Delete. Never
+  // creates a selection or clears an existing one.
+  function rightClickAt(x, y) {
+    root.spellClickPoint = Qt.point(x, y)
+    var position = root.positionAt(x, y)
+    var selStart = Math.min(root.selectionStart, root.selectionEnd)
+    var selEnd = Math.max(root.selectionStart, root.selectionEnd)
+    var insideSelection = selEnd > selStart
+      && position >= selStart && position <= selEnd
+    if (!insideSelection) root.cursorPosition = position
+  }
+
   onPressed: function(mouse) {
     if (mouse.button === Qt.RightButton) {
-      root.spellClickPoint = Qt.point(mouse.x, mouse.y)
+      root.rightClickAt(mouse.x, mouse.y)
       editorMenu.showAt(mouse.x, mouse.y)
     }
   }

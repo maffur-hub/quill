@@ -167,6 +167,76 @@ function diffEdit(oldText, newText) {
   }]
 }
 
+// Split a plan's coarse replacement into the least destructive native edits.
+//
+// The formatter describes a toggle as one replacement (replace "hello" with
+// "**hello**"). Applying that literally removes the selected text and inserts
+// it again, so a native undo that lands between the two commands restores a
+// hole. Whenever the new text still contains the old segment unchanged, emit
+// pure inserts around it instead; when the old text contains the new segment,
+// emit pure deletes. Only a genuinely different middle becomes a small
+// remove+insert. The returned edits are in the original text's coordinates.
+function minimalEdits(oldText, edits) {
+  var source = textOf(oldText)
+  var input = edits || []
+  var output = []
+  for (var i = 0; i < input.length; i++) {
+    var edit = input[i] || {}
+    var start = clamp(Math.floor(Number(edit.start) || 0), 0, source.length)
+    var end = clamp(Math.floor(Number(edit.end) || start), start, source.length)
+    var next = textOf(edit.text)
+    var original = source.slice(start, end)
+
+    if (start === end) {
+      if (next !== "") output.push({ start: start, end: start, text: next })
+      continue
+    }
+    if (next === "") {
+      output.push({ start: start, end: end, text: "" })
+      continue
+    }
+    if (original === next) continue
+
+    // The old segment survives inside the replacement: insert only what was
+    // added, leaving the original characters untouched.
+    var at = original === "" ? -1 : next.indexOf(original)
+    if (at >= 0 && next.indexOf(original, at + 1) < 0) {
+      if (at > 0) output.push({ start: start, end: start, text: next.slice(0, at) })
+      var tail = at + original.length
+      if (tail < next.length) output.push({ start: end, end: end, text: next.slice(tail) })
+      continue
+    }
+
+    // The replacement survives inside the old segment (for example removing
+    // ** from **hello**): delete only the characters that disappear.
+    var keptAt = next === "" ? -1 : original.indexOf(next)
+    if (keptAt >= 0 && original.indexOf(next, keptAt + 1) < 0) {
+      if (keptAt > 0) output.push({ start: start, end: start + keptAt, text: "" })
+      var keptEnd = keptAt + next.length
+      if (keptEnd < original.length) output.push({ start: start + keptEnd, end: end, text: "" })
+      continue
+    }
+
+    // Genuinely different text: keep the common prefix/suffix and replace the
+    // narrow middle only.
+    var prefix = 0
+    var maxPrefix = Math.min(original.length, next.length)
+    while (prefix < maxPrefix && original.charAt(prefix) === next.charAt(prefix)) prefix += 1
+    var suffix = 0
+    var maxSuffix = Math.min(original.length - prefix, next.length - prefix)
+    while (suffix < maxSuffix
+      && original.charAt(original.length - 1 - suffix) === next.charAt(next.length - 1 - suffix)) {
+      suffix += 1
+    }
+    output.push({
+      start: start + prefix,
+      end: end - suffix,
+      text: next.slice(prefix, next.length - suffix)
+    })
+  }
+  return output
+}
+
 function finish(oldText, newText, selectionStart, selectionEnd, extra) {
   var length = newText.length
   var result = {
@@ -980,8 +1050,12 @@ function linkAt(text, start, end) {
     var urlEnd = urlStart + match[2].length
     var closeEnd = urlEnd + 1
     var inside = start >= labelStart && end <= labelEnd
+    // A caret or selection in the destination belongs to the same link. It is
+    // still the link, so editing the URL must replace it rather than nest a
+    // second link inside the old destination.
+    var inUrl = start >= urlStart && end <= urlEnd
     var exact = start === open && end === closeEnd
-    if (inside || exact) {
+    if (inside || inUrl || exact) {
       return {
         open: open, closeEnd: closeEnd,
         labelStart: labelStart, labelEnd: labelEnd,
@@ -1204,6 +1278,16 @@ function planClear(oldText, start, end) {
     var current = collectSpans(marked)
     for (var c = 0; c < current.length; c++) {
       if (current[c].openStart === remove[k].openStart && current[c].closeEnd === remove[k].closeEnd) {
+        // The selection boundary can fall inside a tag (for example 15
+        // characters into a colour span). Removing that tag would take the
+        // sentinel with it, and the empty marker would leak into the note as
+        // an invisible U+E100. Refuse instead of corrupting the document.
+        var openPart = marked.slice(current[c].openStart, current[c].openEnd)
+        var closePart = marked.slice(current[c].closeStart, current[c].closeEnd)
+        if (openPart.indexOf(SEL_OPEN) >= 0 || openPart.indexOf(SEL_CLOSE) >= 0
+          || closePart.indexOf(SEL_OPEN) >= 0 || closePart.indexOf(SEL_CLOSE) >= 0) {
+          return fail("Select within the formatted text")
+        }
         marked = marked.slice(0, current[c].openStart) + marked.slice(current[c].openEnd, current[c].closeStart)
           + marked.slice(current[c].closeEnd)
         break
@@ -1212,10 +1296,17 @@ function planClear(oldText, start, end) {
   }
   l = marked.indexOf(SEL_OPEN)
   r = marked.indexOf(SEL_CLOSE)
+  if (l < 0 || r < 0 || r <= l) return fail("Select within the formatted text")
   var inner = marked.slice(l + 1, r)
   var cleaned = stripInlineMarkers(inner)
   var nextMarked = marked.slice(0, l + 1) + cleaned + marked.slice(r)
+  if (nextMarked.indexOf(SEL_OPEN) < 0 || nextMarked.indexOf(SEL_CLOSE) < 0) {
+    return fail("Select within the formatted text")
+  }
   var result = extractSelection(nextMarked)
+  if (result.text.indexOf(SEL_OPEN) >= 0 || result.text.indexOf(SEL_CLOSE) >= 0) {
+    return fail("Select within the formatted text")
+  }
   return finish(oldText, result.text, result.selectionStart, result.selectionEnd)
 }
 

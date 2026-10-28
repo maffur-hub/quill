@@ -123,6 +123,7 @@ ShellRoot {
     suppressDirty = true
     tooLarge = !!result.tooLarge
     editor.text = tooLarge ? "" : String(result.content || "")
+    editor.resetFormatHistory()
     editor.cursorPosition = 0
     suppressDirty = false
     loaded = !tooLarge
@@ -174,6 +175,7 @@ ShellRoot {
     var text = root.draftText
     root.suppressDirty = true
     editor.text = text
+    editor.resetFormatHistory()
     editor.cursorPosition = text.length
     root.suppressDirty = false
     root.draftPending = false
@@ -285,6 +287,7 @@ ShellRoot {
     var scrollY = editorScroll.contentY
     root.suppressDirty = true
     editor.text = value
+    editor.resetFormatHistory()
     editor.cursorPosition = Math.min(caret, value.length)
     root.suppressDirty = false
     root.savedText = value
