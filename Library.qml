@@ -8,6 +8,7 @@ import qs.Ui
 import "ImageSizing.js" as ImageSizing
 import "MarkdownFormat.js" as MarkdownFormat
 import "TableEngine.js" as TableEngine
+import "TagSuggest.js" as TagSuggest
 import "WritableGuard.js" as WritableGuard
 
 // Quill's library: three panes, a Markdown editor with live highlighting,
@@ -226,11 +227,16 @@ Item {
   }
 
   // ------------------------------------------------------------ library load
-  function refreshAll() {
+  function refreshAll(statusMessage) {
     enqueue({
       args: ["list"],
       silent: true,
-      onSuccess: function(result) { root.applyList(result, false) },
+      onSuccess: function(result) {
+        root.applyList(result, false)
+        // A caller that just destroyed a local condition (for example a tag
+        // add) can keep its message instead of the generic note count.
+        if (statusMessage) root.statusText = String(statusMessage)
+      },
       onError: function(message) { root.loadingList = false; root.statusText = message }
     })
     if (root.category === "trash") refreshTrash()
@@ -696,6 +702,7 @@ Item {
           root.dirty = true
         }
         root.statusText = message
+        if (tagSuggestPopup && tagSuggestPopup.applying) tagSuggestPopup.showError(message)
       }
     })
   }
@@ -714,6 +721,9 @@ Item {
       dirty = true
       statusText = "Could not write the note"
       pendingDetach = false
+    }
+    if (tagSuggestPopup && tagSuggestPopup.applying) {
+      tagSuggestPopup.showError("Could not write the note")
     }
   }
 
@@ -941,6 +951,90 @@ Item {
   function reloadFromDisk() {
     if (!root.diskChangePending) return
     root.applyExternalContent(root.diskChangeText)
+  }
+
+  // ------------------------------------------------------ tag suggestions
+  function tagSuggestKnownTags() {
+    var output = []
+    for (var i = 0; i < root.tags.length; i++) {
+      var row = root.tags[i]
+      output.push(row && typeof row === "object" ? row.tag : row)
+    }
+    return output
+  }
+
+  function tagSuggestAvailable() {
+    return !!root.selectedNote
+      && !root.selectedNote.trashed
+      && root.loaded
+      && !root.loadingNote
+      && !root.tooLarge
+      && !root.draftPending
+      && !root.diskChangePending
+      && root.selectedId !== ""
+      && root.writesAllowed
+  }
+
+  function openTagSuggest() {
+    if (!root.tagSuggestAvailable()) return
+    var note = root.selectedNote
+    var noteTags = note.tags ? note.tags : []
+    var suggestions = TagSuggest.suggest(
+      String(note.title || ""),
+      String(editor.text || ""),
+      noteTags,
+      root.tagSuggestKnownTags())
+    tagSuggestPopup.openFor(suggestions, noteTags)
+  }
+
+  function applySuggestedTags(tags) {
+    if (!root.tagSuggestAvailable()) {
+      tagSuggestPopup.showError("This note cannot be edited right now")
+      return
+    }
+    var id = root.selectedId
+    var note = root.selectedNote
+    var seen = {}
+    if (note.tags) {
+      for (var t = 0; t < note.tags.length; t++) {
+        seen[TagSuggest.normalizeTag(note.tags[t])] = true
+      }
+    }
+    var clean = []
+    for (var i = 0; i < tags.length; i++) {
+      var tag = TagSuggest.normalizeTag(tags[i])
+      if (!tag || seen[tag]) continue
+      seen[tag] = true
+      clean.push(tag)
+    }
+    if (clean.length === 0) {
+      tagSuggestPopup.showError("Select or type at least one new tag")
+      return
+    }
+    tagSuggestPopup.applying = true
+    tagSuggestPopup.errorText = ""
+    // Any dirty buffer is written first: tag-add must edit the saved note, not
+    // race the asynchronous temp-file save.
+    root.afterSave(id, function() {
+      root.enqueue({
+        args: ["tag-add", id].concat(clean),
+        silent: true,
+        onSuccess: function(result) {
+          if (root.selectedId === id) {
+            root.applyExternalContent(result.content, result.modified, "Tags added")
+          }
+          tagSuggestPopup.finishSuccess()
+          root.statusText = "Tags added"
+          root.refreshAll("Tags added")
+        },
+        onError: function(message) {
+          // Keep the popup open so the selection is not lost; the note itself
+          // was not touched by a failed command.
+          tagSuggestPopup.showError(message)
+          root.statusText = message
+        }
+      })
+    })
   }
 
   function keepDiskChange() {
@@ -2933,6 +3027,14 @@ Item {
     }
   }
 
+  // ------------------------------------------------------- tag suggestions
+  TagSuggestPopup {
+    id: tagSuggestPopup
+    parent: Overlay.overlay
+    anchors.centerIn: Overlay.overlay
+    onApplied: function(tags) { root.applySuggestedTags(tags) }
+  }
+
   // ---------------------------------------------------------- rename dialog
   Popup {
     id: renameNotePopup
@@ -3432,6 +3534,14 @@ Item {
             label: "#" + String(modelData)
             onActivated: root.selectCategory("tag:" + String(modelData))
           }
+        }
+
+        TagChip {
+          objectName: "addTagChip"
+          label: "+ Tag"
+          visible: root.tagSuggestAvailable()
+          opacity: 0.8
+          onActivated: root.openTagSuggest()
         }
 
         Item { width: Math.max(0, parent.width - x); height: 1 }

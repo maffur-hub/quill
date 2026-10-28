@@ -91,6 +91,7 @@ function isMutatingArgs(args) {
     "delete": 1,
     "empty-trash": 1,
     "pin": 1,
+    "tag-add": 1,
     "tag-rename": 1,
     "import-omanano": 1,
     "index": 1,

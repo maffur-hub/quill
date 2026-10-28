@@ -37,6 +37,8 @@ backlinks. Deleting `index.db` is safe; it is rebuilt automatically.
   ImageSizing.js       pure image-size parsing/rewriting (shared, node-testable)
   TableEngine.js       pure table parsing, formulas and row/column edits
   MathSyntax.js        pure maths delimiter detection (shared, node-testable)
+  TagSuggest.js        pure contextual tag extractor (shared, node-testable)
+  TagSuggestPopup.qml  toggle chips + custom tags, then Apply
   MathText.js          Markdown → RichText HTML for blocks containing maths
   WritableGuard.js     pure live-root write guard (shared with tests)
   scripts/quill-store  Python 3 stdlib backend (JSON in / JSON out)
@@ -91,6 +93,22 @@ heading/list markers and `` ` `` `*` `_` `~` stripped, capped at 120 chars.
 Tags come from frontmatter `tags:` and inline `#tag` outside code fences and
 inline code. `[[Target]]`, `[[Target|Alias]]` and `[[Target#Heading]]` resolve
 case-insensitively by title, then filename stem.
+
+### Tag suggestions
+
+The `+ Tag` chip at the end of a note's tag row suggests tags derived from that
+note's own title, headings and body — locally and offline, never from its
+folder or a generic list of every tag in the library. Tags already on the note
+are excluded, and a library tag gets only a small ranking boost when the same
+concept actually appears in the note.
+
+Suggestions are proposals, not silent edits: toggle the ones you want, add
+comma- or space-separated tags in the field, then **Apply**. Any pending editor
+save is written first; the chosen tags are then appended to the end of the
+body as inline `#tags` (an existing trailing tag line is extended in place,
+and YAML frontmatter is never rewritten). The chips, sidebar counts and Joplin
+mirror update as usual. The chip is hidden for trashed, read-only, too-large
+and draft-pending notes.
 
 ## Crash drafts
 
@@ -886,6 +904,7 @@ $S folder delete "Archive" [--force]     # --force moves notes to the root
 $S search "prefix query" --limit 50    # prefix + typo-tolerant
 $S tags
 $S tag-rename old-tag new-tag
+$S tag-add <id> <tag> [<tag>...]          # append inline #tags to the body
 $S backlinks <id>
 $S preview <id>                           # wiki/tag links become quill:// URLs
 $S import-omanano
@@ -911,6 +930,12 @@ trashed nor too large. `write` removes that draft when its normalised text
 equals the bytes just saved; a newer draft is kept. `draft discard <id>`
 removes the adjacent draft and returns `{"id": ..., "discarded": true|false}`.
 Draft commands are mutations for the `QUILL_E2E` live-root guard.
+
+`tag-add` normalises requested tags the same way as inline tags, ignores
+invalid ones and tags already on the note (case-insensitive), caps one call at
+20 additions, and returns `{id, tags, content, modified}`. It extends a
+trailing tag-only line or adds one blank line plus a new `#tag` line, keeps
+the note's newline style, snapshots the previous body, and reindexes the note.
 
 `preview` strips the YAML frontmatter block (its title and tags are already
 shown in the UI), then converts wiki links to

@@ -700,6 +700,37 @@ def normalize_tags(values) -> list[str]:
     return output
 
 
+TAG_ONLY_LINE_RE = re.compile(r"^\s*(?:#[A-Za-z0-9_/-]+(?:\s+|$))+$")
+
+
+def append_inline_tags(content: str, tags: list[str]) -> str:
+    """Append `#tag` words at the end of the body, preserving newline style.
+
+    A trailing tag-only line (for example `#one #two`) is extended in place;
+    otherwise exactly one blank line separates the body from a new tag line.
+    Frontmatter is never edited because it lives above the last body line.
+    """
+    if not tags:
+        return content
+    newline = detect_newline(content)
+    text = normalize_newlines(content, "\n")
+    tagline = " ".join("#" + tag for tag in tags)
+    trimmed = text.rstrip("\n")
+    lines = trimmed.split("\n") if trimmed else []
+    if lines and TAG_ONLY_LINE_RE.match(lines[-1]):
+        lines[-1] = lines[-1].rstrip() + " " + tagline
+        result = "\n".join(lines) + "\n"
+    else:
+        core = text.rstrip()
+        result = (core + "\n\n" if core else "") + tagline + "\n"
+    return normalize_newlines(result, newline)
+
+
+def note_tags(content: str) -> list[str]:
+    frontmatter, _body = split_frontmatter(content)
+    return normalize_tags(frontmatter_tags(frontmatter) + extract_inline_tags(content))
+
+
 def scan_blocks(text: str):
     """Yield (in_code, line) for each line, tracking fenced code blocks."""
     in_code = False
@@ -709,6 +740,20 @@ def scan_blocks(text: str):
             yield in_code, line
             continue
         yield in_code, line
+
+
+def has_unclosed_fence(text: str) -> bool:
+    """True when `text` ends inside a fenced code block.
+
+    Uses the same toggle semantics as `scan_blocks`/`FENCE_RE`, so any fence
+    delimiter line closes an open fence and the only way to end in code is an
+    unclosed block.
+    """
+    in_code = False
+    for line in text.splitlines():
+        if FENCE_RE.match(line):
+            in_code = not in_code
+    return in_code
 
 
 def protected_spans(line: str) -> list[tuple[int, int]]:
@@ -2049,6 +2094,72 @@ def command_tags(_args) -> dict:
     return {"tags": [{"tag": str(tag), "count": int(count)} for tag, count in rows]}
 
 
+def command_tag_add(args) -> dict:
+    ensure_store()
+    identifier = safe_relative(args.id)
+    path = note_path(identifier)
+    if not path.is_file():
+        raise StoreError(f"note not found: {args.id}")
+    requested = normalize_tags(getattr(args, "tags", []) or [])
+    draft_deleted = False
+    with locked():
+        try:
+            previous_raw = path.read_bytes()
+        except OSError as error:
+            raise StoreError(f"could not read the note: {error}") from error
+        try:
+            content = previous_raw.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise StoreError("note is not valid UTF-8") from error
+        newline = detect_newline(content)
+        present = {tag.casefold() for tag in note_tags(content)}
+        missing: list[str] = []
+        for tag in requested:
+            key = tag.casefold()
+            if key in present:
+                continue
+            present.add(key)
+            missing.append(tag)
+            if len(missing) >= 20:
+                break
+        # Tags appended inside an open fence would be invisible to
+        # `extract_inline_tags`, so refuse rather than silently losing them.
+        # A request whose tags are all present still succeeds as a no-op.
+        if missing and has_unclosed_fence(content):
+            raise StoreError("cannot add tags while a fenced code block is open")
+        updated_content = append_inline_tags(content, missing)
+        updated = updated_content.encode("utf-8")
+        if updated != previous_raw:
+            snapshot_note(identifier, previous_raw, "tag-add")
+            atomic_write(path, updated)
+            # As with `write`, a draft is redundant only once it matches the
+            # bytes now on disk; a newer draft must survive.
+            try:
+                draft = read_draft(path)
+                if (draft is not None
+                        and normalize_newlines(draft[0], newline) == updated_content):
+                    draft_path(path).unlink()
+                    draft_deleted = True
+            except OSError:
+                pass
+            conn = index_connect()
+            try:
+                index_file(conn, path, False, pinned_set())
+                resolve_links(conn)
+                conn.commit()
+            finally:
+                conn.close()
+            prune_versions(identifier)
+        stat = path.stat()
+    return {
+        "id": identifier,
+        "tags": note_tags(updated_content),
+        "content": updated_content,
+        "modified": int(stat.st_mtime * 1000),
+        "draftDeleted": draft_deleted,
+    }
+
+
 def replace_inline_tag(line: str, old_key: str, new_tag: str) -> tuple[str, int]:
     pieces: list[tuple[int, int]] = []
     cursor = 0
@@ -2533,6 +2644,7 @@ MUTATING_COMMANDS = {
     "delete",
     "empty-trash",
     "pin",
+    "tag-add",
     "tag-rename",
     "import-omanano",
     "index",
@@ -2668,6 +2780,11 @@ def build_parser() -> argparse.ArgumentParser:
     tag_rename.add_argument("old")
     tag_rename.add_argument("new")
     tag_rename.set_defaults(func=command_tag_rename)
+
+    tag_add = sub.add_parser("tag-add")
+    tag_add.add_argument("id")
+    tag_add.add_argument("tags", nargs="+")
+    tag_add.set_defaults(func=command_tag_add)
 
     backlinks = sub.add_parser("backlinks")
     backlinks.add_argument("id")
