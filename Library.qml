@@ -2315,6 +2315,7 @@ Item {
             onAction: function(name, value) {
               if (!editor) return
               if (name === "attach") editor.openAttachPicker()
+              else if (name === "draw") editor.openDrawCanvas()
               else editor.applyFormat(name, value)
             }
           }

@@ -1199,6 +1199,14 @@ Item {
         }
       }
       MenuButton {
+        objectName: "formatInsertDraw"
+        label: "Draw…"
+        onActivated: {
+          insertPopup.close()
+          root.invoke("draw", "")
+        }
+      }
+      MenuButton {
         objectName: "formatInsertNoteLink"
         label: "Note link…"
         onActivated: {

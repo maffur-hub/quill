@@ -47,6 +47,26 @@ TextArea {
   readonly property string attachHome: Quickshell.env("HOME") || "/"
   readonly property bool attachCanConfirm: root.attachPath.trim() !== ""
 
+  // "Draw…": a themed freehand canvas. Strokes live in memory until Insert
+  // exports a white-background PNG through the same attachment pipeline, so a
+  // drawing behaves exactly like any other attached image.
+  readonly property var drawPopupRef: drawPopup
+  readonly property bool drawPopupOpen: drawPopup.visible
+  property var drawingStrokes: []
+  property string drawColour: "#000000"
+  property int drawBrushWidth: 4
+  property bool drawEraser: false
+  property bool drawSaving: false
+  property string drawTempPath: ""
+  property string drawError: ""
+  readonly property bool drawCanInsert: root.drawingStrokes.length > 0
+    && !root.drawSaving && !root.attaching
+  readonly property var drawPalette: [
+    "#000000", "#e03e2d", "#3598db", "#2dc26b",
+    "#f1c40f", "#e67e22", "#95a5a6", "#ffffff"
+  ]
+  readonly property var drawBrushSizes: [2, 4, 8, 16]
+
   // Replaces the stock white Qt text menu with a compact icon strip. The
   // attached menu stays null; right-click is handled in onPressed so the strip
   // can be centred over the click rather than dropped at the pointer.
@@ -643,7 +663,7 @@ TextArea {
     else root.attachFile(target)
   }
 
-  function attachFile(path) {
+  function attachFile(path, altName) {
     if (!root.attachAllowed() || root.attaching) return false
     var target = root.attachResolvePath(path)
     if (target === "") return false
@@ -651,13 +671,16 @@ TextArea {
       root.attachFailed("No store configured for attachments")
       return false
     }
+    var alt = (altName === undefined || altName === null || String(altName) === "")
+      ? root.attachBasename(target)
+      : String(altName)
     root.attachOutput = ""
     root.attachError = ""
     root.attaching = true
     root.attachSelected = ""
     attachPicker.close()
     attachProcess.command = [root.storePath, "attachment", "save",
-      "--file", target, "--name", root.attachBasename(target)]
+      "--file", target, "--name", alt]
     attachProcess.running = true
     attachTimer.restart()
     return true
@@ -688,6 +711,7 @@ TextArea {
     if (exitCode === 0 && payload && payload.markdown) {
       root.insertAttachmentMarkdown(String(payload.markdown))
       root.attachmentAdded(String(payload.path || ""))
+      if (root.drawTempPath !== "") root.completeDrawInsert(true)
       return
     }
 
@@ -703,6 +727,191 @@ TextArea {
     if (!message) message = String(root.attachError || "").trim()
     if (!message) message = "Could not attach file"
     root.attachFailed(message)
+    if (root.drawTempPath !== "") root.completeDrawInsert(false, message)
+  }
+
+  // ---------------------------------------------------------------- drawing
+
+  function openDrawCanvas() {
+    if (root.drawSaving) return false
+    if (!root.attachAllowed()) return false
+    if (root.storePath === "") return false
+    root.resetDrawCanvas()
+    drawPopup.open()
+    return true
+  }
+
+  function resetDrawCanvas() {
+    root.drawingStrokes = []
+    root.drawColour = "#000000"
+    root.drawBrushWidth = 4
+    root.drawEraser = false
+    root.drawError = ""
+    drawSurface.requestPaint()
+  }
+
+  function closeDrawCanvas() {
+    if (root.drawSaving) return false
+    drawPopup.close()
+    return true
+  }
+
+  function drawChooseColour(value) {
+    if (root.drawSaving) return false
+    root.drawColour = String(value || "#000000")
+    root.drawEraser = false
+    return true
+  }
+
+  function drawChooseBrush(value) {
+    if (root.drawSaving) return false
+    var size = Math.round(Number(value))
+    if (!(size > 0)) return false
+    root.drawBrushWidth = size
+    return true
+  }
+
+  function drawToggleEraser() {
+    if (root.drawSaving) return false
+    root.drawEraser = !root.drawEraser
+    return root.drawEraser
+  }
+
+  function drawStrokeStart(x, y) {
+    var px = Math.max(0, Math.min(drawSurface.width, Number(x) || 0))
+    var py = Math.max(0, Math.min(drawSurface.height, Number(y) || 0))
+    var stroke = {
+      color: root.drawEraser ? "#ffffff" : root.drawColour,
+      width: root.drawEraser ? root.drawBrushWidth * 3 : root.drawBrushWidth,
+      points: [{ x: px, y: py }]
+    }
+    root.drawingStrokes = root.drawingStrokes.concat([stroke])
+    drawSurface.requestPaint()
+    return true
+  }
+
+  // Points are appended in place so a drag does not rebuild the stroke array;
+  // the last stroke always owns the point list being extended.
+  function drawStrokeMove(x, y) {
+    if (root.drawingStrokes.length === 0) return false
+    var px = Math.max(0, Math.min(drawSurface.width, Number(x) || 0))
+    var py = Math.max(0, Math.min(drawSurface.height, Number(y) || 0))
+    var stroke = root.drawingStrokes[root.drawingStrokes.length - 1]
+    stroke.points.push({ x: px, y: py })
+    drawSurface.requestPaint()
+    return true
+  }
+
+  function drawStrokeEnd() {
+    drawSurface.requestPaint()
+    return true
+  }
+
+  function drawUndo() {
+    if (root.drawSaving || root.drawingStrokes.length === 0) return false
+    root.drawingStrokes = root.drawingStrokes.slice(0, -1)
+    drawSurface.requestPaint()
+    return true
+  }
+
+  function drawClear() {
+    if (root.drawSaving) return false
+    root.drawingStrokes = []
+    drawSurface.requestPaint()
+    return true
+  }
+
+  function insertDrawing() {
+    if (!root.attachAllowed()) return false
+    if (root.drawSaving || root.attaching) return false
+    if (root.drawingStrokes.length === 0) return false
+    if (root.storePath === "") {
+      root.drawError = "No store configured for attachments"
+      return false
+    }
+    root.drawSaving = true
+    root.drawError = ""
+    // Flush the pending stroke paint before the scene graph grabs the canvas.
+    drawSurface.requestPaint()
+    Qt.callLater(root.grabDrawing)
+    return true
+  }
+
+  function grabDrawing() {
+    if (!root.drawSaving) return
+    if (drawSurface.width <= 0 || drawSurface.height <= 0) {
+      root.drawError = "The drawing canvas is not ready"
+      root.drawSaving = false
+      return
+    }
+    drawSurface.grabToImage(function(result) {
+      root.finishDrawGrab(result)
+    }, Qt.size(Math.round(drawSurface.width), Math.round(drawSurface.height)))
+  }
+
+  function finishDrawGrab(result) {
+    if (!root.drawSaving) return
+    var folder = Quickshell.env("TMPDIR") || "/tmp"
+    if (folder.length > 1 && folder.charAt(folder.length - 1) === "/") {
+      folder = folder.slice(0, -1)
+    }
+    var tmp = folder + "/quill-drawing-" + Date.now() + ".png"
+    var saved = result !== null && result !== undefined
+      && result.saveToFile("file://" + tmp)
+    if (!saved) {
+      root.drawError = "Could not save the drawing image"
+      root.drawSaving = false
+      return
+    }
+    root.drawTempPath = tmp
+    if (!root.attachFile(tmp, "drawing")) {
+      Quickshell.execDetached(["rm", "-f", tmp])
+      root.drawTempPath = ""
+      root.drawSaving = false
+      root.drawError = "Could not attach the drawing"
+    }
+  }
+
+  function completeDrawInsert(ok, message) {
+    var tmp = root.drawTempPath
+    if (tmp !== "") Quickshell.execDetached(["rm", "-f", tmp])
+    root.drawTempPath = ""
+    root.drawSaving = false
+    if (ok) {
+      drawPopup.close()
+      root.resetDrawCanvas()
+      return
+    }
+    root.drawError = String(message || "Could not insert the drawing")
+  }
+
+  function paintDrawing(context) {
+    context.clearRect(0, 0, drawSurface.width, drawSurface.height)
+    // Always export on white, even when the shell theme is dark.
+    context.fillStyle = "#ffffff"
+    context.fillRect(0, 0, drawSurface.width, drawSurface.height)
+    context.lineCap = "round"
+    context.lineJoin = "round"
+    for (var i = 0; i < root.drawingStrokes.length; i += 1) {
+      var stroke = root.drawingStrokes[i]
+      var points = stroke.points || []
+      if (points.length === 0) continue
+      context.strokeStyle = stroke.color
+      context.fillStyle = stroke.color
+      context.lineWidth = stroke.width
+      if (points.length === 1) {
+        context.beginPath()
+        context.arc(points[0].x, points[0].y, stroke.width / 2, 0, Math.PI * 2)
+        context.fill()
+        continue
+      }
+      context.beginPath()
+      context.moveTo(points[0].x, points[0].y)
+      for (var p = 1; p < points.length; p += 1) {
+        context.lineTo(points[p].x, points[p].y)
+      }
+      context.stroke()
+    }
   }
 
   function pasteAsText() {
@@ -876,7 +1085,9 @@ TextArea {
       if (!root.attaching) return
       root.attaching = false
       attachProcess.running = false
-      root.attachFailed("Attaching the file timed out")
+      var message = "Attaching the file timed out"
+      root.attachFailed(message)
+      if (root.drawTempPath !== "") root.completeDrawInsert(false, message)
     }
   }
 
@@ -1127,6 +1338,269 @@ TextArea {
           verticalPadding: Style.space(4)
           anchors.verticalCenter: parent.verticalCenter
           onClicked: root.attachChosenPath()
+        }
+      }
+    }
+  }
+
+  // Freehand drawing: a themed modal canvas over the editor. Strokes stay
+  // local until Insert exports a PNG, so Cancel never touches the note.
+  Popup {
+    id: drawPopup
+    objectName: "drawCanvasPopup"
+    // Narrow editor panes get a smaller popup; the canvas keeps a 3:5-ish
+    // shape so a sketch remains usable without overflowing the window.
+    width: Math.min(Style.space(680),
+      Math.max(Style.space(320), root.width - Style.space(24)))
+    padding: Style.space(8)
+    focus: true
+    modal: true
+    // Outside clicks are deliberately ignored: losing a sketch to a stray
+    // click is worse than closing with Escape or Cancel.
+    closePolicy: root.drawSaving ? Popup.NoAutoClose : Popup.CloseOnEscape
+    x: Math.max(Style.space(4), Math.round((root.width - width) / 2))
+    y: Math.max(Style.space(4), Math.round((root.height - height) / 2))
+    onClosed: {
+      if (root.drawSaving) return
+      if (root.drawTempPath !== "") {
+        Quickshell.execDetached(["rm", "-f", root.drawTempPath])
+        root.drawTempPath = ""
+      }
+      root.resetDrawCanvas()
+    }
+
+    background: BorderSurface {
+      color: Commons.Color.background
+      borderSpec: Border.controlSpec("normal", Commons.Color.foreground,
+        Commons.Color.accent)
+      radius: Style.cornerRadius
+    }
+
+    contentItem: Column {
+      spacing: Style.space(6)
+
+      Row {
+        width: parent.width
+        spacing: Style.space(6)
+
+        Text {
+          text: "Draw"
+          textFormat: Text.PlainText
+          color: Commons.Color.foreground
+          font.family: Style.font.family
+          font.pixelSize: Style.font.body
+          font.bold: true
+        }
+
+        Text {
+          anchors.verticalCenter: parent.verticalCenter
+          width: parent.width - Style.space(60)
+          text: root.drawEraser ? "Erasing — drag over the drawing"
+            : "Drag to sketch. Insert saves a PNG."
+          textFormat: Text.PlainText
+          elide: Text.ElideRight
+          color: Util.alpha(Commons.Color.foreground, 0.55)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+        }
+      }
+
+      Rectangle {
+        id: drawFrame
+        objectName: "drawSurfaceFrame"
+        width: parent.width
+        height: Math.max(Style.space(220), Math.round(width * 0.6))
+        color: "#ffffff"
+        border.width: 1
+        border.color: Util.alpha(Commons.Color.foreground, 0.28)
+        radius: Style.space(2)
+
+        Canvas {
+          id: drawSurface
+          objectName: "drawSurface"
+          anchors.fill: parent
+          anchors.margins: 1
+          onPaint: root.paintDrawing(getContext("2d"))
+        }
+
+        MouseArea {
+          id: drawInput
+          objectName: "drawInput"
+          anchors.fill: drawSurface
+          cursorShape: Qt.CrossCursor
+          preventStealing: true
+          onPressed: function(mouse) { root.drawStrokeStart(mouse.x, mouse.y) }
+          onPositionChanged: function(mouse) {
+            if (pressed) root.drawStrokeMove(mouse.x, mouse.y)
+          }
+          onReleased: root.drawStrokeEnd()
+        }
+      }
+
+      Row {
+        width: parent.width
+        spacing: Style.space(4)
+
+        Repeater {
+          model: root.drawPalette
+
+          delegate: Rectangle {
+            id: drawSwatch
+            required property int index
+            required property string modelData
+
+            objectName: "drawSwatch" + index
+            width: Style.space(22)
+            height: Style.space(20)
+            radius: Style.space(3)
+            color: drawSwatch.modelData
+            border.width: root.drawColour === drawSwatch.modelData && !root.drawEraser
+              ? 2 : 1
+            border.color: root.drawColour === drawSwatch.modelData && !root.drawEraser
+              ? Commons.Color.accent
+              : Util.alpha(Commons.Color.foreground, 0.28)
+
+            MouseArea {
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.drawChooseColour(drawSwatch.modelData)
+            }
+
+            Text {
+              anchors.centerIn: parent
+              visible: root.drawColour === drawSwatch.modelData && !root.drawEraser
+              text: "✓"
+              textFormat: Text.PlainText
+              color: drawSwatch.modelData === "#ffffff" || drawSwatch.modelData === "#f1c40f"
+                ? "#1a1a1a" : "#ffffff"
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              font.bold: true
+            }
+          }
+        }
+      }
+
+      Row {
+        width: parent.width
+        spacing: Style.space(4)
+
+        Text {
+          anchors.verticalCenter: parent.verticalCenter
+          width: Style.space(34)
+          text: "Brush"
+          textFormat: Text.PlainText
+          color: Util.alpha(Commons.Color.foreground, 0.62)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+        }
+
+        Repeater {
+          model: root.drawBrushSizes
+
+          delegate: Button {
+            id: drawBrushButton
+            required property int index
+            required property int modelData
+
+            objectName: "drawBrush" + modelData
+            width: Style.space(30)
+            height: Style.space(22)
+            text: String(modelData)
+            fontSize: Style.font.caption
+            horizontalPadding: 0
+            verticalPadding: 0
+            selected: root.drawBrushWidth === modelData
+            onClicked: root.drawChooseBrush(modelData)
+          }
+        }
+
+        Button {
+          id: drawEraserButton
+          objectName: "drawEraser"
+          width: Style.space(58)
+          height: Style.space(22)
+          text: "Eraser"
+          fontSize: Style.font.caption
+          horizontalPadding: Style.space(5)
+          verticalPadding: 0
+          selected: root.drawEraser
+          onClicked: root.drawToggleEraser()
+        }
+      }
+
+      Text {
+        objectName: "drawErrorLabel"
+        width: parent.width
+        visible: root.drawError !== ""
+        text: root.drawError
+        textFormat: Text.PlainText
+        wrapMode: Text.WordWrap
+        color: Commons.Color.urgent
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
+      }
+
+      Row {
+        width: parent.width
+        height: Style.space(26)
+        spacing: Style.space(5)
+
+        Button {
+          id: drawUndoButton
+          objectName: "drawUndo"
+          text: "Undo"
+          fontSize: Style.font.bodySmall
+          horizontalPadding: Style.space(7)
+          verticalPadding: Style.space(4)
+          anchors.verticalCenter: parent.verticalCenter
+          enabled: root.drawingStrokes.length > 0 && !root.drawSaving
+          onClicked: root.drawUndo()
+        }
+
+        Button {
+          id: drawClearButton
+          objectName: "drawClear"
+          text: "Clear"
+          fontSize: Style.font.bodySmall
+          horizontalPadding: Style.space(7)
+          verticalPadding: Style.space(4)
+          anchors.verticalCenter: parent.verticalCenter
+          enabled: root.drawingStrokes.length > 0 && !root.drawSaving
+          onClicked: root.drawClear()
+        }
+
+        Item {
+          width: Math.max(0, parent.width - drawUndoButton.width
+            - drawClearButton.width - drawCancelButton.width - drawInsertButton.width
+            - parent.spacing * 4)
+          height: 1
+        }
+
+        Button {
+          id: drawCancelButton
+          objectName: "drawCancel"
+          text: "Cancel"
+          fontSize: Style.font.bodySmall
+          horizontalPadding: Style.space(7)
+          verticalPadding: Style.space(4)
+          anchors.verticalCenter: parent.verticalCenter
+          enabled: !root.drawSaving
+          onClicked: root.closeDrawCanvas()
+        }
+
+        Button {
+          id: drawInsertButton
+          objectName: "drawInsert"
+          text: root.drawSaving ? "Inserting…" : "Insert"
+          fontSize: Style.font.bodySmall
+          horizontalPadding: Style.space(7)
+          verticalPadding: Style.space(4)
+          anchors.verticalCenter: parent.verticalCenter
+          active: root.drawCanInsert
+          enabled: root.drawCanInsert
+          onClicked: root.insertDrawing()
         }
       }
     }

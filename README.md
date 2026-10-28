@@ -617,6 +617,16 @@ attaches a file. A single click on a file selects it; double-click it, or press
 notes, or while a crash-draft banner is up. The status bar confirms
 **File attached** or shows the store's error message.
 
+**Draw…** in the same menu opens a modal freehand canvas. Pick one of the
+palette swatches, choose a brush width (2, 4, 8 or 16 px) and drag on the white
+surface; **Eraser** paints in white, **Undo** removes the last stroke and
+**Clear** starts over. **Insert** exports the sketch as a PNG and adds it to
+the note at the caret through the same attachment pipeline, so the image is
+content-addressed under `<data>/attachments/` and mirrored to Joplin like any
+other attached image. The exported file always has a white background, even in
+a dark theme. **Cancel** or Escape closes the canvas without touching the note
+or writing a file. The canvas is not offered for trashed or read-only notes.
+
 The store copies the bytes to `<data>/attachments/<sha256>.<ext>` (mode 0644,
 20 MiB maximum) and links that copy. Nothing is linked in place, so the original
 can be moved or deleted afterwards without breaking the note, and the note stays
