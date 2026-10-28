@@ -252,6 +252,7 @@ also accepts:
 | Bold / italic / strike | `**text**` / `*text*` / `~~text~~` |
 | Underline | `<u>text</u>` |
 | Highlight | `==text==` |
+| Highlight colour | `<span style="background-color: rgb(191, 237, 210);">text</span>`; **No colour** removes it |
 | Superscript / subscript | `<sup>text</sup>` / `<sub>text</sub>` |
 | Heading | `#` … `######`; Normal removes the prefix |
 | Date / time | `YYYY-MM-DD` / `HH:mm` at the caret |
@@ -276,6 +277,18 @@ to a coloured selection replaces the property instead of nesting spans;
 large use CSS pixels after probing Qt RichText: percentages and `em` were
 ignored by Qt, while `px` and `<font size>` rendered. Pixels are therefore the
 documented fallback; Joplin renders the same inline style in its HTML preview.
+
+### Highlight colours
+
+`==text==` remains the default yellow highlight. The chevron beside the
+highlight button opens a small palette (yellow, green, blue, pink, orange,
+purple); choosing a colour stores an ordinary
+`<span style="background-color: rgb(r, g, b);">text</span>`, which Joplin also
+renders. After a colour has been chosen the main highlight button applies that
+colour; pick the yellow swatch to return to `==`. **No colour** removes only
+the background property and leaves text colour, size, underline and other
+formatting intact. Quill computes a readable dark or light text colour when
+rendering, so the note itself never stores a theme-dependent `color` value.
 
 Qt's `Text.MarkdownText` paints `_text_` as **underline** even though Markdown
 defines it as italic. Quill's editor underlay has always rendered italic; the

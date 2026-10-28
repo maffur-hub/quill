@@ -30,6 +30,9 @@ Item {
   signal action(string name, var value)
 
   property string lastColor: "#e03e2d"
+  // Empty means the default == yellow highlight; otherwise a hex colour that
+  // the main highlight button applies as a background-color span.
+  property string lastHighlight: ""
   property int tableHoverRow: -1
   property int tableHoverCol: -1
   // Custom picker state: hue in degrees, saturation/value 0..1.
@@ -56,6 +59,9 @@ Item {
   readonly property Item noteLinkInput: noteLinkField
   readonly property var colorPalettePopup: colorPopup
   readonly property var colorPickerPopup: colorPicker
+  readonly property var highlightPalettePopup: highlightPopup
+  readonly property Item highlightButtonRef: highlightButton
+  readonly property Item highlightChevronRef: highlightChevron
   readonly property var noteLinkPopupRef: noteLinkPopup
   readonly property var insertPopupRef: insertPopup
   readonly property Item emojiInput: emojiSearch
@@ -74,6 +80,17 @@ Item {
     "#ECF0F1", "#CED4D9", "#95A5A6", "#7E8C8D", "#34495E"
   ]
   readonly property var paletteBase: ["#000000", "#FFFFFF"]
+
+  // Pastel highlights. The first entry is the default == yellow; the rest are
+  // stored as background-color spans. Dark text is computed at render time.
+  readonly property var highlightSwatches: [
+    { hex: "#f5e663", label: "Yellow highlight (==)" },
+    { hex: "#bfedd2", label: "Green highlight" },
+    { hex: "#c2e0f4", label: "Blue highlight" },
+    { hex: "#f8cac6", label: "Pink highlight" },
+    { hex: "#fad7a0", label: "Orange highlight" },
+    { hex: "#eccafa", label: "Purple highlight" }
+  ]
 
   function clampUnit(value) {
     return Math.max(0, Math.min(1, value))
@@ -214,6 +231,49 @@ Item {
     colorPopup.close()
   }
 
+  function applyHighlight() {
+    var colour = MarkdownFormat.normaliseColour(root.lastHighlight)
+    if (colour === null) {
+      root.invoke("highlight")
+      return
+    }
+    root.invoke("highlightColor", colour)
+  }
+
+  function chooseDefaultHighlight() {
+    root.lastHighlight = ""
+    root.invoke("highlight")
+    highlightPopup.close()
+  }
+
+  function chooseHighlight(hex) {
+    var normalised = MarkdownFormat.normaliseHex(hex)
+    if (normalised === null) return false
+    root.lastHighlight = normalised
+    root.invoke("highlightColor", MarkdownFormat.normaliseColour(normalised))
+    highlightPopup.close()
+    return true
+  }
+
+  function clearHighlightColour() {
+    root.invoke("noHighlightColor", "")
+    highlightPopup.close()
+  }
+
+  function isHighlightSwatch(hex) {
+    var wanted = MarkdownFormat.normaliseHex(hex)
+    if (wanted === null) return false
+    if (root.lastHighlight === "") return wanted === "#f5e663"
+    return wanted === MarkdownFormat.normaliseHex(root.lastHighlight)
+  }
+
+  function openHighlightPopover() {
+    if (!available) return
+    closePopovers()
+    placePopup(highlightPopup, highlightControl)
+    highlightPopup.open()
+  }
+
   function isLastColour(hex) {
     var a = MarkdownFormat.normaliseHex(hex)
     var b = MarkdownFormat.normaliseHex(root.lastColor)
@@ -305,6 +365,7 @@ Item {
   function closePopovers() {
     colorPopup.close()
     colorPicker.close()
+    highlightPopup.close()
     sizePopup.close()
     linkPopup.close()
     tablePopup.close()
@@ -449,11 +510,59 @@ Item {
 
       Divider {}
 
-      FmtButton {
-        objectName: "formatHighlightButton"
-        glyph: "▨"
-        tip: "Highlight (Ctrl+Shift+H)"
-        onActivated: root.invoke("highlight")
+      // Highlight keeps == as its main action and adds a chevron palette for
+      // coloured background spans. The last chosen colour drives the main
+      // button, exactly like the text-colour control next to it.
+      Item {
+        id: highlightControl
+        width: Style.space(30)
+        height: Style.space(23)
+
+        FmtButton {
+          id: highlightButton
+          objectName: "formatHighlightButton"
+          width: Style.space(22)
+          height: parent.height
+          glyph: "▨"
+          tip: "Highlight (Ctrl+Shift+H)"
+          onActivated: root.applyHighlight()
+        }
+
+        Rectangle {
+          anchors.horizontalCenter: highlightButton.horizontalCenter
+          anchors.bottom: parent.bottom
+          anchors.bottomMargin: Style.space(4)
+          width: Style.space(9)
+          height: 2
+          color: root.available
+            ? (root.lastHighlight === "" ? "#f5e663" : root.lastHighlight)
+            : Util.alpha(Commons.Color.foreground, 0.25)
+        }
+
+        Item {
+          id: highlightChevron
+          anchors.right: parent.right
+          anchors.top: parent.top
+          width: Style.space(8)
+          height: parent.height
+
+          Text {
+            anchors.centerIn: parent
+            anchors.verticalCenterOffset: 1
+            text: "▾"
+            textFormat: Text.PlainText
+            color: Util.alpha(Commons.Color.foreground, root.available ? 0.72 : 0.38)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+          }
+
+          MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            enabled: root.available
+            onClicked: root.openHighlightPopover()
+          }
+        }
       }
       // Joplin-style colour control: an "A", a last-used underline and a
       // chevron. The wrapper keeps the button 30 px wide (within the 23–30 px
@@ -736,6 +845,94 @@ Item {
             cursorShape: Qt.PointingHandCursor
             onClicked: root.openColourPicker()
           }
+        }
+      }
+    }
+  }
+
+  // Highlight palette. The yellow swatch is the default == mark; the other
+  // swatches store ordinary background-color spans. "No colour" removes only
+  // the background property, so text colour/size/underline survive.
+  Popup {
+    id: highlightPopup
+    objectName: "highlightPopup"
+    width: Style.space(170)
+    padding: Style.space(8)
+    focus: true
+    closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+    background: BorderSurface {
+      color: Commons.Color.background
+      borderSpec: Border.controlSpec("normal", Commons.Color.foreground, Commons.Color.accent)
+      radius: Style.cornerRadius
+    }
+
+    contentItem: Column {
+      spacing: Style.space(6)
+
+      Text {
+        text: "Highlight colour"
+        color: Util.alpha(Commons.Color.foreground, 0.62)
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
+      }
+
+      Grid {
+        columns: 6
+        spacing: Style.space(2)
+
+        Repeater {
+          model: root.highlightSwatches
+          SwatchCell {
+            required property var modelData
+            swatch: String(modelData.hex)
+            tip: String(modelData.label)
+            active: root.isHighlightSwatch(String(modelData.hex))
+            onPicked: String(modelData.hex) === "#f5e663"
+              ? root.chooseDefaultHighlight()
+              : root.chooseHighlight(String(modelData.hex))
+          }
+        }
+      }
+
+      Row {
+        spacing: Style.space(2)
+
+        // "No colour": transparent cell with a diagonal slash.
+        Rectangle {
+          width: Style.space(24)
+          height: Style.space(22)
+          radius: Style.space(3)
+          color: "transparent"
+          border.width: 1
+          border.color: Util.alpha(Commons.Color.foreground, 0.22)
+
+          Rectangle {
+            anchors.centerIn: parent
+            width: Style.space(17)
+            height: 1
+            rotation: -45
+            color: Util.alpha(Commons.Color.foreground, 0.72)
+          }
+
+          MouseArea {
+            id: noHighlightMouse
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.clearHighlightColour()
+          }
+
+          ToolTip.visible: noHighlightMouse.containsMouse
+          ToolTip.text: "No highlight colour"
+          ToolTip.delay: 500
+        }
+
+        Text {
+          anchors.verticalCenter: parent.verticalCenter
+          text: "No colour"
+          color: Util.alpha(Commons.Color.foreground, 0.72)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
         }
       }
     }
@@ -1554,6 +1751,7 @@ Item {
   component SwatchCell: Rectangle {
     id: cell
     property string swatch: "#000000"
+    property string tip: ""
     property bool active: false
     signal picked()
 
@@ -1573,6 +1771,10 @@ Item {
       cursorShape: Qt.PointingHandCursor
       onClicked: cell.picked()
     }
+
+    ToolTip.visible: cellMouse.containsMouse && cell.tip !== ""
+    ToolTip.text: cell.tip
+    ToolTip.delay: 500
 
     Rectangle {
       anchors.fill: parent

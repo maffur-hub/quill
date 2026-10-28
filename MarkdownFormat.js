@@ -8,9 +8,10 @@
 //
 // Actions write ordinary Markdown. The only HTML Quill emits is a small
 // whitelist that Joplin and Qt RichText both understand: <u>...</u> and
-// <span style="color: rgb(r, g, b);">...</span> / font-size spans. Joplin
-// stores the colour as an rgb() triple, so new spans use that canonical form;
-// hex input is still accepted and old hex spans can be replaced in place.
+// <span style="...">...</span> spans for text colour, background highlight and
+// font size. Joplin stores colours as an rgb() triple, so new spans use that
+// canonical form; hex input is still accepted and old hex spans can be
+// replaced in place.
 
 var SEL_OPEN = "\uE100"
 var SEL_CLOSE = "\uE101"
@@ -821,8 +822,9 @@ function planSpan(oldText, start, end, key, value) {
   var left = marked.indexOf(SEL_OPEN)
   var right = marked.indexOf(SEL_CLOSE)
   var target = value === "" ? null : value
-  var open = '<span style="' + (key === "color" ? "color" : "font-size") + ": " + value
-    + ';">'
+  var cssKey = key === "color" ? "color"
+    : key === "background-color" ? "background-color" : "font-size"
+  var open = '<span style="' + cssKey + ": " + value + ';">'
   if (left < 0 || right < 0) return fail("Cannot apply formatting across a tag")
 
   // Caret only: recolour the span under the cursor in place. A caret outside
@@ -1233,7 +1235,8 @@ function plan(text, start, end, action, value) {
     || name === "strike" || name === "code" || name === "highlight"
     || name === "superscript" || name === "subscript" || name === "color"
     || name === "noColour" || name === "noColor" || name === "size"
-    || name === "noSize" || name === "link" || name === "date"
+    || name === "noSize" || name === "highlightColor" || name === "noHighlightColor"
+    || name === "link" || name === "date"
     || name === "time" || name === "noteLink" || name === "emoji"
   if (inlineAction) {
     var safe = clampOutsideTags(source, s, e)
@@ -1249,6 +1252,12 @@ function plan(text, start, end, action, value) {
     return planSpan(source, s, e, "color", colour)
   }
   if (name === "noColour" || name === "noColor") return planSpan(source, s, e, "color", "")
+  if (name === "highlightColor") {
+    var background = normaliseColour(value)
+    if (background === null) return fail("Enter a colour like #e06c75 or rgb(224, 62, 45)")
+    return planSpan(source, s, e, "background-color", background)
+  }
+  if (name === "noHighlightColor") return planSpan(source, s, e, "background-color", "")
   if (name === "size") {
     var size = String(value || "")
     if (size === "normal" || size === "") return planSpan(source, s, e, "font-size", "")

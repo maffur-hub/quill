@@ -147,6 +147,17 @@ TextArea {
     return amount >= 1 && amount <= 400 ? amount + unit : null
   }
 
+  // Background highlights are stored without a text colour so the note stays
+  // theme-neutral. The underlay adds a readable foreground at paint time only.
+  function contrastHtmlColour(value) {
+    var hex = safeHtmlColour(value)
+    if (hex === null) return hexColor(foregroundColor)
+    var red = parseInt(hex.slice(1, 3), 16)
+    var green = parseInt(hex.slice(3, 5), 16)
+    var blue = parseInt(hex.slice(5, 7), 16)
+    return (0.299 * red + 0.587 * green + 0.114 * blue) > 150 ? "#101315" : "#ffffff"
+  }
+
   function safeInlineSpanStyle(attributes) {
     var match = String(attributes || "").match(/^\s+style="([^"]*)"\s*$/i)
     if (!match) return null
@@ -163,6 +174,10 @@ TextArea {
         var colour = safeHtmlColour(value)
         if (colour === null) return null
         props.push({ key: "color", value: colour })
+      } else if (key === "background-color") {
+        var background = safeHtmlColour(value)
+        if (background === null) return null
+        props.push({ key: "background-color", value: background })
       } else if (key === "font-size") {
         var size = safeHtmlFontSize(value)
         if (size === null) return null
@@ -232,11 +247,20 @@ TextArea {
         closeHtml = "</" + tag.name + ">" + closeHtml
       } else if (tag.name === "span") {
         var colour = null
+        var background = null
         for (var p = 0; p < tag.props.length; p++) {
           if (tag.props[p].key === "color") colour = tag.props[p].value
+          else if (tag.props[p].key === "background-color") background = tag.props[p].value
         }
-        if (colour !== null) {
-          openHtml += '<span style="color:' + colour + ';">'
+        if (colour !== null || background !== null) {
+          var styles = []
+          if (colour !== null) styles.push("color:" + colour + ";")
+          if (background !== null) {
+            styles.push("background-color:" + background + ";")
+            // Paint the contrast colour without storing it in the note.
+            if (colour === null) styles.push("color:" + contrastHtmlColour(background) + ";")
+          }
+          openHtml += '<span style="' + styles.join(" ") + '">'
           closeHtml = "</span>" + closeHtml
         }
       }

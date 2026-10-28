@@ -106,12 +106,35 @@ function safeFontSize(value) {
   return amount >= 1 && amount <= 400 ? amount + unit : null
 }
 
-// Only style="..." is allowed, and only colour / font-size declarations.
-// Every other attribute and every other CSS property is rejected.
+// Readable foreground for a stored background colour. Computed at render time
+// only; the note keeps just background-color.
+function contrastColour(value) {
+  var colour = safeColour(value)
+  if (colour === null) return "#101315"
+  var red, green, blue
+  if (colour.charAt(0) === "#") {
+    red = parseInt(colour.slice(1, 3), 16)
+    green = parseInt(colour.slice(3, 5), 16)
+    blue = parseInt(colour.slice(5, 7), 16)
+  } else {
+    var match = colour.match(/\(([^)]*)\)/)
+    var channels = match ? match[1].split(",") : []
+    red = Number(channels[0])
+    green = Number(channels[1])
+    blue = Number(channels[2])
+  }
+  return (0.299 * red + 0.587 * green + 0.114 * blue) > 150 ? "#101315" : "#ffffff"
+}
+
+// Only style="..." is allowed, and only colour / background / font-size
+// declarations. Every other attribute and every other CSS property is
+// rejected.
 function safeSpanStyle(attributes) {
   var match = textOf(attributes).match(/^\s+style="([^"]*)"\s*$/i)
   if (!match) return null
   var pieces = []
+  var hasColour = false
+  var background = null
   var declarations = match[1].split(";")
   for (var i = 0; i < declarations.length; i++) {
     var part = declarations[i].trim()
@@ -123,7 +146,13 @@ function safeSpanStyle(attributes) {
     if (key === "color") {
       var colour = safeColour(value)
       if (colour === null) return null
+      hasColour = true
       pieces.push("color:" + colour)
+    } else if (key === "background-color") {
+      var fill = safeColour(value)
+      if (fill === null) return null
+      background = fill
+      pieces.push("background-color:" + fill)
     } else if (key === "font-size") {
       var size = safeFontSize(value)
       if (size === null) return null
@@ -132,6 +161,7 @@ function safeSpanStyle(attributes) {
       return null
     }
   }
+  if (background !== null && !hasColour) pieces.push("color:" + contrastColour(background))
   return pieces.length === 0 ? null : pieces.join("; ")
 }
 
@@ -308,8 +338,8 @@ function renderInline(value, resolve, syntax) {
   })
 
   // Whitelist inline HTML. Only well-formed <u>...</u> and
-  // <span style="color:#hex[; font-size:...]">...</span> pairs survive;
-  // every other tag stays literal text and is escaped below.
+  // <span style="...">...</span> pairs survive (colour, background highlight
+  // and font size); every other tag stays literal text and is escaped below.
   buffer = protectWhitelistTags(buffer)
 
   html = escapeHtml(buffer)
