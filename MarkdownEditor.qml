@@ -24,6 +24,25 @@ TextArea {
   property bool highlightingEnabled: true
   property string storePath: ""
 
+  // Spellcheck: scripts/quill-spellcheck runs the local hunspell dictionary
+  // over the note and returns UTF-16 ranges for prose misspellings. The
+  // TextArea remains the only text editor; a Canvas behind it paints the
+  // squiggles and the right-click strip opens the suggestions.
+  property bool spellcheckEnabled: true
+  property var spellIssues: []
+  property string spellError: ""
+  property string spellSnapshot: ""
+  property int spellRequestId: 0
+  property int spellRevision: 0
+  property bool spellBusy: false
+  property bool spellPending: false
+  property point spellClickPoint: Qt.point(-1, -1)
+  readonly property var spellPopupRef: spellPopup
+  readonly property var spellMenuIssue: {
+    var issue = root.spellIssueAt(root.spellClickPoint.x, root.spellClickPoint.y)
+    return issue ? issue : root.spellIssueAtCursor()
+  }
+
   // Image paste: Ctrl+V asks scripts/quill-paste-image first. A normal text
   // paste happens when the clipboard has no image (or has text as well).
   property bool pastingImage: false
@@ -87,6 +106,14 @@ TextArea {
     return cut > 0 ? storePath.slice(0, cut) + "/quill-paste-image" : "quill-paste-image"
   }
 
+  readonly property string spellHelperPath: {
+    var cut = storePath.lastIndexOf("/")
+    if (cut > 0) return storePath.slice(0, cut) + "/quill-spellcheck"
+    var url = String(Qt.resolvedUrl("scripts/quill-spellcheck"))
+    if (url.indexOf("file://") !== 0) return ""
+    return url.slice(7)
+  }
+
   signal imagePasted(string path)
   signal pasteFailed(string message)
   signal attachmentAdded(string path)
@@ -115,6 +142,237 @@ TextArea {
       + Math.round(colorValue.g * 255) + ","
       + Math.round(colorValue.b * 255) + ","
       + Math.round(opacity * 100) / 100 + ")"
+  }
+
+  // ------------------------------------------------------------- spellcheck
+
+  function spellClear(message) {
+    if (root.spellIssues.length > 0) root.spellIssues = []
+    root.spellSnapshot = ""
+    root.spellPending = false
+    root.spellError = String(message || "")
+    root.spellRevision += 1
+    if (spellSquiggles) spellSquiggles.requestPaint()
+  }
+
+  // Safe JSON parsing for the helper. Offsets are UTF-16 code units, which is
+  // exactly what TextEdit.remove()/insert() and positionToRectangle() use.
+  function spellParse(raw, source) {
+    var original = source === undefined ? String(root.text) : String(source)
+    var json = String(raw === undefined || raw === null ? "" : raw).trim()
+    if (json === "") {
+      return { ok: false, error: "Spellcheck returned no output", issues: [] }
+    }
+    var payload = null
+    try {
+      payload = JSON.parse(json)
+    } catch (error) {
+      return { ok: false, error: "Spellcheck returned invalid JSON", issues: [] }
+    }
+    if (!payload || payload.ok !== true) {
+      return {
+        ok: false,
+        error: payload && payload.error ? String(payload.error) : "Spellcheck failed",
+        issues: []
+      }
+    }
+    var output = []
+    var words = Array.isArray(payload.words) ? payload.words : []
+    for (var i = 0; i < words.length; i++) {
+      var item = words[i] || {}
+      var word = String(item.word === undefined || item.word === null ? "" : item.word)
+      var start = Math.round(Number(item.start))
+      var end = Math.round(Number(item.end))
+      if (word === "" || !isFinite(start) || !isFinite(end)) continue
+      if (start < 0 || end <= start || end > original.length) continue
+      var suggestions = []
+      if (Array.isArray(item.suggestions)) {
+        for (var s = 0; s < item.suggestions.length && suggestions.length < 8; s++) {
+          var suggestion = String(item.suggestions[s])
+          if (suggestion !== "") suggestions.push(suggestion)
+        }
+      }
+      output.push({ word: word, start: start, end: end, suggestions: suggestions })
+    }
+    return { ok: true, error: "", issues: output }
+  }
+
+  function spellIssueAt(x, y) {
+    if (root.spellIssues.length === 0) return null
+    if (Number(x) < 0 || Number(y) < 0) return null
+    var position = root.positionAt(Number(x) || 0, Number(y) || 0)
+    for (var i = 0; i < root.spellIssues.length; i++) {
+      var issue = root.spellIssues[i]
+      if (position >= issue.start && position < issue.end) return issue
+    }
+    return null
+  }
+
+  function spellIssueAtCursor() {
+    for (var i = 0; i < root.spellIssues.length; i++) {
+      var issue = root.spellIssues[i]
+      if (root.cursorPosition >= issue.start && root.cursorPosition < issue.end) return issue
+    }
+    return null
+  }
+
+  function requestSpellcheck() {
+    if (!root.spellcheckEnabled || root.readOnly || root.spellHelperPath === ""
+      || root.text.length > 200000) {
+      root.spellClear("")
+      return false
+    }
+    if (root.text.length === 0) {
+      root.spellClear("")
+      return true
+    }
+    if (spellProcess.running) {
+      root.spellPending = true
+      return false
+    }
+    root.spellRequestId += 1
+    spellProcess.requestId = root.spellRequestId
+    spellProcess.requestText = String(root.text)
+    spellProcess.outText = ""
+    spellProcess.errText = ""
+    root.spellBusy = true
+    spellProcess.command = ["/usr/bin/python3", root.spellHelperPath]
+    spellProcess.stdinEnabled = true
+    spellProcess.running = true
+    return true
+  }
+
+  function finishSpellcheck(exitCode) {
+    var requestId = spellProcess.requestId
+    var snapshot = spellProcess.requestText
+    root.spellBusy = false
+    if (requestId !== root.spellRequestId) return
+    if (snapshot !== root.text) {
+      // The note changed while hunspell was running. Drop this result and let
+      // the debounce ask again rather than drawing stale offsets.
+      root.spellPending = false
+      spellTimer.restart()
+      return
+    }
+    if (!root.spellcheckEnabled || root.readOnly || root.text.length > 200000) {
+      root.spellClear("")
+      return
+    }
+    var parsed = root.spellParse(spellProcess.outText, snapshot)
+    if (!parsed.ok) {
+      var message = parsed.error || "Spellcheck failed"
+      var stderr = String(spellProcess.errText || "").trim()
+      if (message === "Spellcheck returned no output" && stderr !== "") message = stderr
+      if (exitCode !== 0 && stderr !== "" && message.indexOf(stderr) < 0) {
+        message = stderr
+      }
+      root.spellIssues = []
+      root.spellSnapshot = ""
+      root.spellError = message
+    } else {
+      root.spellIssues = parsed.issues
+      root.spellSnapshot = snapshot
+      root.spellError = ""
+    }
+    root.spellRevision += 1
+    if (spellSquiggles) spellSquiggles.requestPaint()
+    if (root.spellPending) {
+      root.spellPending = false
+      spellTimer.restart()
+    }
+  }
+
+  function openSpellSuggestionsAt(x, y) {
+    var issue = root.spellIssueAt(x, y)
+    if (!issue) return false
+    spellPopup.showIssue(issue, x, y)
+    return true
+  }
+
+  function openSpellMenu() {
+    var issue = root.spellIssueAt(root.spellClickPoint.x, root.spellClickPoint.y)
+    var px = root.spellClickPoint.x
+    var py = root.spellClickPoint.y
+    if (!issue) {
+      issue = root.spellIssueAtCursor()
+      if (issue) {
+        var rect = root.positionToRectangle(issue.start)
+        px = rect.x + 4
+        py = rect.y + rect.height
+      }
+    }
+    if (!issue) return false
+    spellPopup.showIssue(issue, px, py)
+    return true
+  }
+
+  function applySpellSuggestion(start, end, suggestion) {
+    start = Math.round(Number(start))
+    end = Math.round(Number(end))
+    var replacement = String(suggestion === undefined || suggestion === null ? "" : suggestion)
+    if (!isFinite(start) || !isFinite(end) || !root.enabled || root.readOnly) return false
+    if (start < 0 || end <= start || end > root.text.length || replacement === "") return false
+    if (root.spellSnapshot !== root.text) {
+      // The text moved since the suggestion list was built. Never replace a
+      // range that no longer means the same word.
+      root.spellPending = false
+      spellTimer.restart()
+      return false
+    }
+    root.remove(start, end)
+    root.insert(start, replacement)
+    root.cursorPosition = start + replacement.length
+    root.spellSnapshot = ""
+    root.spellIssues = []
+    root.spellRevision += 1
+    if (spellSquiggles) spellSquiggles.requestPaint()
+    spellPopup.close()
+    root.forceActiveFocus()
+    root.requestSpellcheck()
+    return true
+  }
+
+  function paintSpellWave(ctx, x1, y, x2) {
+    if (!(x2 > x1)) return
+    var step = 4
+    var amplitude = 1.6
+    var lift = -amplitude
+    ctx.beginPath()
+    ctx.moveTo(x1, y)
+    for (var x = x1; x < x2; x += step) {
+      var middle = Math.min(x + step / 2, x2)
+      var next = Math.min(x + step, x2)
+      ctx.quadraticCurveTo(middle, y + lift, next, y)
+      lift = -lift
+    }
+    ctx.stroke()
+  }
+
+  function paintSpellSquiggles(ctx) {
+    ctx.clearRect(0, 0, spellSquiggles.width, spellSquiggles.height)
+    if (!root.spellcheckEnabled || root.readOnly || root.spellIssues.length === 0) return
+    var colour = Commons.Color.urgent
+    ctx.strokeStyle = Qt.rgba(colour.r, colour.g, colour.b, 0.8)
+    ctx.lineWidth = 1
+    ctx.lineCap = "round"
+    for (var i = 0; i < root.spellIssues.length; i++) {
+      var issue = root.spellIssues[i]
+      if (issue.start < 0 || issue.end > root.text.length) continue
+      var from = root.positionToRectangle(issue.start)
+      var to = root.positionToRectangle(issue.end)
+      if (from.height <= 0) continue
+      var firstLine = from.y + from.height - 1
+      var lastLine = to.y + to.height - 1
+      if (Math.abs(firstLine - lastLine) < 1) {
+        root.paintSpellWave(ctx, from.x, firstLine, to.x)
+      } else {
+        // A word wrapped at the right edge: underline up to the edge, then
+        // from the left content edge on the final visual line.
+        var right = Math.max(from.x, spellSquiggles.width - root.rightPadding)
+        root.paintSpellWave(ctx, from.x, firstLine, right)
+        root.paintSpellWave(ctx, root.leftPadding, lastLine, to.x)
+      }
+    }
   }
 
   function escapeHtml(value) {
@@ -1023,6 +1281,36 @@ TextArea {
     }
   }
 
+  // Spellcheck: one hunspell session per debounced request. The note text goes
+  // over stdin, so there are no temp files or shell quoting concerns.
+  Process {
+    id: spellProcess
+    property int requestId: 0
+    property string requestText: ""
+    property string outText: ""
+    property string errText: ""
+    stdinEnabled: true
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: spellProcess.outText = String(text || "")
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: spellProcess.errText = String(text || "")
+    }
+    onStarted: {
+      write(spellProcess.requestText)
+      stdinEnabled = false
+    }
+    onExited: function(exitCode) { root.finishSpellcheck(exitCode) }
+  }
+
+  Timer {
+    id: spellTimer
+    interval: 800
+    onTriggered: root.requestSpellcheck()
+  }
+
   Timer {
     id: pasteTimer
     interval: 15000
@@ -1630,6 +1918,92 @@ TextArea {
     }
   }
 
+  // Themed suggestions for the misspelled word under the right-click point
+  // (or the caret when opened from the strip's Spelling action).
+  Popup {
+    id: spellPopup
+    objectName: "quillSpellSuggestions"
+    property string word: ""
+    property int issueStart: -1
+    property int issueEnd: -1
+    property var suggestions: []
+    readonly property bool hasSuggestions: suggestions.length > 0
+    width: Style.space(220)
+    height: spellColumn.implicitHeight + topPadding + bottomPadding
+    padding: Style.space(6)
+    popupType: Qt.platform.pluginName !== "wayland" ? Popup.Window : Popup.Item
+    focus: true
+    closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+    onClosed: root.forceActiveFocus()
+
+    function showIssue(issue, px, py) {
+      word = String(issue.word || "")
+      issueStart = issue.start
+      issueEnd = issue.end
+      suggestions = (issue.suggestions || []).slice(0, 8)
+      open()
+      var gap = Style.space(6)
+      var margin = Style.space(6)
+      var win = root.Window.window
+      var winWidth = win ? win.width : root.width
+      var winHeight = win ? win.height : root.height
+      var point = root.mapToItem(null, px, py)
+      var nx = Math.max(margin, Math.min(winWidth - width - margin, point.x))
+      var ny = point.y + gap
+      if (ny + height > winHeight - margin) ny = point.y - height - gap
+      ny = Math.max(margin, Math.min(winHeight - height - margin, ny))
+      var origin = root.mapFromItem(null, nx, ny)
+      x = origin.x
+      y = origin.y
+    }
+
+    background: BorderSurface {
+      color: Commons.Color.menu.background
+      borderSpec: Border.controlSpec("normal", Commons.Color.menu.border,
+        Commons.Color.accent)
+      radius: Style.cornerRadius
+    }
+
+    contentItem: Column {
+      id: spellColumn
+      spacing: Style.space(2)
+      width: spellPopup.width - spellPopup.leftPadding - spellPopup.rightPadding
+
+      Text {
+        width: parent.width
+        text: spellPopup.word
+        color: Commons.Color.menu.text
+        font.family: Style.font.family
+        font.pixelSize: Style.font.bodySmall
+        font.bold: true
+        elide: Text.ElideRight
+      }
+      Repeater {
+        model: spellPopup.suggestions
+        Button {
+          required property string modelData
+          required property int index
+          objectName: "quillSpellSuggestion" + index
+          width: spellColumn.width
+          text: modelData
+          fontSize: Style.font.bodySmall
+          horizontalPadding: Style.space(5)
+          verticalPadding: Style.space(3)
+          onClicked: root.applySpellSuggestion(spellPopup.issueStart,
+            spellPopup.issueEnd, modelData)
+        }
+      }
+      Text {
+        visible: !spellPopup.hasSuggestions
+        width: parent.width
+        text: "No suggestions"
+        color: Util.alpha(Commons.Color.menu.text, 0.7)
+        font.family: Style.font.family
+        font.pixelSize: Style.font.bodySmall
+      }
+    }
+  }
+
   // A compact horizontal action strip in place of the stock vertical text
   // menu. Right-click centres it over the pointer and lifts it above the
   // click, flipping below when there is no room at the top of the editor.
@@ -1731,6 +2105,18 @@ TextArea {
           root.remove(Math.min(root.selectionStart, root.selectionEnd),
             Math.max(root.selectionStart, root.selectionEnd))
           editorMenu.close()
+        }
+      }
+
+      MenuDivider {}
+
+      MenuAction {
+        glyph: "\uf02d"
+        tip: "Spelling"
+        enabled: !root.readOnly && root.spellMenuIssue !== null
+        onActivated: {
+          editorMenu.close()
+          root.openSpellMenu()
         }
       }
 
@@ -1843,10 +2229,39 @@ TextArea {
   persistentSelection: true
 
   onTextChanged: {
+    if (root.spellSnapshot !== root.text && root.spellIssues.length > 0) {
+      root.spellIssues = []
+      root.spellRevision += 1
+    }
+    spellTimer.restart()
     if (root.suppressFormatHistory) return
     root.formatUndoPending = false
     root.formatRedoPending = false
   }
+
+  onWidthChanged: {
+    if (spellSquiggles) spellSquiggles.requestPaint()
+    spellTimer.restart()
+  }
+
+  onFontChanged: {
+    if (spellSquiggles) spellSquiggles.requestPaint()
+    spellTimer.restart()
+  }
+
+  onReadOnlyChanged: {
+    if (root.readOnly) root.spellClear("")
+    else spellTimer.restart()
+  }
+
+  onSpellcheckEnabledChanged: {
+    if (!root.spellcheckEnabled) root.spellClear("")
+    else spellTimer.restart()
+  }
+
+  onStorePathChanged: spellTimer.restart()
+
+  Component.onCompleted: spellTimer.restart()
 
   FontMetrics {
     id: editorMetrics
@@ -1884,6 +2299,22 @@ TextArea {
       color: root.foregroundColor
       font.family: root.font.family
       font.pixelSize: root.font.pixelSize
+    }
+
+    // Squiggles sit above the styled text but below the transparent TextArea,
+    // so hit-testing, selection and the caret are untouched. positionToRectangle
+    // already includes leftPadding/topPadding, matching this canvas's origin.
+    Canvas {
+      id: spellSquiggles
+      objectName: "quillSpellSquiggles"
+      anchors.fill: parent
+      visible: root.spellIssues.length > 0
+      property int revision: root.spellRevision
+      onRevisionChanged: requestPaint()
+      onVisibleChanged: if (visible) requestPaint()
+      onWidthChanged: requestPaint()
+      onHeightChanged: requestPaint()
+      onPaint: root.paintSpellSquiggles(getContext("2d"))
     }
   }
 
@@ -1938,7 +2369,10 @@ TextArea {
   }
 
   onPressed: function(mouse) {
-    if (mouse.button === Qt.RightButton) editorMenu.showAt(mouse.x, mouse.y)
+    if (mouse.button === Qt.RightButton) {
+      root.spellClickPoint = Qt.point(mouse.x, mouse.y)
+      editorMenu.showAt(mouse.x, mouse.y)
+    }
   }
 
   // One icon button in the right-click strip. The glyphs are Nerd Font icons

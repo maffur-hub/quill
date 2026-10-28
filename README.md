@@ -44,6 +44,7 @@ backlinks. Deleting `index.db` is safe; it is rebuilt automatically.
   scripts/quill-store  Python 3 stdlib backend (JSON in / JSON out)
   scripts/quill-agent  Node JSONL bridge to the OpenCode service (chat)
   scripts/quill-paste-image  clipboard image → attachment store helper
+  scripts/quill-spellcheck  local hunspell spellcheck helper (JSON in / JSON out)
   scripts/quill-math   offline TeX → themed SVG renderer (JSON in / JSON out)
   scripts/quill-export-html  Markdown → one standalone HTML file (images + SVG maths)
   scripts/quill-window launcher for Detached.qml (stages it for `qs -p`)
@@ -258,9 +259,9 @@ the editor regains focus and the selection is restored.
 
 Right-clicking the editor opens a compact horizontal icon strip centred above
 the pointer (it flips below the click near the top edge). It carries
-undo/redo, the clipboard actions, select all, the inline formatting actions
-and date/time insertion; each icon has a tooltip. It works in both the
-Library and detached note windows.
+undo/redo, the clipboard actions, select all, a spelling-suggestions action,
+the inline formatting actions and date/time insertion; each icon has a
+tooltip. It works in both the Library and detached note windows.
 
 The toolbar writes ordinary Markdown plus a tiny HTML whitelist that Joplin
 also accepts:
@@ -312,6 +313,38 @@ Qt's `Text.MarkdownText` paints `_text_` as **underline** even though Markdown
 defines it as italic. Quill's editor underlay has always rendered italic; the
 preview and agent chat now route underscore emphasis through `MathText.js`, so
 all three agree. Use `<u>…</u>` for underline.
+
+## Spellcheck
+
+Spelling is checked locally with `hunspell` through
+`scripts/quill-spellcheck`; nothing leaves the machine and no service is
+contacted. The helper reads the note body on stdin and returns JSON with
+UTF-16 offsets (the same indexing QML uses, including for emoji). After about
+800 ms without typing, misspelled prose words get a subtle red squiggle in the
+editor, drawn by a Canvas behind the transparent TextArea so selection, the
+caret, IME and undo/redo behave normally.
+
+The right-click strip has a **Spelling** action. It opens a themed suggestion
+popup for the misspelled word under the click (or under the caret): choose a
+suggestion to replace exactly that word, or see “No suggestions”. The list
+comes from the local dictionary; applying one is a normal edit, so native
+undo still works. The action is disabled for read-only notes and when no
+suggestion target is available.
+
+Markdown is masked before checking, so the following never produce squiggles:
+YAML frontmatter, fenced (``` / ~~~) and inline code, URLs, `www.` addresses
+and email addresses, Markdown link destinations, wiki links (`[[…]]`), inline
+`#tags`, HTML tags and entities, and `$…$`, `$$…$$`, `\(…\)` or `\[…\]`
+maths. Prose inside link text and headings is still checked. Single-letter
+tokens, pure numbers and short all-caps acronyms are skipped.
+
+The default dictionary is `en_AU`. Set `QUILL_HUNSPELL` to use a different
+hunspell binary and `QUILL_HUNSPELL_DICTIONARY` to pass a different `-d`
+dictionary. A missing binary or dictionary is reported through the editor's
+`spellError` property rather than blocking editing. Spellcheck is skipped for
+notes over 200,000 characters; the helper also caps input at 2 MiB and 5,000
+unique words. This is **spellcheck only: there is no grammar checking** and no
+LanguageTool or network integration.
 
 ## Chat
 

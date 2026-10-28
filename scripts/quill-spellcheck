@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+"""Spellcheck one Markdown note with hunspell.
+
+Reads UTF-8 note text from stdin and writes one JSON object to stdout:
+
+    {"ok": true, "words": [
+      {"word": "wrold", "start": 12, "end": 17, "suggestions": ["world"]}
+    ]}
+
+Offsets are UTF-16 code units, matching QML/Qt string indexing. All
+processing is local: hunspell plus the Python standard library. Masked
+Markdown regions keep their length (non-newline characters become spaces) so
+a prose token's offset still points at the same characters in the original.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+
+MAX_BYTES = 2 * 1024 * 1024
+MAX_UNIQUE_WORDS = 5000
+MAX_SUGGESTIONS = 8
+HUNSPELL_TIMEOUT = 20
+
+# Unicode letters, joined by apostrophes or hyphens. Digits are not part of a
+# prose word; a mixed token such as "abc123" is checked as "abc".
+TOKEN_RE = re.compile(r"[^\W\d_]+(?:[-'\u2019][^\W\d_]+)*", re.UNICODE)
+
+FENCE_RE = re.compile(r"(`{3,}|~{3,})")
+INLINE_CODE_RE = re.compile(r"(`+)(.*?)\1", re.S)
+MATH_BLOCK_RE = re.compile(r"\$\$(?=\S).*?(?<=\S)\$\$", re.S)
+MATH_INLINE_RE = re.compile(r"(?<![\\$])\$(?=\S)(?:[^\n$\\]|\\.)*?(?<=\S)\$(?!\$)")
+MATH_PAREN_RE = re.compile(r"\\\((?=\S).*?(?<=\S)\\\)", re.S)
+MATH_BRACKET_RE = re.compile(r"\\\[(?=\S).*?(?<=\S)\\\]", re.S)
+HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
+WIKI_LINK_RE = re.compile(r"\[\[[^\]\n]*\]\]")
+LINK_DEST_RE = re.compile(
+    r"\]\(\s*(?:<[^>\n]*>|[^)\n]*?)(?:\s+[\"'][^\"'\n]*[\"'])?\s*\)")
+REF_DEF_RE = re.compile(r"(?m)^[ \t]{0,3}\[[^\]\n]+\]:[ \t]*\S+.*$")
+URL_RE = re.compile(r"(?:https?://|ftp://|www\.)[^\s<>()\[\]{}\"']+", re.I)
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+HTML_TAG_RE = re.compile(
+    r"</?[A-Za-z][A-Za-z0-9-]*(?:\s+[A-Za-z_:][-A-Za-z0-9_:.]*"
+    r"(?:\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s\"'=<>`]+))?)*\s*/?>")
+HTML_ENTITY_RE = re.compile(r"&(?:[A-Za-z][A-Za-z0-9]{1,31}|#\d+|#x[0-9A-Fa-f]+);")
+INLINE_TAG_RE = re.compile(r"(?<![\w#])#[A-Za-z][\w/-]*")
+
+
+def fail(message):
+    write_json({"ok": False, "error": str(message)})
+    return 0
+
+
+def write_json(payload):
+    sys.stdout.write(json.dumps(payload, ensure_ascii=True) + "\n")
+    sys.stdout.flush()
+
+
+def mask_range(chars, start, end):
+    """Blank a range without moving offsets; newlines are left intact."""
+    start = max(0, start)
+    end = min(len(chars), end)
+    for index in range(start, end):
+        if chars[index] not in "\r\n":
+            chars[index] = " "
+
+
+def mask_regex(chars, pattern, text):
+    for match in pattern.finditer(text):
+        mask_range(chars, match.start(), match.end())
+
+
+def mask_frontmatter(chars, text):
+    opening = re.match(r"---[ \t]*\r?\n", text)
+    if not opening:
+        return
+    closing = re.search(r"(?m)^(?:---|\.\.\.)[ \t]*\r?$", text[opening.end():])
+    if not closing:
+        return
+    mask_range(chars, 0, opening.end() + closing.end())
+
+
+def mask_fenced_code(chars, text):
+    offset = 0
+    fence_char = ""
+    fence_length = 0
+    for line in text.splitlines(keepends=True):
+        content = line.rstrip("\r\n")
+        stripped = content.lstrip(" ")
+        indent = len(content) - len(stripped)
+        fence = FENCE_RE.match(stripped) if indent <= 3 else None
+        if fence_char == "":
+            if fence:
+                fence_char = fence.group(1)[0]
+                fence_length = len(fence.group(1))
+                mask_range(chars, offset, offset + len(content))
+        else:
+            mask_range(chars, offset, offset + len(content))
+            if fence and fence.group(1)[0] == fence_char \
+                    and len(fence.group(1)) >= fence_length:
+                fence_char = ""
+        offset += len(line)
+
+
+def masked_text(text):
+    chars = list(text)
+    mask_frontmatter(chars, text)
+    mask_fenced_code(chars, text)
+    current = "".join(chars)
+    mask_regex(chars, INLINE_CODE_RE, current)
+    current = "".join(chars)
+    for pattern in (MATH_BLOCK_RE, MATH_INLINE_RE, MATH_PAREN_RE, MATH_BRACKET_RE):
+        mask_regex(chars, pattern, current)
+        current = "".join(chars)
+    for pattern in (HTML_COMMENT_RE, WIKI_LINK_RE, LINK_DEST_RE, REF_DEF_RE,
+                    URL_RE, EMAIL_RE, HTML_TAG_RE, HTML_ENTITY_RE, INLINE_TAG_RE):
+        mask_regex(chars, pattern, current)
+        current = "".join(chars)
+    return current
+
+
+def utf16_offsets(text, positions):
+    """Map codepoint indexes to UTF-16 code-unit indexes in one pass."""
+    needed = set(positions)
+    mapped = {}
+    units = 0
+    for index, character in enumerate(text):
+        if index in needed:
+            mapped[index] = units
+        units += 2 if ord(character) > 0xFFFF else 1
+    if len(text) in needed:
+        mapped[len(text)] = units
+    return mapped
+
+
+def run_hunspell(words):
+    binary = os.environ.get("QUILL_HUNSPELL") or "hunspell"
+    dictionary = os.environ.get("QUILL_HUNSPELL_DICTIONARY")
+    if dictionary is None:
+        dictionary = "en_AU"
+    dictionary = dictionary.strip()
+    command = [binary, "-a", "-i", "UTF-8"]
+    if dictionary:
+        command.extend(["-d", dictionary])
+    payload = "\n".join(words) + "\n"
+    try:
+        completed = subprocess.run(
+            command,
+            input=payload.encode("utf-8"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=HUNSPELL_TIMEOUT,
+        )
+    except FileNotFoundError:
+        raise RuntimeError("hunspell not found: " + binary)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("hunspell timed out")
+    except OSError as error:
+        raise RuntimeError("could not run hunspell: " + str(error))
+
+    stderr = completed.stderr.decode("utf-8", "replace").strip()
+    if completed.returncode != 0:
+        raise RuntimeError(stderr or ("hunspell exited " + str(completed.returncode)))
+
+    lines = completed.stdout.decode("utf-8", "replace").splitlines()
+    index = 0
+    while index < len(lines) and not lines[index].startswith("@(#)"):
+        index += 1
+    if index >= len(lines):
+        raise RuntimeError(stderr or "hunspell returned no dictionary header")
+    index += 1
+
+    results = {}
+    for word in words:
+        while index < len(lines) and lines[index].strip() == "":
+            index += 1
+        block = []
+        while index < len(lines) and lines[index].strip() != "":
+            block.append(lines[index])
+            index += 1
+        if not block:
+            results[word] = None
+            continue
+        answer = None
+        for line in block:
+            if line.startswith("&"):
+                match = re.match(r"&\s+\S+\s+\d+\s+\d+:\s*(.*)$", line)
+                suggestions = []
+                if match:
+                    for item in match.group(1).split(","):
+                        item = item.strip()
+                        if item and item not in suggestions:
+                            suggestions.append(item)
+                answer = suggestions[:MAX_SUGGESTIONS]
+                break
+            if line.startswith("#"):
+                answer = []
+                break
+        # No & / # answer means accepted (* / + / -, or an unknown marker).
+        # hunspell can emit several lines for one hyphenated word.
+        results[word] = answer
+    return results
+
+
+def spellcheck(text):
+    masked = masked_text(text)
+    occurrences = {}
+    order = []
+    for match in TOKEN_RE.finditer(masked):
+        word = match.group(0)
+        if len(word) < 2:
+            continue
+        if word.isupper() and len(word) <= 4:
+            continue
+        if word not in occurrences:
+            occurrences[word] = []
+            order.append(word)
+        occurrences[word].append((match.start(), match.end()))
+
+    if len(order) > MAX_UNIQUE_WORDS:
+        raise RuntimeError("Too many unique words (limit %d)" % MAX_UNIQUE_WORDS)
+    if not order:
+        return []
+
+    results = run_hunspell(order)
+    misspelled = []
+    for word in order:
+        suggestions = results.get(word)
+        if suggestions is None:
+            continue
+        for start, end in occurrences[word]:
+            misspelled.append((start, end, word, suggestions))
+
+    if not misspelled:
+        return []
+
+    positions = []
+    for start, end, _word, _suggestions in misspelled:
+        positions.append(start)
+        positions.append(end)
+    offsets = utf16_offsets(text, positions)
+
+    issues = []
+    for start, end, word, suggestions in misspelled:
+        issues.append({
+            "word": word,
+            "start": offsets[start],
+            "end": offsets[end],
+            "suggestions": list(suggestions),
+        })
+    issues.sort(key=lambda issue: issue["start"])
+    return issues
+
+
+def main():
+    raw = sys.stdin.buffer.read(MAX_BYTES + 1)
+    if len(raw) > MAX_BYTES:
+        return fail("Input is too large (limit %d bytes)" % MAX_BYTES)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        return fail("Input is not valid UTF-8: " + str(error))
+    try:
+        words = spellcheck(text)
+    except RuntimeError as error:
+        return fail(error)
+    except Exception as error:  # never crash on unexpected note content
+        return fail("Spellcheck failed: " + str(error))
+    write_json({"ok": True, "words": words})
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
