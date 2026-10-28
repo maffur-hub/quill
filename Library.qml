@@ -99,6 +99,9 @@ Item {
   property var pendingNoteAction: null
   property string renameTargetId: ""
   property string renameNoteText: ""
+  // The note the open tag-suggestion popup was built from. Apply must target
+  // this id even if the selection moved underneath it.
+  property string tagSuggestNoteId: ""
   property string deleteNoteTargetId: ""
   property string deleteNoteTargetTitle: ""
   property int saveSeq: 0
@@ -419,6 +422,7 @@ Item {
     inFlightSaveText = ""
     suppressDirty = true
     editor.text = ""
+    editor.resetFormatHistory()
     editor.cursorPosition = 0
     suppressDirty = false
     loaded = false
@@ -468,6 +472,7 @@ Item {
         if (requestedId !== root.selectedId) return
         root.suppressDirty = true
         editor.text = result.tooLarge ? "" : String(result.content || "")
+        editor.resetFormatHistory()
         editor.cursorPosition = caretAtEnd ? editor.text.length : 0
         root.suppressDirty = false
         root.loadingNote = false
@@ -540,6 +545,7 @@ Item {
     var text = root.draftText
     root.suppressDirty = true
     editor.text = text
+    editor.resetFormatHistory()
     editor.cursorPosition = text.length
     root.suppressDirty = false
     root.draftPending = false
@@ -646,6 +652,21 @@ Item {
     action()
   }
 
+  // A save that could not even be prepared (for example createObject returned
+  // null) must not leave a queued note action or a tag apply locked forever.
+  function savePrepareFailed(message) {
+    saveState = "Save failed"
+    statusText = message
+    pendingEditorOpen = false
+    if (pendingNoteAction
+        && String(pendingNoteAction.id) === String(selectedId)) {
+      pendingNoteAction = null
+    }
+    if (tagSuggestPopup && tagSuggestPopup.applying) {
+      tagSuggestPopup.showError(message)
+    }
+  }
+
   function flushSave() {
     saveTimer.stop()
     if (!root.writesAllowed) {
@@ -664,9 +685,7 @@ Item {
     var path = dataRoot + "/.quill-save-" + saveSeq + "-" + Date.now() + ".md"
     var view = saveFileComponent.createObject(root, { path: path })
     if (!view) {
-      saveState = "Save failed"
-      statusText = "Could not prepare a save"
-      pendingEditorOpen = false
+      savePrepareFailed("Could not prepare a save")
       return
     }
     var text = String(editor.text)
@@ -922,6 +941,7 @@ Item {
     var scrollY = editorScroll.contentY
     root.suppressDirty = true
     editor.text = value
+    editor.resetFormatHistory()
     editor.cursorPosition = Math.min(caret, value.length)
     root.suppressDirty = false
     root.savedTextById[id] = value
@@ -977,6 +997,9 @@ Item {
 
   function openTagSuggest() {
     if (!root.tagSuggestAvailable()) return
+    // Never replace an in-flight apply with a fresh popup state.
+    if (tagSuggestPopup.applying) return
+    var id = String(root.selectedId)
     var note = root.selectedNote
     var noteTags = note.tags ? note.tags : []
     var suggestions = TagSuggest.suggest(
@@ -984,15 +1007,41 @@ Item {
       String(editor.text || ""),
       noteTags,
       root.tagSuggestKnownTags())
+    root.tagSuggestNoteId = id
     tagSuggestPopup.openFor(suggestions, noteTags)
   }
 
+  function clearTagSuggestTarget() {
+    root.tagSuggestNoteId = ""
+  }
+
+  // A backend tag write can hang (for example a stuck lock). Release the modal
+  // after 20s so Escape/Cancel work again. A late result is still protected by
+  // applySuggestedTags()'s captured editVersion: newer typing is never
+  // replaced, and a clean unchanged buffer may accept the result harmlessly.
+  function tagApplyTimedOut() {
+    if (!tagSuggestPopup || !tagSuggestPopup.applying) return
+    root.clearTagSuggestTarget()
+    var message = "Adding tags timed out — try again"
+    root.statusText = message
+    tagSuggestPopup.showError(message)
+  }
+
   function applySuggestedTags(tags) {
+    var id = root.tagSuggestNoteId
+    // A window shortcut (Ctrl+N, Ctrl+Delete, refresh removing the note) can
+    // change the selection while the modal popup is open. Suggestions built
+    // for note A must never be written to note B.
+    if (id === "" || id !== String(root.selectedId)) {
+      tagSuggestPopup.showError("The note changed — reopen Add tags")
+      root.statusText = "The note changed — reopen Add tags"
+      root.clearTagSuggestTarget()
+      return
+    }
     if (!root.tagSuggestAvailable()) {
       tagSuggestPopup.showError("This note cannot be edited right now")
       return
     }
-    var id = root.selectedId
     var note = root.selectedNote
     var seen = {}
     if (note.tags) {
@@ -1011,21 +1060,47 @@ Item {
       tagSuggestPopup.showError("Select or type at least one new tag")
       return
     }
+    // Capture the buffer version at the moment the user presses Apply. If it
+    // moves while tag-add runs, newer typing must not be replaced.
+    var applyVersion = root.editVersion
     tagSuggestPopup.applying = true
     tagSuggestPopup.errorText = ""
     // Any dirty buffer is written first: tag-add must edit the saved note, not
     // race the asynchronous temp-file save.
     root.afterSave(id, function() {
+      // afterSave() can still run after the user switched notes; abort before
+      // issuing the backend command for an id that is no longer selected.
+      if (String(root.selectedId) !== id) {
+        tagSuggestPopup.showError("The note changed — reopen Add tags")
+        root.statusText = "The note changed — reopen Add tags"
+        root.clearTagSuggestTarget()
+        return
+      }
       root.enqueue({
         args: ["tag-add", id].concat(clean),
         silent: true,
         onSuccess: function(result) {
+          var keptNewerEdits = false
           if (root.selectedId === id) {
-            root.applyExternalContent(result.content, result.modified, "Tags added")
+            // editVersion also resets on a safe external reload, so treat the
+            // buffer as unchanged when a clean editor already holds exactly
+            // the tag-add result (the file watcher may have applied it first).
+            var versionChanged = root.editVersion !== applyVersion
+            var alreadyApplied = !root.dirty
+              && String(editor.text) === String(result.content)
+            if (!versionChanged || alreadyApplied) {
+              root.applyExternalContent(result.content, result.modified, "Tags added")
+            } else {
+              // Tags landed on disk; keep the newer buffer instead of
+              // clobbering it with the stale tag-add content.
+              keptNewerEdits = true
+            }
           }
+          root.clearTagSuggestTarget()
           tagSuggestPopup.finishSuccess()
-          root.statusText = "Tags added"
-          root.refreshAll("Tags added")
+          root.statusText = keptNewerEdits
+            ? "Tags added — newer edits kept" : "Tags added"
+          root.refreshAll(root.statusText)
         },
         onError: function(message) {
           // Keep the popup open so the selection is not lost; the note itself
@@ -1228,6 +1303,7 @@ Item {
 
     var caret = editor.cursorPosition
     editor.text = nextText
+    editor.resetFormatHistory()
     editor.cursorPosition = Math.min(caret, nextText.length)
     tableEditor.commitSucceeded = true
     tableSavePending = true
@@ -1796,18 +1872,24 @@ Item {
     if (!deleteArmed || deleteArmId !== selectedId) { armDelete(false); return }
     var id = selectedId
     deleteArmed = false
+    // Flush the open table into the buffer before the save check: the grid's
+    // edits are only committed to editor.text by closeTable().
     if (tableOpen) closeTable(false)
-    enqueue({
-      args: ["trash", id],
-      silent: true,
-      onSuccess: function(result) {
-        if (root.selectedId === id) root.selectedId = ""
-        root.pendingSelectId = ""
-        root.statusText = "Moved to Trash"
-        root.refreshAll()
-        root.refreshTrash()
-      },
-      onError: function(message) { root.statusText = message }
+    // Write a pending edit before the backend moves the file; the command only
+    // runs in the save's success continuation.
+    root.afterSave(id, function() {
+      enqueue({
+        args: ["trash", id],
+        silent: true,
+        onSuccess: function(result) {
+          if (root.selectedId === id) root.selectedId = ""
+          root.pendingSelectId = ""
+          root.statusText = "Moved to Trash"
+          root.refreshAll()
+          root.refreshTrash()
+        },
+        onError: function(message) { root.statusText = message }
+      })
     })
   }
 
@@ -1870,18 +1952,25 @@ Item {
 
   function moveSelectedTo(folder) {
     if (!selectedNote || selectedNote.trashed) return
-    if (String(selectedNote.folder || "") === String(folder || "")) return
     var id = selectedId
-    enqueue({
-      args: ["move", id, "--folder", String(folder || "")],
-      silent: true,
-      onSuccess: function(result) {
-        root.pendingSelectId = String(result.id || id)
-        root.category = String(folder || "") === "" ? "all" : "folder:" + String(folder)
-        root.statusText = "Moved"
-        root.refreshAll()
-      },
-      onError: function(message) { root.statusText = message }
+    var targetFolder = String(folder || "")
+    if (String(selectedNote.folder || "") === targetFolder) return
+    // Commit grid edits so afterSave sees a dirty buffer and flushes them.
+    if (tableOpen) closeTable(false)
+    // Flush the open buffer first: moving the file before the queued save
+    // lands would write the old text (or fail against the moved path).
+    root.afterSave(id, function() {
+      enqueue({
+        args: ["move", id, "--folder", targetFolder],
+        silent: true,
+        onSuccess: function(result) {
+          root.pendingSelectId = String(result.id || id)
+          root.category = targetFolder === "" ? "all" : "folder:" + targetFolder
+          root.statusText = "Moved"
+          root.refreshAll()
+        },
+        onError: function(message) { root.statusText = message }
+      })
     })
   }
 
@@ -1918,7 +2007,6 @@ Item {
         args: ["rename", id, "--title", title],
         silent: true,
         onSuccess: function(result) {
-          root.pendingSelectId = String(result.id || id)
           root.statusText = "Renamed"
           root.refreshAll()
           root.reloadRenamedNote(id)
@@ -2139,6 +2227,12 @@ Item {
   }
 
   function handleEscape() {
+    if (tagSuggestPopup && tagSuggestPopup.opened) {
+      // Escape is the popup's cancel key, but never while a tag write is in
+      // flight: closing then would let the result overwrite newer typing.
+      if (!tagSuggestPopup.applying) tagSuggestPopup.close()
+      return
+    }
     if (root.exportOpen) {
       root.closeExport()
       return
@@ -2196,6 +2290,20 @@ Item {
   }
 
   Timer { id: saveTimer; interval: 600; onTriggered: root.flushSave() }
+  Timer {
+    id: tagApplyTimer
+    objectName: "tagApplyTimeoutTimer"
+    interval: 20000
+    repeat: false
+    onTriggered: root.tagApplyTimedOut()
+  }
+  Connections {
+    target: tagSuggestPopup
+    function onApplyingChanged() {
+      if (tagSuggestPopup.applying) tagApplyTimer.restart()
+      else tagApplyTimer.stop()
+    }
+  }
   Timer {
     id: joplinNotifyTimer
     interval: 2500
@@ -3033,6 +3141,7 @@ Item {
     parent: Overlay.overlay
     anchors.centerIn: Overlay.overlay
     onApplied: function(tags) { root.applySuggestedTags(tags) }
+    onCancelled: root.clearTagSuggestTarget()
   }
 
   // ---------------------------------------------------------- rename dialog

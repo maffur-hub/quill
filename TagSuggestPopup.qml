@@ -18,6 +18,7 @@ Popup {
   property string errorText: ""
   property bool applying: false
   property bool didApply: false
+  property bool closedWhileApplying: false
 
   signal applied(var tags)
   signal cancelled()
@@ -27,7 +28,12 @@ Popup {
   modal: true
   dim: true
   focus: true
-  closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+  // Escape and click-outside must not close the popup while the tag write is
+  // in flight. Otherwise the caller would apply the result to whatever buffer
+  // the user starts editing after the cancel.
+  closePolicy: popup.applying
+    ? Popup.NoAutoClose
+    : (Popup.CloseOnEscape | Popup.CloseOnPressOutside)
   background: BorderSurface {
     color: Commons.Color.background
     borderSpec: Border.controlSpec("normal", Commons.Color.foreground, Commons.Color.accent)
@@ -50,6 +56,7 @@ Popup {
     errorText = ""
     applying = false
     didApply = false
+    closedWhileApplying = false
     customField.text = ""
   }
 
@@ -131,19 +138,35 @@ Popup {
   function showError(message) {
     applying = false
     errorText = String(message || "Could not add tags")
+    // If something closed the popup while the command was running, bring it
+    // back so the error is visible and Cancel/retry work again.
+    if (closedWhileApplying) {
+      closedWhileApplying = false
+      if (!opened) open()
+    }
   }
 
   function finishSuccess() {
     applying = false
     didApply = true
-    close()
+    closedWhileApplying = false
+    if (popup.opened) close()
   }
 
   onOpened: {
     customField.forceActiveFocus()
   }
   onClosed: {
-    if (!didApply) cancelled()
+    // A successful programmatic close is never a cancel.
+    if (popup.didApply) return
+    // If a programmatic close lands mid-apply, treat it as neither a success
+    // nor a user cancel: the in-flight result still decides. A later failure
+    // reopens the popup with the error; success just resets the state.
+    if (popup.applying) {
+      popup.closedWhileApplying = true
+      return
+    }
+    cancelled()
   }
 
   // Fallback for Enter while a suggestion chip (not the field) has focus.
@@ -266,6 +289,7 @@ Popup {
         id: cancelButton
         objectName: "tagSuggestCancelButton"
         text: "Cancel"
+        enabled: !popup.applying
         fontSize: Style.font.bodySmall
         horizontalPadding: Style.space(10)
         verticalPadding: Style.space(5)
