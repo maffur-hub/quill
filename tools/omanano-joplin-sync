@@ -57,6 +57,9 @@ IMAGE_SIZE_RE = re.compile(
 RESOURCE_LINK_RE = re.compile(r"(!?\[[^\]]*\]\()(<[^>]*>|[^)\s]+)(\))")
 RESOURCE_SCHEMES = ("#", "mailto:")
 RESOURCE_PREFIX = "attachments/"
+# A fenced code block opener/closer: up to three spaces, then a run of
+# backticks or tildes (at least three).
+FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
 
 class ConfigError(Exception):
     """Bad user configuration or environment."""
@@ -143,9 +146,96 @@ def derive_title(body):
             return text[:120]
     return "Untitled"
 
+# Sentinels for inline code spans. Private-use characters never occur in note
+# text and match neither RESOURCE_LINK_RE nor IMAGE_SIZE_RE, so a masked link or
+# image keeps its surrounding construct intact during a transform. The original
+# span (including backtick delimiters) is restored verbatim afterwards.
+CODE_SENTINEL_OPEN = "\ue000"
+CODE_SENTINEL_CLOSE = "\ue001"
+
+def _mask_inline_code(line):
+    """Mask complete inline code spans on one line.
+
+    Returns ``(masked, spans)``: every complete backtick run plus its matching
+    closing run is replaced by a unique sentinel, and ``spans`` holds the
+    original text in order. An unmatched run is literal text (CommonMark), so
+    everything from it onwards is left as-is.
+    """
+    masked, spans = [], []
+    pos, length = 0, len(line)
+    while pos < length:
+        start = line.find("`", pos)
+        if start < 0:
+            masked.append(line[pos:])
+            break
+        end = start
+        while end < length and line[end] == "`":
+            end += 1
+        ticks, scan, close = end - start, end, -1
+        while scan < length:
+            found = line.find("`", scan)
+            if found < 0:
+                break
+            after = found
+            while after < length and line[after] == "`":
+                after += 1
+            if after - found == ticks:      # a run of exactly the same length
+                close = after
+                break
+            scan = after
+        if close < 0:                       # unmatched run: literal text
+            masked.append(line[pos:])
+            break
+        masked.append(line[pos:start])
+        masked.append(f"{CODE_SENTINEL_OPEN}{len(spans)}{CODE_SENTINEL_CLOSE}")
+        spans.append(line[start:close])
+        pos = close
+    return "".join(masked), spans
+
+def _restore_inline_code(text, spans):
+    """Put the original code spans back into a transformed masked line."""
+    for index, span in enumerate(spans):
+        text = text.replace(
+            f"{CODE_SENTINEL_OPEN}{index}{CODE_SENTINEL_CLOSE}", span)
+    return text
+
+def map_markdown_prose(body, transform):
+    """Apply ``transform`` to prose only, leaving code byte-for-byte intact.
+
+    Fenced blocks (``FENCE_RE``) are copied verbatim. On prose lines each
+    complete inline code span is masked before the transform runs and restored
+    afterwards, so a code span inside an image alt text or link label does not
+    break the surrounding construct. Line endings are preserved because the
+    transform only sees the line content and the original terminator is
+    appended unchanged.
+    """
+    output, fence = [], None
+    for line in body.splitlines(keepends=True):
+        content = line.rstrip("\r\n")
+        ending = line[len(content):]
+        if fence is None:
+            match = FENCE_RE.match(content)
+            if match:
+                fence = match.group(1)
+                output.append(line)
+                continue
+            masked, spans = _mask_inline_code(content)
+            output.append(_restore_inline_code(transform(masked), spans) + ending)
+        else:
+            output.append(line)
+            match = FENCE_RE.match(content)
+            if (match and match.group(1)[0] == fence[0]
+                    and len(match.group(1)) >= len(fence)
+                    and not content[match.end():].strip()):
+                fence = None                # closing fence (same char, long enough)
+    return "".join(output)
+
 def strip_image_sizes(body):
-    """Drop Quill's {width=...}/{height=...} hint from Markdown image tags."""
-    return IMAGE_SIZE_RE.sub(r"\1", body)
+    """Drop Quill's {width=...}/{height=...} hint from Markdown image tags.
+
+    Code fences and inline code spans are left untouched.
+    """
+    return map_markdown_prose(body, lambda text: IMAGE_SIZE_RE.sub(r"\1", text))
 
 def split_frontmatter(text):
     """Split a leading YAML frontmatter block off a note.
@@ -581,7 +671,8 @@ class Syncer:
             if resource_id is None:
                 return match.group(0)
             return f"{match.group(1)}:/{resource_id}{match.group(3)}"
-        return RESOURCE_LINK_RE.sub(replace, body)
+        return map_markdown_prose(
+            body, lambda text: RESOURCE_LINK_RE.sub(replace, text))
 
     def create(self, rel, title, body, parent_id, digest):
         self.counts["created"] += 1
@@ -711,11 +802,23 @@ class Syncer:
         self.load_folder_index()
         self.ensure_root()
         self.reporter.detail(f"source: {self.notes_dir} ({len(files)} markdown files)")
-        for rel, path in files.items():
-            self.sync_file(rel, path)
-        self.handle_missing(set(files))
-        if self.dirty and not self.dry_run:
-            save_state(self.state_path, self.state)
+        try:
+            for rel, path in files.items():
+                self.sync_file(rel, path)
+            self.handle_missing(set(files))
+        finally:
+            # Persist progress even when an API error aborts the run: notes
+            # already written must not look edited-elsewhere on the next run.
+            # A state save must never hide the exception that caused the abort.
+            if self.dirty and not self.dry_run:
+                aborting = sys.exc_info()[0] is not None
+                try:
+                    save_state(self.state_path, self.state)
+                except Exception as exc:
+                    if not aborting:
+                        raise
+                    self.reporter.warn(
+                        f"warning: could not save state {self.state_path}: {exc}")
         return self.counts
 
 def parse_args(argv):

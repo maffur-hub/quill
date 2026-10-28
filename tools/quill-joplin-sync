@@ -19,10 +19,15 @@
 #   quill-joplin-sync --work          # worker loop (internal; safe to run)
 #
 # Quill calls --notify after a debounced save. The worker syncs immediately,
-# retries only while the pending marker exists, and exits once the queue is
-# drained. When nothing is pending --flush exits without touching the Joplin
-# API, so an idle timer wakes locally and does nothing. Mode flags are consumed
-# here and never forwarded to the shared tool.
+# retries only while work is pending, and exits once the queue is drained.
+# A worker claims `pending` by renaming it to `in_progress`; if it is killed
+# mid-sync, --flush treats that marker as work and the next worker reclaims it.
+# When nothing is pending --flush exits without touching the Joplin API, so an
+# idle timer wakes locally and does nothing. Mode flags are consumed here and
+# never forwarded to the shared tool. --dry-run is rejected with a queue mode,
+# since a dry-run worker would consume pending work without syncing it. A
+# --token value is moved into OMANANO_JOPLIN_TOKEN so it is never visible in a
+# detached worker's argv.
 #
 # Before replacing a Joplin note (or trashing one with --prune), the shared
 # tool saves the remote body under
@@ -67,6 +72,7 @@ backoff_spec="${QUILL_JOPLIN_QUEUE_BACKOFF:-10 30 60 120 300 600 900}"
 max_attempts="${QUILL_JOPLIN_QUEUE_MAX_ATTEMPTS:-8}"
 
 pending="$queue_dir/pending"
+in_progress="$queue_dir/in_progress"
 lock_file="$queue_dir/queue.lock"
 log_file="$queue_dir/queue.log"
 attempts_file="$queue_dir/queue.attempts"
@@ -93,6 +99,51 @@ for arg in "$@"; do
       ;;
   esac
 done
+
+# A queue worker must never run with --dry-run: it would claim the pending
+# marker, write nothing and exit 0, so the timer would never retry the real
+# sync. Reject the combination before any marker is created or consumed.
+if [[ -n "$queue_mode" ]]; then
+  for arg in "${engine_args[@]}"; do
+    if [[ "$arg" == "--dry-run" ]]; then
+      echo "error: --dry-run cannot be combined with $queue_mode" >&2
+      exit 2
+    fi
+  done
+fi
+
+# Keep the token off the detached worker's argv, where `ps` would expose it.
+# The shared engine and the tag helper both read OMANANO_JOPLIN_TOKEN. Every
+# other engine flag stays on the command line.
+clean_args=()
+token_from_arg=""
+i=0
+while (( i < ${#engine_args[@]} )); do
+  arg="${engine_args[$i]}"
+  case "$arg" in
+    --token)
+      if (( i + 1 < ${#engine_args[@]} )); then
+        token_from_arg="${engine_args[$((i + 1))]}"
+        i=$((i + 2))
+        continue
+      fi
+      clean_args+=("$arg")
+      i=$((i + 1))
+      ;;
+    --token=*)
+      token_from_arg="${arg#--token=}"
+      i=$((i + 1))
+      ;;
+    *)
+      clean_args+=("$arg")
+      i=$((i + 1))
+      ;;
+  esac
+done
+engine_args=("${clean_args[@]}")
+if [[ -n "$token_from_arg" ]]; then
+  export OMANANO_JOPLIN_TOKEN="$token_from_arg"
+fi
 
 function ensure_queue() {
   mkdir -p "$queue_dir" 2>/dev/null || return 1
@@ -146,14 +197,13 @@ function rotate_log() {
 # Detach exactly one worker. The worker takes the lock itself, so a spawn that
 # races with a running worker exits silently.
 function spawn_worker() {
-  local -a quiet=()
-  local arg
-  for arg in "${engine_args[@]}"; do
-    [[ "$arg" == "--quiet" ]] && quiet=(--quiet)
-  done
   ensure_queue || return 1
   rotate_log
-  setsid --fork "$self" --work "${quiet[@]}" </dev/null >>"$log_file" 2>&1
+  # Forward the caller's engine flags (--prune/--force/--notebook/--api-url/
+  # --notes-dir/--state/--backup-dir/--attachments-dir/...). The mode flags
+  # --notify/--flush/--work were consumed by the parser above, and --token was
+  # moved into OMANANO_JOPLIN_TOKEN so it never appears in `ps`.
+  setsid --fork "$self" --work "${engine_args[@]}" </dev/null >>"$log_file" 2>&1
 }
 
 function log_line() {
@@ -251,12 +301,31 @@ function run_worker() {
   clear_attempts
   log_line "worker started (pid $$)"
 
+  # Holding the lock proves no live worker owns in-progress: a killed worker
+  # left it behind. Reclaim it as ordinary pending work.
+  if [[ -e "$in_progress" ]]; then
+    if [[ -e "$pending" ]]; then
+      rm -f -- "$in_progress"
+      log_line "reclaimed stale in-progress marker (pending already set)"
+    elif mv -f -- "$in_progress" "$pending"; then
+      log_line "reclaimed stale in-progress marker"
+    else
+      log_line "could not reclaim in-progress marker; deferring to the timer"
+      return 0
+    fi
+  fi
+
   while :; do
     if [[ ! -e "$pending" ]]; then
       log_line "queue empty; worker exiting"
       return 0
     fi
-    rm -f -- "$pending"
+    # Claim the work atomically. A notification that lands after this rename
+    # creates a fresh pending marker, so it is never dropped.
+    if ! mv -f -- "$pending" "$in_progress"; then
+      log_line "could not claim pending marker; deferring to the timer"
+      return 0
+    fi
     log_line "sync attempt $((attempt + 1))"
 
     run_sync "${engine_args[@]}"
@@ -265,6 +334,7 @@ function run_worker() {
     if (( status == 0 )); then
       attempt=0
       clear_attempts
+      rm -f -- "$in_progress"
       log_line "sync ok"
       if [[ -e "$pending" ]]; then
         log_line "work arrived during sync; syncing again"
@@ -273,8 +343,13 @@ function run_worker() {
       return 0
     fi
 
-    # Failure: put the work back and decide whether another attempt is useful.
-    mark_pending
+    # Failure: restore the marker so --flush retries. Work that arrived during
+    # the failed sync already has its own pending marker.
+    if [[ -e "$pending" ]]; then
+      rm -f -- "$in_progress"
+    elif ! mv -f -- "$in_progress" "$pending"; then
+      mark_pending
+    fi
     attempt=$((attempt + 1))
     set_attempts "$attempt"
     log_line "sync failed with exit $status (attempt $attempt/$max); work retained"
@@ -310,7 +385,9 @@ fi
 
 if [[ "$queue_mode" == "--flush" ]]; then
   # No marker means no network access at all: the idle timer is a local no-op.
-  [[ -e "$pending" ]] || exit 0
+  # An in-progress marker without pending is a worker that was killed mid-sync,
+  # so it is work the timer must retry.
+  [[ -e "$pending" || -e "$in_progress" ]] || exit 0
   if ! worker_running; then
     spawn_worker >/dev/null 2>&1 || true
   fi
@@ -322,5 +399,5 @@ if [[ "$queue_mode" == "--work" ]]; then
   exit $?
 fi
 
-run_sync "$@"
+run_sync "${engine_args[@]}"
 exit $?
