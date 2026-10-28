@@ -26,6 +26,7 @@ import json
 import os
 import re
 import sys
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -38,7 +39,7 @@ DEFAULT_STATE = "~/.local/share/quill-joplin/state.json"
 JOPLIN_SETTINGS = Path("~/.config/joplin-desktop/settings.json").expanduser()
 TIMEOUT = 8
 
-TAG_RE = re.compile(r"(?<![#\w\\])#([A-Za-z0-9_/-]+)")
+TAG_RE = re.compile(r"(?<![#\w\\\u0300-\u036f])#([\w\u0300-\u036f/-]+)")
 INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
 FENCE_RE = re.compile(r"^\s{0,3}(```|~~~)")
 URL_RE = re.compile(r"(?:https?://|mailto:)[^\s<>()]+")
@@ -67,12 +68,39 @@ def split_frontmatter(text: str):
     return None, text
 
 
+# Same fold as scripts/quill-store and TagSuggest.js: Joplin must receive the
+# storage tag (`naive`), not a truncated `na` or an accented spelling.
+ACCENT_FOLD = {
+    "à": "a", "á": "a", "â": "a", "ã": "a", "ä": "a", "å": "a", "æ": "ae",
+    "ç": "c", "è": "e", "é": "e", "ê": "e", "ë": "e", "ì": "i", "í": "i",
+    "î": "i", "ï": "i", "ð": "d", "ñ": "n", "ò": "o", "ó": "o", "ô": "o",
+    "õ": "o", "ö": "o", "ø": "o", "œ": "oe", "š": "s", "ù": "u", "ú": "u",
+    "û": "u", "ü": "u", "ý": "y", "ÿ": "y", "ž": "z", "þ": "th",
+    "ß": "ss", "ẞ": "ss",
+}
+ACCENT_TABLE = {}
+for _accent, _ascii in ACCENT_FOLD.items():
+    ACCENT_TABLE[ord(_accent)] = _ascii
+    _upper = _accent.upper()
+    if len(_upper) == 1:
+        ACCENT_TABLE[ord(_upper)] = _ascii.upper()
+
+
+def fold_accents(value):
+    text = str(value or "").translate(ACCENT_TABLE)
+    if text.isascii():
+        return text
+    decomposed = unicodedata.normalize("NFKD", text)
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+
+
 def normalize_tags(values):
     output, seen = [], set()
     for raw in values:
         value = str(raw or "").strip().lstrip("#").strip()
         if not value:
             continue
+        value = fold_accents(value)
         value = re.sub(r"[^A-Za-z0-9_/-]+", "-", value).strip("-/")
         if not value:
             continue

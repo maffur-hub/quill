@@ -48,7 +48,31 @@ VERSION_THROTTLE_DEFAULT = 60.0
 
 VERSION_FILENAME_RE = re.compile(r"^(\d{8}T\d{6}Z)-([0-9a-f]{16})(?:-(\d+))?\.md$")
 
-TAG_RE = re.compile(r"(?<![#\w\\])#([A-Za-z0-9_/-]+)")
+# Latin-1/Extended-A accents folded to ASCII, mirroring TagSuggest.js ACCENTS
+# so `#naïve` and `#naive` are one tag in storage and in the index. Other
+# scripts are left for the sanitiser below (they normalise to `-` and drop).
+ACCENT_FOLD = {
+    "à": "a", "á": "a", "â": "a", "ã": "a", "ä": "a", "å": "a", "æ": "ae",
+    "ç": "c", "è": "e", "é": "e", "ê": "e", "ë": "e", "ì": "i", "í": "i",
+    "î": "i", "ï": "i", "ð": "d", "ñ": "n", "ò": "o", "ó": "o", "ô": "o",
+    "õ": "o", "ö": "o", "ø": "o", "œ": "oe", "š": "s", "ù": "u", "ú": "u",
+    "û": "u", "ü": "u", "ý": "y", "ÿ": "y", "ž": "z", "þ": "th",
+    "ß": "ss", "ẞ": "ss",
+}
+ACCENT_TABLE: dict[int, str] = {}
+for _accent, _ascii in ACCENT_FOLD.items():
+    ACCENT_TABLE[ord(_accent)] = _ascii
+    _upper = _accent.upper()
+    if len(_upper) == 1:
+        ACCENT_TABLE[ord(_upper)] = _ascii.upper()
+
+# A tag is `#` followed by Unicode word characters (accents included), plus
+# the separators Quill has always allowed. The lookbehind keeps `#` inside a
+# word (`a#b`), a fence/heading (`##x`) or an escape (`\#x`) out, and the
+# character class consumes a whole accented word so `#na` can never match the
+# prefix of `#naïve`.
+TAG_CHARS = r"\w\u0300-\u036f/-"
+TAG_RE = re.compile(r"(?<![#\w\\\u0300-\u036f])#([" + TAG_CHARS + r"]+)")
 WIKI_RE = re.compile(r"\[\[([^\[\]\n]+?)\]\]")
 INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
 FENCE_RE = re.compile(r"^\s{0,3}(```|~~~)")
@@ -620,6 +644,35 @@ def read_draft(note: Path) -> tuple[str, int] | None:
     return payload.decode("utf-8", errors="replace"), int(stat.st_mtime * 1000)
 
 
+def move_draft(source: Path, target: Path) -> None:
+    """Move `<note>.md.draft` alongside its note.
+
+    Best-effort: a missing draft is normal, and a destination draft is never
+    overwritten (that would destroy unsaved text). Failures never fail the
+    note operation itself.
+    """
+    draft = draft_path(source)
+    try:
+        if not draft.is_file():
+            return
+        destination = draft_path(target)
+        if destination.exists():
+            return
+        shutil.move(str(draft), str(destination))
+    except OSError:
+        pass
+
+
+def discard_draft(note: Path) -> None:
+    """Remove a note's crash draft, if any. Best-effort."""
+    try:
+        draft = draft_path(note)
+        if draft.is_file() or draft.is_symlink():
+            draft.unlink()
+    except OSError:
+        pass
+
+
 # --------------------------------------------------------------------------
 # markdown parsing
 
@@ -682,6 +735,20 @@ def frontmatter_tags(frontmatter: str | None) -> list[str]:
     return normalize_tags(collected)
 
 
+def fold_accents(value: str) -> str:
+    """Fold common Latin accents to ASCII, matching TagSuggest.js.
+
+    The explicit table covers letters that Unicode decomposition leaves alone
+    (æ, ø, œ, ß, þ, ð); NFKD handles the rest of Latin Extended-A. Case is
+    preserved so stored tags keep the author's capitalisation.
+    """
+    text = str(value or "").translate(ACCENT_TABLE)
+    if text.isascii():
+        return text
+    decomposed = unicodedata.normalize("NFKD", text)
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+
+
 def normalize_tags(values) -> list[str]:
     output: list[str] = []
     seen: set[str] = set()
@@ -689,6 +756,7 @@ def normalize_tags(values) -> list[str]:
         value = str(raw or "").strip().lstrip("#").strip()
         if not value:
             continue
+        value = fold_accents(value)
         value = re.sub(r"[^A-Za-z0-9_/-]+", "-", value).strip("-/")
         if not value:
             continue
@@ -700,7 +768,14 @@ def normalize_tags(values) -> list[str]:
     return output
 
 
-TAG_ONLY_LINE_RE = re.compile(r"^\s*(?:#[A-Za-z0-9_/-]+(?:\s+|$))+$")
+def tag_key(value: str) -> str:
+    """Comparison key for a raw tag or `#tag` token (accents folded)."""
+    normalized = normalize_tags([value])
+    return normalized[0].casefold() if normalized else ""
+
+
+TAG_ONLY_LINE_RE = re.compile(
+    r"^\s*(?:#[" + TAG_CHARS + r"]+(?:\s+|$))+$")
 
 
 def append_inline_tags(content: str, tags: list[str]) -> str:
@@ -1232,6 +1307,25 @@ def command_read(args) -> dict:
 
 
 def command_write(args) -> dict:
+    # The UI hands over one throwaway `.quill-save-*` buffer per save. Clean
+    # it up on every exit path (failed note lookup, oversized payload, write
+    # error), but never delete a caller-supplied arbitrary file.
+    content_path = None
+    cleanup_path = None
+    raw_content_file = getattr(args, "content_file", None)
+    if raw_content_file:
+        content_path = Path(os.path.expanduser(str(raw_content_file)))
+        if content_path.name.startswith(".quill-save-"):
+            cleanup_path = content_path
+    try:
+        return write_note(args, content_path)
+    finally:
+        if cleanup_path is not None:
+            with contextlib.suppress(OSError):
+                cleanup_path.unlink()
+
+
+def write_note(args, content_path: Path | None) -> dict:
     ensure_store()
     identifier = safe_relative(args.id)
     path = note_path(identifier)
@@ -1240,18 +1334,11 @@ def command_write(args) -> dict:
         raise StoreError(f"note not found: {args.id}")
     if path.exists() and not path.is_file():
         raise StoreError(f"note path is not a file: {args.id}")
-    if getattr(args, "content_file", None):
-        content_path = Path(os.path.expanduser(args.content_file))
+    if content_path is not None:
         try:
             payload = content_path.read_bytes()
         except OSError as error:
             raise StoreError(f"could not read content file: {error}") from error
-        finally:
-            # The UI hands over one throwaway buffer per save. Never delete a
-            # caller-supplied file, only Quill's own save buffers.
-            if content_path.name.startswith(".quill-save-"):
-                with contextlib.suppress(OSError):
-                    content_path.unlink()
     else:
         payload = sys.stdin.buffer.read(MAX_NOTE_BYTES + 1)
     if len(payload) > MAX_NOTE_BYTES:
@@ -1542,6 +1629,7 @@ def command_move(args) -> dict:
                 raise StoreError(f"could not read the note before moving it: {error}") from error
             snapshot_note(identifier, data, "move", destructive=True)
             shutil.move(str(source), str(target))
+            move_draft(source, target)
             prune_empty_dirs(source.parent)
             next_id = target.relative_to(NOTES).as_posix()
             pins = pinned_set()
@@ -1578,6 +1666,7 @@ def command_trash(args) -> dict:
             raise StoreError(f"could not read the note before trashing it: {error}") from error
         snapshot_note(identifier, data, "trash", destructive=True)
         shutil.move(str(source), str(target))
+        move_draft(source, target)
         prune_empty_dirs(source.parent)
         pins = pinned_set()
         if identifier in pins:
@@ -1606,6 +1695,7 @@ def command_restore(args) -> dict:
         if target.exists():
             target = unique_target(target_dir, source.name, "restored-")
         shutil.move(str(source), str(target))
+        move_draft(source, target)
         prune_empty_dirs(source.parent)
         new_id = target.relative_to(NOTES).as_posix()
         conn = index_connect()
@@ -1629,6 +1719,7 @@ def command_delete(args) -> dict:
             raise StoreError(f"could not read the note before deleting it: {error}") from error
         snapshot_note(identifier, data, "delete", destructive=True)
         path.unlink()
+        discard_draft(path)
         conn = index_connect()
         try:
             sync_index(conn)
@@ -2174,7 +2265,7 @@ def replace_inline_tag(line: str, old_key: str, new_tag: str) -> tuple[str, int]
     spans = []
     for start, end in pieces:
         for match in TAG_RE.finditer(line, start, end):
-            if match.group(1).casefold() == old_key and not overlaps(match.span(), protected):
+            if tag_key(match.group(1)) == old_key and not overlaps(match.span(), protected):
                 spans.append(match.span(1))
     for start, end in reversed(spans):
         output = output[:start] + new_tag + output[end:]
@@ -2183,11 +2274,17 @@ def replace_inline_tag(line: str, old_key: str, new_tag: str) -> tuple[str, int]
 
 
 def rewrite_tags(content: str, old: str, new: str) -> tuple[str, int]:
-    old_key = old.casefold()
+    old_key = tag_key(old)
+    if not old_key:
+        # Every tag whose characters all normalize away (for example 日本語)
+        # shares the "" key; treating that as a match would rewrite all of them.
+        raise StoreError("cannot rewrite tags: old tag has no comparable characters")
     newline = detect_newline(content)
     lines = content.splitlines(keepends=True)
     changes = 0
-    # Frontmatter (inline or block list forms).
+    # Frontmatter (inline or block list forms). Track the current YAML key
+    # while scanning so `- item` lines under `aliases:`, `categories:` or any
+    # other key are never rewritten.
     if lines and lines[0].strip() == "---":
         closing = None
         for index in range(1, min(len(lines), 400)):
@@ -2195,29 +2292,58 @@ def rewrite_tags(content: str, old: str, new: str) -> tuple[str, int]:
                 closing = index
                 break
         if closing is not None:
+            current_key = None
+            current_indent = -1
             for index in range(1, closing):
                 line = lines[index]
-                match = re.match(r"^(\s*tags\s*:\s*)(.*?)(\r?\n)?$", line, re.IGNORECASE)
-                if match:
-                    rest = match.group(2)
+                body = line.rstrip("\r\n")
+                if body.strip() == "" or body.lstrip().startswith("#"):
+                    continue
+                key_match = re.match(
+                    r"^(\s*)([^\s:#\-][^:]*?)\s*:\s*(.*)$", body)
+                if key_match:
+                    key_indent = len(key_match.group(1))
+                    key_name = key_match.group(2).strip().lower()
+                    rest = key_match.group(3)
+                    current_key = key_name if key_name == "tags" and not rest.strip() else None
+                    current_indent = key_indent
+                    if key_name != "tags":
+                        continue
                     if rest.strip().startswith("["):
                         inner = rest.strip()[1:-1] if rest.strip().endswith("]") else rest.strip()[1:]
                         values = [value.strip().strip("'\"") for value in inner.split(",")]
-                        next_values = [new if value.casefold().lstrip("#") == old_key else value for value in values]
+                        next_values = [
+                            new if tag_key(value) == old_key else value
+                            for value in values
+                        ]
                         changes += sum(
                             1
                             for before, after in zip(values, next_values)
-                            if before.casefold().lstrip("#") == old_key
+                            if before != after
                         )
-                        lines[index] = match.group(1) + "[" + ", ".join(next_values) + "]" + (match.group(3) or "")
-                    elif rest.strip().casefold().lstrip("#") == old_key:
-                        lines[index] = match.group(1) + new + (match.group(3) or "")
+                        lines[index] = (
+                            body[:key_match.start(3)]
+                            + "[" + ", ".join(next_values) + "]"
+                            + (line[len(body):] or "")
+                        )
+                    elif rest.strip() and tag_key(rest) == old_key:
+                        lines[index] = (
+                            body[:key_match.start(3)] + new + (line[len(body):] or "")
+                        )
                         changes += 1
                     continue
-                item = re.match(r"^(\s*-\s*)(.+?)(\r?\n)?$", line)
-                if item and item.group(2).strip().strip("'\"").casefold().lstrip("#") == old_key:
-                    lines[index] = item.group(1) + new + (item.group(3) or "")
+                item = re.match(r"^(\s*)-\s*(.+?)\s*$", body)
+                if (item and current_key == "tags"
+                        and len(item.group(1)) >= current_indent
+                        and tag_key(item.group(2).strip().strip("'\"")) == old_key):
+                    lines[index] = (
+                        item.group(1) + "- " + new + (line[len(body):] or "")
+                    )
                     changes += 1
+                elif item is None and not body.lstrip().startswith("-"):
+                    # Unknown non-list content (a nested mapping value, ...):
+                    # stop treating following items as tag entries.
+                    current_key = None
             content = "".join(lines)
     # Inline tags outside frontmatter and code.
     frontmatter, body = split_frontmatter(content)
@@ -2249,6 +2375,10 @@ def command_tag_rename(args) -> dict:
     new = normalize_tags([args.new])
     if not old:
         raise StoreError("old tag is empty")
+    if not tag_key(old):
+        raise StoreError(
+            f"cannot rename {old!r}: it has no comparable characters "
+            "(tags that normalize to an empty key would all match)")
     if not new:
         raise StoreError("new tag is empty")
     new = new[0]
