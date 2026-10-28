@@ -39,6 +39,10 @@ Item {
   property real pickerHue: 0
   property real pickerSat: 1
   property real pickerVal: 1
+  // Set while a mouse pick on the SV square/hue strip owns the colour. It
+  // keeps a stale editingFinished() from a just-blurred text field from
+  // committing the old typed value over the picked one.
+  property bool pickerMousePick: false
   readonly property var pickerRgb: hsvToRgb(pickerHue, pickerSat, pickerVal)
   readonly property int pickerRed: pickerRgb[0]
   readonly property int pickerGreen: pickerRgb[1]
@@ -165,6 +169,26 @@ Item {
     if (!colorPickerHexField.activeFocus) colorPickerHexField.text = root.pickerHex
   }
 
+  // A mouse pick must win over text left in a still-focused field: blur the
+  // RGB/hex inputs first so syncPickerFields() rewrites every field from
+  // pickerRgb. pickerMousePick stops the resulting editingFinished() from
+  // committing the stale text back over the pick.
+  function blurPickerFields() {
+    var fields = [colorPickerRed, colorPickerGreen, colorPickerBlue, colorPickerHexField]
+    var focused = false
+    for (var i = 0; i < fields.length; i++) {
+      if (fields[i].activeFocus) focused = true
+    }
+    if (focused) root.pickerMousePick = true
+    for (var j = 0; j < fields.length; j++) fields[j].focus = false
+  }
+
+  function mousePick() {
+    root.pickerMousePick = true
+    root.blurPickerFields()
+    root.syncPickerFields()
+  }
+
   function commitPickerHex() {
     var hex = MarkdownFormat.colourToHex(colorPickerHexField.text)
     if (hex === null) return false
@@ -187,6 +211,12 @@ Item {
   }
 
   function commitPickerFields() {
+    // A mouse pick already committed pickerRgb; ignore stale text still in the
+    // fields (a blur may not have delivered editingFinished yet).
+    if (root.pickerMousePick) {
+      root.pickerMousePick = false
+      return true
+    }
     // Prefer the RGB fields only while one of them is being edited; otherwise
     // the hex field is the canonical source (Save must use typed hex even when
     // the field did not receive focus, e.g. from the e2e harness).
@@ -200,6 +230,7 @@ Item {
   function openColourPicker() {
     if (!available) return
     closePopovers()
+    root.pickerMousePick = false
     root.setPickerHex(MarkdownFormat.colourToHex(root.lastColor) || "#e03e2d")
     colorPicker.open()
   }
@@ -1047,12 +1078,13 @@ Item {
           }
 
           MouseArea {
+            objectName: "formatColorSVMouse"
             anchors.fill: parent
             cursorShape: Qt.CrossCursor
             function pick(mouse) {
               root.pickerSat = root.clampUnit(mouse.x / width)
               root.pickerVal = 1 - root.clampUnit(mouse.y / height)
-              root.syncPickerFields()
+              root.mousePick()
             }
             onPressed: function(mouse) { pick(mouse) }
             onPositionChanged: function(mouse) { if (pressed) pick(mouse) }
@@ -1095,11 +1127,12 @@ Item {
           }
 
           MouseArea {
+            objectName: "formatColorHueMouse"
             anchors.fill: parent
             cursorShape: Qt.SizeVerCursor
             function pick(mouse) {
               root.pickerHue = root.clampUnit(mouse.y / height) * 360
-              root.syncPickerFields()
+              root.mousePick()
             }
             onPressed: function(mouse) { pick(mouse) }
             onPositionChanged: function(mouse) { if (pressed) pick(mouse) }
@@ -1128,6 +1161,7 @@ Item {
             TextField {
               id: colorPickerRed
               objectName: "formatColorRed"
+              onActiveFocusChanged: if (activeFocus) root.pickerMousePick = false
               width: parent.width - Style.space(14)
               font.pixelSize: Style.font.bodySmall
               horizontalPadding: Style.space(4)
@@ -1135,7 +1169,7 @@ Item {
               horizontalAlignment: TextInput.AlignHCenter
               validator: IntValidator { bottom: 0; top: 255 }
               inputMethodHints: Qt.ImhDigitsOnly
-              onEditingFinished: root.commitPickerRgb()
+              onEditingFinished: if (!root.pickerMousePick) root.commitPickerRgb()
               onAccepted: {
                 root.commitPickerRgb()
                 root.savePickerColour()
@@ -1160,6 +1194,7 @@ Item {
             TextField {
               id: colorPickerGreen
               objectName: "formatColorGreen"
+              onActiveFocusChanged: if (activeFocus) root.pickerMousePick = false
               width: parent.width - Style.space(14)
               font.pixelSize: Style.font.bodySmall
               horizontalPadding: Style.space(4)
@@ -1167,7 +1202,7 @@ Item {
               horizontalAlignment: TextInput.AlignHCenter
               validator: IntValidator { bottom: 0; top: 255 }
               inputMethodHints: Qt.ImhDigitsOnly
-              onEditingFinished: root.commitPickerRgb()
+              onEditingFinished: if (!root.pickerMousePick) root.commitPickerRgb()
               onAccepted: {
                 root.commitPickerRgb()
                 root.savePickerColour()
@@ -1192,6 +1227,7 @@ Item {
             TextField {
               id: colorPickerBlue
               objectName: "formatColorBlue"
+              onActiveFocusChanged: if (activeFocus) root.pickerMousePick = false
               width: parent.width - Style.space(14)
               font.pixelSize: Style.font.bodySmall
               horizontalPadding: Style.space(4)
@@ -1199,7 +1235,7 @@ Item {
               horizontalAlignment: TextInput.AlignHCenter
               validator: IntValidator { bottom: 0; top: 255 }
               inputMethodHints: Qt.ImhDigitsOnly
-              onEditingFinished: root.commitPickerRgb()
+              onEditingFinished: if (!root.pickerMousePick) root.commitPickerRgb()
               onAccepted: {
                 root.commitPickerRgb()
                 root.savePickerColour()
@@ -1224,6 +1260,7 @@ Item {
             TextField {
               id: colorPickerHexField
               objectName: "formatColorHex"
+              onActiveFocusChanged: if (activeFocus) root.pickerMousePick = false
               width: parent.width - Style.space(14)
               font.pixelSize: Style.font.bodySmall
               horizontalPadding: Style.space(4)
@@ -1236,7 +1273,7 @@ Item {
                 var typed = MarkdownFormat.colourToHex(text)
                 if (typed !== null) root.setPickerHex(typed)
               }
-              onEditingFinished: root.commitPickerHex()
+              onEditingFinished: if (!root.pickerMousePick) root.commitPickerHex()
               onAccepted: {
                 root.commitPickerHex()
                 root.savePickerColour()
