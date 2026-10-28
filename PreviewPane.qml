@@ -374,7 +374,7 @@ Item {
             && tableNaturalWidth > blockItem.width + 0.5
           readonly property int tableRowCount: isTable && modelData.table ? modelData.table.rows.length + 1 : 0
           readonly property int tableColumnCount: isTable && modelData.table ? modelData.table.header.length : 0
-          readonly property bool overrideWidth: isImage && root.overrides[sourceLine] !== undefined
+          readonly property real overrideWidth: isImage && root.overrides[sourceLine] !== undefined
             ? root.overrides[sourceLine] : -1
           readonly property real paneWidth: Math.max(60, Math.floor(flick.width))
           readonly property real maxContentWidth: Math.max(60, paneWidth - 2)
