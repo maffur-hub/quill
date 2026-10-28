@@ -620,6 +620,10 @@ Item {
   function flushWrite() {
     writeTimer.stop()
     if (!loadedTable) return false
+    // Never rewrite a table that still matches the note. Opening and closing
+    // an untouched table must not canonicalise non-canonical but valid
+    // Markdown (spacing, extra cells, delimiter spelling).
+    if (!gridDirty()) return true
     if (conflict) return false
     if (startLine < 0 || lastSnapshot.length === 0) return false
     if (!reconcileSource()) return false

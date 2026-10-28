@@ -54,6 +54,19 @@ function escapeUrl(value) {
     .replace(/\t/g, "%09")
 }
 
+// Undo exactly one HTML-escape pass. Link/image destinations are captured
+// after the whole buffer was escaped, so `?a=1&b=2` arrives as `&amp;`; without
+// this the later escapeUrl() would produce `&amp;amp;`.
+function unescapeHtml(value) {
+  return textOf(value).replace(/&(amp|lt|gt|quot|#39);/g, function(match, name) {
+    if (name === "amp") return "&"
+    if (name === "lt") return "<"
+    if (name === "gt") return ">"
+    if (name === "quot") return "\""
+    return "'"
+  })
+}
+
 function cleanUrl(value) {
   var url = textOf(value).trim()
   var lower = url.toLowerCase()
@@ -346,7 +359,7 @@ function renderInline(value, resolve, syntax) {
 
   // Images before links (the leading ! is otherwise just text).
   html = html.replace(/!\[([^\]]*)\]\(([^)]*)\)/g, function(match, alt, target) {
-    var src = cleanUrl(target)
+    var src = unescapeHtml(cleanUrl(target))
     if (src === "") return match
     // Attributes cannot hold formatting; unwrap any pending code marker.
     return slot("<img src=\"" + escapeUrl(src) + "\" alt=\""
@@ -354,7 +367,7 @@ function renderInline(value, resolve, syntax) {
   })
 
   html = html.replace(/\[([^\]]+)\]\(([^)]*)\)/g, function(match, label, target) {
-    var href = cleanUrl(target)
+    var href = unescapeHtml(cleanUrl(target))
     if (href === "") return match
     href = stripMarkers(href)
     return slot("<a href=\"" + escapeUrl(href) + "\">" + applyEmphasis(label) + "</a>")

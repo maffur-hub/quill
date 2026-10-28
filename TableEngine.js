@@ -166,21 +166,26 @@ function parseTableAt(lines, index) {
     if (line.trim() === "") break
     if (delimiterAligns(line) !== null) break
     if (!hasDelimiterPipe(line)) break
-    var cells = splitCells(line)
-    while (cells.length < header.length) cells.push("")
-    rows.push(cells.slice(0, header.length))
+    // Keep every cell. A row wider than the header is valid Markdown (GFM
+    // ignores the extra cells, but Quill shows and edits them), and dropping
+    // them here would silently rewrite the note when the grid closes.
+    rows.push(splitCells(line))
     endLine = i
     i += 1
   }
 
-  return {
-    startLine: index,
-    endLine: endLine,
+  // Expand to the widest row so extra cells survive. Extra header/align/
+  // delimiter cells are blank/left, and serialisation turns them into a
+  // canonical left-aligned column.
+  var table = normalizeModel({
     header: header.slice(0),
     aligns: aligns.slice(0),
     delimiters: delimiter.cells.slice(0),
     rows: rows
-  }
+  })
+  table.startLine = index
+  table.endLine = endLine
+  return table
 }
 
 // Find every table outside fenced code blocks. Line numbers are zero-based
@@ -412,6 +417,27 @@ function literalValue(raw) {
   if (text === "") return makeEmpty()
   if (NUMBER_TEXT_RE.test(text)) return makeNumber(Number(text))
   return makeString(text)
+}
+
+// Preview-only form of a literal cell. The raw text keeps its escapes so the
+// grid can edit and serialise it unchanged; the table display should read
+// `x | y` for a cell written `x \| y`.
+function displayCellText(value) {
+  var text = String(value === undefined || value === null ? "" : value)
+  var output = ""
+  for (var i = 0; i < text.length; i++) {
+    var ch = text.charAt(i)
+    if (ch === "\\" && i + 1 < text.length) {
+      var next = text.charAt(i + 1)
+      if (next === "|" || next === "\\") {
+        output += next
+        i += 1
+        continue
+      }
+    }
+    output += ch
+  }
+  return output
 }
 
 function tokenize(source) {
@@ -892,7 +918,8 @@ function computeTable(model) {
       line.push({
         raw: raw,
         value: result.kind === "empty" ? "" : result.value,
-        display: result.kind === "error" ? result.error : isFormula ? result.display : raw,
+        display: result.kind === "error" ? result.error
+          : isFormula ? result.display : displayCellText(raw),
         error: result.kind === "error" ? result.error : null
       })
     }

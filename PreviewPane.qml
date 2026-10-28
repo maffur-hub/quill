@@ -208,7 +208,10 @@ Item {
         i = table.endLine + 1
         continue
       }
-      var image = ImageSizing.splitLine(lines[i])
+      // Fenced lines stay literal: an image-looking line inside ``` is code,
+      // not an image block. Tables and display maths already skip fences via
+      // their finders.
+      var image = fenced[i] ? null : ImageSizing.splitLine(lines[i])
       if (image) {
         flushText()
         flushTasks()

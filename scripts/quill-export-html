@@ -80,6 +80,50 @@ function normaliseFontPx(value) {
   return Math.max(6, Math.min(200, size))
 }
 
+// Relative luminance (0 = black, 1 = white) for the colour forms
+// normaliseColor() accepts. Alpha is composited over the page's white paper.
+function colorLuminance(value) {
+  const color = String(value === undefined || value === null ? "" : value).trim()
+  let red
+  let green
+  let blue
+  const hex = color.match(/^#([0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/)
+  if (hex) {
+    let digits = hex[1]
+    if (digits.length === 3 || digits.length === 4) {
+      digits = digits.split("").map(function(ch) { return ch + ch }).join("")
+    }
+    red = parseInt(digits.slice(0, 2), 16)
+    green = parseInt(digits.slice(2, 4), 16)
+    blue = parseInt(digits.slice(4, 6), 16)
+    if (digits.length === 8) {
+      const alpha = parseInt(digits.slice(6, 8), 16) / 255
+      red = red * alpha + 255 * (1 - alpha)
+      green = green * alpha + 255 * (1 - alpha)
+      blue = blue * alpha + 255 * (1 - alpha)
+    }
+  } else {
+    const rgb = color.match(/^rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})(?:\s*,\s*(0|1|0?\.\d+))?\s*\)$/)
+    if (!rgb) return null
+    const alpha = rgb[4] === undefined ? 1 : Number(rgb[4])
+    red = Number(rgb[1]) * alpha + 255 * (1 - alpha)
+    green = Number(rgb[2]) * alpha + 255 * (1 - alpha)
+    blue = Number(rgb[3]) * alpha + 255 * (1 - alpha)
+  }
+  return (0.2126 * red + 0.7152 * green + 0.0722 * blue) / 255
+}
+
+// Exports always use a fixed light paper. A caller's dark-theme foreground
+// (for example Omarchy's near-white text) must not leak into an SVG drawn on
+// that paper: clamp anything too light to the default ink so maths stays
+// readable, while still honouring explicit dark colours.
+function readableInk(value) {
+  const color = normaliseColor(value)
+  const luminance = colorLuminance(color)
+  if (luminance === null || luminance > 0.6) return DEFAULT_COLOR
+  return color
+}
+
 function leadingColumns(line) {
   let columns = 0
   for (let i = 0; i < line.length; i++) {
@@ -1021,16 +1065,16 @@ function renderBlocks(lines, context) {
 
 // ----------------------------------------------------------------- document
 
-function stylesheet() {
+function stylesheet(fontPx, ink) {
   return `:root { color-scheme: light; }
 * { box-sizing: border-box; }
 html { background: #ffffff; }
 body {
   margin: 0;
   background: #ffffff;
-  color: #1f2328;
+  color: ${ink};
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
-  font-size: 17px;
+  font-size: ${fontPx}px;
   line-height: 1.65;
   -webkit-text-size-adjust: 100%;
 }
@@ -1094,8 +1138,21 @@ del { color: #57606a; }
 `
 }
 
+// Exported notes may still carry the YAML block the preview strips on load.
+// Remove only a leading, closed block; an unclosed leading `---` is an
+// ordinary horizontal rule and stays part of the document.
+function stripFrontmatter(lines) {
+  if (!lines.length || lines[0].trim() !== "---") return lines
+  for (let i = 1; i < lines.length; i++) {
+    const trimmed = lines[i].trim()
+    if (trimmed === "---" || trimmed === "...") return lines.slice(i + 1)
+  }
+  return lines
+}
+
 function renderDocument(markdown, title, options, context) {
-  const lines = String(markdown).replace(/\r\n?/g, "\n").replace(/^\uFEFF/, "").split("\n")
+  const lines = stripFrontmatter(
+    String(markdown).replace(/\r\n?/g, "\n").replace(/^\uFEFF/, "").split("\n"))
   const body = renderBlocks(lines, context)
   return "<!doctype html>\n"
     + '<html lang="en">\n'
@@ -1103,7 +1160,7 @@ function renderDocument(markdown, title, options, context) {
     + '<meta charset="utf-8">\n'
     + '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
     + "<title>" + escapeHtml(title) + "</title>\n"
-    + "<style>\n" + stylesheet() + "</style>\n"
+    + "<style>\n" + stylesheet(context.fontPx, context.color) + "</style>\n"
     + "</head>\n"
     + '<body>\n<main class="note">\n' + body + "\n</main>\n</body>\n</html>\n"
 }
@@ -1135,7 +1192,7 @@ function main() {
   const output = String(options.output || "")
   const title = String(options.title === undefined ? "" : options.title)
   const noteDir = String(options["note-dir"] || "")
-  const color = normaliseColor(options.color)
+  const color = readableInk(options.color)
   const fontPx = normaliseFontPx(options["font-px"])
 
   try {
