@@ -121,8 +121,9 @@ Item {
       root.atBottom = true
       initialise()
     } else {
-      // The dock is closed or the library window went away. Do not leave a
-      // bridge (and its SSE connection) alive behind a hidden dock.
+      // The chat pane was closed. Do not leave a bridge (and its SSE
+      // connection) alive behind a hidden dock; hiding the library window
+      // itself no longer stops the bridge, so an answer keeps streaming.
       agentService.stop()
     }
   }
