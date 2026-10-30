@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls
+import Quickshell
 import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
@@ -24,9 +25,28 @@ Item {
   property bool choseInitial: false
   property string armedSessionID: ""
   property bool sendWhenReady: false
+  // Overridable in offscreen probes; production writes to the Wayland
+  // clipboard without a shell.
+  property var clipboardWriter: function(text) {
+    Quickshell.execDetached(["wl-copy", "--", String(text)])
+  }
+  property string chatMenuSelection: ""
+  property string chatMenuMessage: ""
 
   readonly property int mathRevision: mathService.revision
   readonly property bool inputActive: composer.activeFocus
+
+  function copyChatText(value) {
+    var text = String(value === undefined || value === null ? "" : value)
+    if (text === "") return
+    clipboardWriter(text)
+  }
+
+  function showChatMenu(x, y, selection, message) {
+    chatMenuSelection = String(selection === undefined || selection === null ? "" : selection)
+    chatMenuMessage = String(message === undefined || message === null ? "" : message)
+    chatMessageMenu.popup(Number(x || 0), Number(y || 0))
+  }
 
   function mathRequest(tex, display) {
     mathService.request(String(tex === undefined || tex === null ? "" : tex), !!display)
@@ -356,6 +376,10 @@ Item {
 
       delegate: ChatMessage {
         dock: root
+        clipboardWriter: dock ? dock.clipboardWriter : null
+        onCopyMenuRequested: function(payload) {
+          if (dock) dock.showChatMenu(payload.x, payload.y, payload.selection, payload.message)
+        }
       }
 
       onMovementStarted: root.atBottom = false
@@ -640,6 +664,44 @@ Item {
       font.family: Style.font.family
       font.pixelSize: Style.font.caption
       elide: Text.ElideRight
+    }
+  }
+
+  // --------------------------------------------------------- transcript menu
+  Menu {
+    id: chatMessageMenu
+    objectName: "chatMessageMenu"
+    parent: Overlay.overlay
+    width: Style.space(220)
+    padding: Style.space(4)
+    popupType: Qt.platform.pluginName !== "wayland" ? Popup.Window : Popup.Item
+    palette.window: Commons.Color.menu.background
+    palette.windowText: Commons.Color.menu.text
+    palette.text: Commons.Color.menu.text
+    palette.buttonText: Commons.Color.menu.text
+    palette.light: Commons.Color.menu.selectedBackground
+    palette.midlight: Util.alpha(Commons.Color.foreground, 0.12)
+    palette.mid: Util.alpha(Commons.Color.foreground, 0.16)
+    palette.dark: Commons.Color.menu.border
+
+    background: BorderSurface {
+      color: Commons.Color.menu.background
+      borderSpec: Border.controlSpec("normal", Commons.Color.menu.border,
+        Commons.Color.accent)
+      radius: Style.cornerRadius
+    }
+
+    ContextMenuItem {
+      objectName: "chatCopySelection"
+      text: "Copy selection"
+      enabled: root.chatMenuSelection !== ""
+      onTriggered: root.copyChatText(root.chatMenuSelection)
+    }
+    ContextMenuItem {
+      objectName: "chatCopyMessage"
+      text: "Copy message"
+      enabled: root.chatMenuMessage !== ""
+      onTriggered: root.copyChatText(root.chatMenuMessage)
     }
   }
 

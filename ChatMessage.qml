@@ -1,4 +1,6 @@
 import QtQuick
+import QtQuick.Controls
+import Quickshell
 import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
@@ -23,13 +25,24 @@ Item {
   property var expandedTools: ({})
   property int expansionRev: 0
   property bool reasoningOpen: false
+  // Overridable in offscreen probes; production writes to the Wayland
+  // clipboard without a shell.
+  property var clipboardWriter: function(text) {
+    Quickshell.execDetached(["wl-copy", "--", String(text)])
+  }
+
+  signal copyMenuRequested(var payload)
 
   readonly property bool isUser: kind === "user"
   readonly property var displayLines: String(text || "").split("\n")
   readonly property bool hasDisplayMath: !isUser && MathSyntax.findDisplayBlocks(displayLines).length > 0
+  // Markdown links go through the HTML converter too, so TextEdit can paint
+  // them with the theme accent instead of the document default.
+  readonly property bool hasLink: /\[[^\]]*\]\([^)]*\)/.test(String(text || ""))
+    || /<a\s[^>]*href=/i.test(String(text || ""))
   readonly property bool richText: !isUser
     && (MathSyntax.hasInlineMath(String(text || "")) || hasDisplayMath
-      || MathText.hasFormatting(String(text || "")))
+      || MathText.hasFormatting(String(text || "")) || hasLink)
 
   readonly property var toolList: {
     try {
@@ -48,6 +61,12 @@ Item {
       return dock ? dock.mathResolver(tex, display) : null
     }, MathSyntax)
   }
+
+  // TextEdit has no linkColor property; QTextDocument paints anchors with its
+  // default colour, so the accent is injected into the anchor tags instead.
+  readonly property string bodyHtml: String(renderedText || "").replace(
+    /<a href="([^"]*)"/g,
+    '<a href="$1" style="color:' + String(Commons.Color.accent) + '"')
 
   width: ListView.view ? ListView.view.width : implicitWidth
   implicitHeight: isUser ? userBubble.height + Style.space(2) : assistantColumn.height
@@ -101,6 +120,37 @@ Item {
     return text.charAt(0).toUpperCase() + text.slice(1)
   }
 
+  function copyText(value) {
+    var text = String(value === undefined || value === null ? "" : value)
+    if (text === "") return
+    if (typeof clipboardWriter === "function") clipboardWriter(text)
+  }
+
+  // Ctrl+C while a transcript block owns the caret. Keys.BeforeItem on the
+  // editors runs this before TextEdit's own clipboard handling.
+  function copyKey(event, editor) {
+    if (event.key !== Qt.Key_C) return
+    if ((event.modifiers & Qt.ControlModifier) === 0) return
+    var value = String(editor.selectedText || "")
+    if (value === "") return
+    event.accepted = true
+    root.copyText(value)
+  }
+
+  function requestCopyMenu(editor, mouse, message, kind) {
+    var overlay = Overlay.overlay
+    var point = overlay
+      ? editor.mapToItem(overlay, mouse.x, mouse.y)
+      : editor.mapToItem(null, mouse.x, mouse.y)
+    root.copyMenuRequested({
+      x: point.x,
+      y: point.y,
+      selection: String(editor.selectedText || ""),
+      message: String(message === undefined || message === null ? "" : message),
+      kind: String(kind || "")
+    })
+  }
+
   onTextChanged: if (richText) mathDebounce.restart()
   Component.onCompleted: if (richText) Qt.callLater(requestMath)
 
@@ -115,17 +165,20 @@ Item {
     id: userBubble
     visible: root.isUser
     anchors.right: parent.right
-    width: Math.min(root.width * 0.88, userLabel.implicitWidth + Style.space(20))
-    height: userLabel.implicitHeight + Style.space(14)
+    width: Math.min(root.width * 0.88, userMeasure.implicitWidth + Style.space(20))
+    height: Math.max(userMeasure.implicitHeight, userEdit.contentHeight) + Style.space(14)
     color: Util.alpha(Commons.Color.accent, 0.09)
     borderSpec: Border.flat(Util.alpha(Commons.Color.accent, 0.2), 1)
     radius: Style.cornerRadius
 
+    // TextEdit has no lineHeight and its contentHeight is not the same as a
+    // Text's implicitHeight, so a hidden Text keeps the bubble's compact
+    // wrapped geometry while the visible editor handles selection.
     Text {
-      id: userLabel
+      id: userMeasure
+      visible: false
       anchors.left: parent.left
       anchors.right: parent.right
-      anchors.verticalCenter: parent.verticalCenter
       anchors.leftMargin: Style.space(10)
       anchors.rightMargin: Style.space(10)
       text: root.text
@@ -133,8 +186,23 @@ Item {
       color: Commons.Color.foreground
       font.family: Style.font.family
       font.pixelSize: Style.font.body
-      lineHeight: 1.2
       wrapMode: Text.Wrap
+    }
+
+    SelectableText {
+      id: userEdit
+      objectName: "chatUserText"
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.space(10)
+      anchors.rightMargin: Style.space(10)
+      text: root.text
+      color: Commons.Color.foreground
+      onCopyKeyRequested: function(event) { root.copyKey(event, userEdit) }
+      onMenuRequested: function(mouse) {
+        root.requestCopyMenu(userEdit, mouse, String(root.text || ""), "user")
+      }
     }
   }
 
@@ -171,18 +239,20 @@ Item {
         }
       }
 
-      Text {
+      SelectableText {
+        id: reasoningEdit
+        objectName: "chatReasoningText"
         visible: root.reasoningOpen
         width: parent.width
         text: String(root.reasoning || "")
-        textFormat: Text.PlainText
         color: Util.alpha(Commons.Color.foreground, 0.55)
-        font.family: Style.font.family
         font.pixelSize: Style.font.bodySmall
         font.italic: true
-        lineHeight: 1.2
-        wrapMode: Text.Wrap
+        onCopyKeyRequested: function(event) { root.copyKey(event, reasoningEdit) }
+        onMenuRequested: function(mouse) {
+          root.requestCopyMenu(reasoningEdit, mouse, String(root.reasoning || ""), "reasoning")
         }
+      }
     }
 
     Repeater {
@@ -289,19 +359,62 @@ Item {
       }
     }
 
-    Text {
+    SelectableText {
+      id: bodyEdit
+      objectName: "chatAssistantText"
       visible: String(root.text || "") !== ""
       width: parent.width
-      text: root.renderedText
-      textFormat: root.richText ? Text.RichText : Text.MarkdownText
-      wrapMode: Text.Wrap
+      text: root.bodyHtml
+      textFormat: root.richText ? TextEdit.RichText : TextEdit.MarkdownText
       color: Commons.Color.foreground
-      linkColor: Commons.Color.accent
-      font.family: Style.font.family
-      font.pixelSize: Style.font.body
-      lineHeight: 1.15
+      onCopyKeyRequested: function(event) { root.copyKey(event, bodyEdit) }
+      onMenuRequested: function(mouse) {
+        root.requestCopyMenu(bodyEdit, mouse, String(root.text || ""), "assistant")
+      }
       onLinkActivated: function(link) {
         if (root.dock) root.dock.linkActivated(link)
+      }
+    }
+  }
+
+  // A read-only transcript block that can be selected with the mouse, copied
+  // with Ctrl+C, and right-clicked for the dock's copy menu.
+  component SelectableText: TextEdit {
+    id: editor
+
+    signal copyKeyRequested(var event)
+    signal menuRequested(var mouse)
+
+    readOnly: true
+    selectByMouse: true
+    selectByKeyboard: true
+    cursorVisible: false
+    activeFocusOnPress: true
+    persistentSelection: false
+    wrapMode: TextEdit.Wrap
+    textFormat: TextEdit.PlainText
+    textMargin: 0
+    color: Commons.Color.foreground
+    font.family: Style.font.family
+    font.pixelSize: Style.font.body
+    selectionColor: Util.alpha(Commons.Color.accent, 0.42)
+    selectedTextColor: Commons.Color.foreground
+
+    // Run before TextEdit's own Ctrl+C handling so the dock's Wayland writer
+    // owns the clipboard instead of Qt's.
+    Keys.priority: Keys.BeforeItem
+    Keys.onPressed: function(event) {
+      editor.copyKeyRequested(event)
+    }
+
+    MouseArea {
+      anchors.fill: parent
+      acceptedButtons: Qt.RightButton
+      propagateComposedEvents: false
+      cursorShape: Qt.IBeamCursor
+      onClicked: function(mouse) {
+        editor.menuRequested(mouse)
+        mouse.accepted = true
       }
     }
   }
