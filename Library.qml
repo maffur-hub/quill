@@ -2972,7 +2972,7 @@ Item {
         anchors.right: parent.right
         anchors.top: parent.top
         anchors.bottom: parent.bottom
-        visible: root.chatOpen && root.active
+        visible: root.chatOpen
         width: Style.space(340)
         dataRoot: root.dataRoot
         pluginDir: root.pluginDir

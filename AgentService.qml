@@ -36,9 +36,23 @@ Item {
   signal sessionsUpdated()
   signal historyLoaded()
 
+  // Wanted means "the dock wants a live bridge", independent of whether one is
+  // running right now. The supervisor only ever revives a wanted bridge, so a
+  // dock that was closed (stop) is never resurrected behind the user.
+  property bool wanted: false
   property bool quitting: false
   property bool started: false
   property bool relaunchWhenStopped: false
+  // One connect attempt per spawn. The generation counter keeps start() from
+  // force-killing and respawning faster than the connect deadline.
+  property bool connectTimedOut: false
+  property int spawnGeneration: 0
+  property int recoveredGeneration: -1
+  // True once the bridge has produced any parsed event since this spawn. A
+  // bridge that is alive but reporting a service error counts as healthy.
+  property bool heardFromBridge: false
+  property int failedSpawns: 0
+  property double nextSpawnAt: 0
   readonly property bool bridgeRunning: process.running
   readonly property int bridgePid: process.processId || 0
   property string pendingText: ""
@@ -57,22 +71,34 @@ Item {
   }
 
   function start() {
+    wanted = true
     started = true
     // Reuse a live bridge. Sending start again would reconnect SSE and reset
     // the bridge's transcript bookkeeping for an already-open dock.
     if (process.running) {
       if (quitting) relaunchWhenStopped = true
+      // A connect attempt already gave up but the child still looks alive (a
+      // forced stop does not always emit onExited). Replace it once per spawn
+      // so the dock cannot sit on "Connecting to OpenCode…" forever.
+      if (!ready && connectTimedOut && !quitting
+          && recoveredGeneration !== spawnGeneration) {
+        recoveredGeneration = spawnGeneration
+        process.running = false
+        stopTimer.stop()
+        quitting = false
+        delayedStart.restart()
+      }
       return
     }
     relaunchWhenStopped = false
     stopTimer.stop()
     quitting = false
-    error = ""
     ready = false
     delayedStart.restart()
   }
 
   function retry() {
+    wanted = true
     error = ""
     notice = ""
     if (process.running && ready) {
@@ -93,7 +119,7 @@ Item {
   function newChat(title) {
     var command = { type: "new" }
     if (title) command.title = String(title)
-    writeLine(command)
+    return writeLine(command)
   }
 
   function openSession(sessionID) {
@@ -106,13 +132,21 @@ Item {
     if (!value || busy) return
     if (!activeSessionID) {
       // Creating a session is asynchronous; send as soon as `opened` lands.
+      if (!newChat()) {
+        root.error = "Chat bridge is not running"
+        start()
+        return
+      }
       pendingText = value
-      newChat()
+      return
+    }
+    if (!writeLine({ type: "prompt", sessionID: activeSessionID, text: value })) {
+      root.error = "Chat bridge is not running"
+      start()
       return
     }
     appendUser(value)
     busy = true
-    writeLine({ type: "prompt", sessionID: activeSessionID, text: value })
   }
 
   function interrupt() {
@@ -158,8 +192,10 @@ Item {
   }
 
   function stop() {
+    wanted = false
     quitting = true
     relaunchWhenStopped = false
+    connectTimer.stop()
     if (process.running) writeLine({ type: "stop" })
     // Closing stdin also makes the bridge exit; this covers a hung child.
     stopTimer.restart()
@@ -302,11 +338,15 @@ Item {
       return
     }
     if (!event || !event.type) return
+    heardFromBridge = true
     var type = String(event.type)
 
     if (type === "ready") {
       ready = true
       error = ""
+      connectTimer.stop()
+      failedSpawns = 0
+      nextSpawnAt = 0
       if (event.agent) agentName = capitalise(String(event.agent))
       return
     }
@@ -409,16 +449,66 @@ Item {
     onTriggered: {
       if (root.quitting || process.running) return
       root.lastStderr = ""
-      root.error = ""
+      root.heardFromBridge = false
+      root.connectTimedOut = false
+      root.spawnGeneration += 1
       process.command = ["node", String(root.pluginDir) + "/scripts/quill-agent"]
       process.running = true
+      connectTimer.restart()
+    }
+  }
+
+  // Watches a spawn that never becomes ready. Without this the dock can show a
+  // silent "Connecting to OpenCode…" forever; the error row plus Retry button
+  // in ChatDock only appear once `error` is set.
+  Timer {
+    id: connectTimer
+    interval: 10000
+    repeat: false
+    onTriggered: {
+      if (root.ready) return
+      // Any event proves the child is alive; it may simply be reporting a
+      // service error, which the dock already surfaces. Killing it here would
+      // discard a healthy bridge.
+      if (root.heardFromBridge) return
+      root.connectTimedOut = true
+      root.error = root.lastStderr !== "" ? root.lastStderr : "Could not connect to OpenCode"
+      if (process.running) process.running = false
     }
   }
 
   Timer {
     id: stopTimer
     interval: 600
-    onTriggered: if (process.running) process.running = false
+    onTriggered: {
+      if (process.running) process.running = false
+      // Quickshell does not always emit onExited for a forced kill. Un-latch
+      // here so a bridge the dock still wants is not stuck in `quitting`.
+      if (root.wanted) {
+        root.quitting = false
+        delayedStart.restart()
+      }
+    }
+  }
+
+  // Self-heal: ChatDock only calls start() when it becomes visible, so a child
+  // that died while the dock stayed open would otherwise stay dead.
+  Timer {
+    id: supervisor
+    interval: 3000
+    repeat: true
+    running: true
+    onTriggered: {
+      if (!root.wanted) return
+      if (root.ready) return
+      if (process.running) return
+      if (delayedStart.running) return
+      if (stopTimer.running) return
+      // A dead bridge behind a stale error still deserves another attempt, but
+      // back off so a missing `node` cannot spawn-storm the machine.
+      if (Date.now() < root.nextSpawnAt) return
+      root.start()
+    }
   }
 
   ListModel {
@@ -439,8 +529,10 @@ Item {
     }
     onStarted: root.writeLine({ type: "start", dataRoot: root.dataRoot })
     onExited: function(exitCode) {
+      var wasReady = root.ready
       root.ready = false
       root.busy = false
+      connectTimer.stop()
       if (root.relaunchWhenStopped) {
         // The dock was reopened while the previous child was still stopping.
         // Start exactly one replacement after it has gone.
@@ -450,7 +542,19 @@ Item {
         delayedStart.restart()
         return
       }
-      if (root.quitting) return
+      if (root.quitting) {
+        stopTimer.stop()
+        return
+      }
+      // A spawn that never announced ready is a failed spawn; space out the
+      // next supervisor attempt instead of looping every few seconds.
+      if (!wasReady) {
+        root.failedSpawns += 1
+        root.nextSpawnAt = Date.now() + Math.min(30000, 3000 * root.failedSpawns)
+      }
+      // The connect deadline already explained this exit; keep its message
+      // instead of replacing it with a generic "stopped unexpectedly".
+      if (root.connectTimedOut) return
       root.error = root.lastStderr !== ""
         ? root.lastStderr
         : "Chat bridge stopped unexpectedly"

@@ -23,6 +23,7 @@ Item {
   property bool atBottom: true
   property bool choseInitial: false
   property string armedSessionID: ""
+  property bool sendWhenReady: false
 
   readonly property int mathRevision: mathService.revision
   readonly property bool inputActive: composer.activeFocus
@@ -59,9 +60,15 @@ Item {
   }
 
   function submit() {
-    if (!agentService.ready || agentService.error !== "" || agentService.busy) return
+    if (agentService.busy) return
     var value = String(composer.text || "").trim()
     if (value === "") return
+    if (!agentService.ready || agentService.error !== "") {
+      sendWhenReady = true
+      agentService.retry()
+      return
+    }
+    sendWhenReady = false
     agentService.sendPrompt(value)
     composer.text = ""
     root.atBottom = true
@@ -75,7 +82,12 @@ Item {
       composer.cursorPosition = composer.text.length
       return
     }
-    if (!agentService.ready || agentService.error !== "") return
+    if (!agentService.ready || agentService.error !== "") {
+      composer.text = label
+      composer.forceActiveFocus()
+      composer.cursorPosition = composer.text.length
+      return
+    }
     agentService.sendPrompt(label)
     root.atBottom = true
     scrollToEnd()
@@ -152,6 +164,16 @@ Item {
     function onScrollRequested() {
       root.atBottom = true
       root.scrollToEnd()
+    }
+  }
+
+  // Enter pressed while offline keeps the text in the composer and asks the
+  // bridge to reconnect; send it as soon as the service answers.
+  Connections {
+    target: agentService
+
+    function onReadyChanged() {
+      if (agentService.ready && root.sendWhenReady) root.submit()
     }
   }
 
@@ -535,6 +557,13 @@ Item {
       borderSpec: Border.controlSpec("normal", Commons.Color.foreground, Commons.Color.accent)
       radius: Style.cornerRadius
 
+      MouseArea {
+        anchors.fill: parent
+        z: -1
+        cursorShape: Qt.IBeamCursor
+        onClicked: composer.forceActiveFocus()
+      }
+
       Row {
         id: composerRow
         anchors.left: parent.left
@@ -548,12 +577,13 @@ Item {
           id: composer
           width: parent.width - sendButton.width - parent.spacing
           height: Math.min(Style.space(96), Math.max(Style.space(40), contentHeight + Style.space(4)))
-          enabled: agentService.ready && agentService.error === ""
           placeholderText: agentService.busy
             ? "Answering…"
-            : agentService.activeSessionID === ""
-              ? "Ask about your notes…"
-              : "Message"
+            : (agentService.error !== "" || !agentService.ready)
+              ? "Offline — press Enter to retry"
+              : agentService.activeSessionID === ""
+                ? "Ask about your notes…"
+                : "Message"
           placeholderTextColor: Util.alpha(Commons.Color.foreground, 0.3)
           color: Commons.Color.foreground
           font.family: Style.font.family

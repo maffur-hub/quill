@@ -421,6 +421,10 @@ function connectSSE() {
     }
     lastServiceError = ''
     sseBackoff = 500
+    // `ready` means the service answered, not merely that its URL was
+    // resolved. Re-announcing on every successful connect also clears a stale
+    // offline state in the dock after a reconnect.
+    send({ type: 'ready', service: serviceURL, directory: dataRoot, agent: agent })
     // A reconnect may have missed events. Reload the open transcript and the
     // session list instead of trying to replay deltas; on the first connect
     // the list refresh also clears any stale service error in the dock.
@@ -818,7 +822,6 @@ async function handleCommand(command) {
       resolveService()
       resolvePassword()
       lastServiceError = ''
-      send({ type: 'ready', service: serviceURL, directory: dataRoot, agent: agent })
       if (!password) {
         emitError('service', 'OpenCode service password was not found')
         return
@@ -893,6 +896,7 @@ function enqueueCommand(command) {
 // --------------------------------------------------------------- lifecycle
 
 function shutdown() {
+  if (stopping) return
   stopping = true
   clearTimeout(sseReconnectTimer)
   sseReconnectTimer = null
@@ -941,10 +945,13 @@ process.stdout.on('error', function(error) {
 
 process.on('uncaughtException', function(error) {
   log('uncaught: ' + (error && error.stack ? error.stack : messageOf(error)))
+  // Writing the error to a broken stdout would throw again and recurse.
+  if (stdoutBroken || (error && error.code === 'EPIPE')) return
   emitError('bridge', messageOf(error))
 })
 process.on('unhandledRejection', function(error) {
   log('unhandled: ' + messageOf(error))
+  if (stdoutBroken || (error && error.code === 'EPIPE')) return
   emitError('bridge', messageOf(error))
 })
 
