@@ -292,6 +292,20 @@ function normaliseTool(part) {
   return entry
 }
 
+// OpenCode lists session messages newest-first. Order them explicitly so the
+// transcript reads top-to-bottom and the idle check sees the newest message.
+function chronologicalMessages(data) {
+  const list = Array.isArray(data) ? data : []
+  const entries = list.map(function(item, index) { return { item: item, index: index } })
+  entries.sort(function(a, b) {
+    const ta = a.item && a.item.time && a.item.time.created ? Number(a.item.time.created) : 0
+    const tb = b.item && b.item.time && b.item.time.created ? Number(b.item.time.created) : 0
+    if (ta !== tb) return ta - tb
+    return b.index - a.index
+  })
+  return entries.map(function(entry) { return entry.item })
+}
+
 function normaliseHistory(data) {
   const messages = []
   const list = Array.isArray(data) ? data : []
@@ -663,7 +677,9 @@ function handleToolEvent(type, data) {
 
 async function loadHistory(sessionID, quiet) {
   const response = await api('GET', '/api/session/' + encodeURIComponent(sessionID) + '/message')
-  const raw = response && Array.isArray(response.data) ? response.data : []
+  // The service returns messages newest-first; order them oldest-first so the
+  // transcript reads top-to-bottom and the idle check below sees the newest.
+  const raw = chronologicalMessages(response && Array.isArray(response.data) ? response.data : [])
   const messages = normaliseHistory(raw)
   if (sessionID !== currentSessionID) return messages
   resetTranscriptParts()
@@ -674,8 +690,9 @@ async function loadHistory(sessionID, quiet) {
     messages: messages
   })
   // A reconnect can miss the execution-succeeded event. OpenCode appends an
-  // idle marker when a run finishes, so the last raw message tells us whether
-  // the Stop button should stay up.
+  // idle marker when a run finishes, so the newest message (last, after the
+  // chronological ordering above) tells us whether the Stop button should stay
+  // up.
   let idle = true
   if (raw.length > 0) idle = raw[raw.length - 1].type === 'idle'
   send({ type: 'status', sessionID: sessionID, status: idle ? 'idle' : 'running' })
