@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# Load every Quill QML component in a disposable, headless Quickshell instance.
+#
+# qmllint does not verify attached-property names (for example a misspelled
+# `Drag.suggestedAction`), and that class of error makes the whole plugin fail
+# to load: the bar icon disappears and the panel never opens. This check
+# compiles and instantiates the components against the real Omarchy modules so
+# a hard load error fails the test run instead of the desktop.
+#
+# It runs its own config under QT_QPA_PLATFORM=offscreen with a throwaway data
+# root, so it never touches the running shell or the user's notes.
+set -u
+
+cd "$(dirname "$0")/.." || exit 1
+root=$(pwd)
+
+shell_root="${OMARCHY_PATH:-/usr/share/omarchy}/shell"
+if [[ ! -f "$shell_root/shell.qml" ]]; then
+  echo "skip: Omarchy shell not found at $shell_root"
+  exit 0
+fi
+if ! command -v quickshell >/dev/null 2>&1; then
+  echo "skip: quickshell is not installed"
+  exit 0
+fi
+
+# Panel.qml is excluded on purpose: it creates a PanelWindow, which cannot
+# commit under the offscreen platform and would fail for reasons unrelated to
+# our code. Library.qml is the component the panel hosts, and a broken
+# dependency shows up there.
+components=(Library.qml NoteList.qml Sidebar.qml MarkdownEditor.qml QuickSwitcher.qml VersionHistory.qml TagManager.qml TemplateManager.qml)
+
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/quill-qmlcheck.XXXXXX") || exit 1
+trap 'rm -rf "$tmp"' EXIT
+
+mkdir -p "$tmp/imports" "$tmp/data"
+ln -s "$shell_root" "$tmp/imports/qs"
+
+{
+  echo 'import QtQuick'
+  echo 'import Quickshell'
+  echo ''
+  echo 'ShellRoot {'
+  echo '  id: probe'
+  echo "  property string base: \"file://$root/\""
+  index=0
+  for component in "${components[@]}"; do
+    echo "  Loader { id: loader$index; source: probe.base + \"$component\";"
+    echo "    onStatusChanged: console.log(\"QMLCHECK $component=\" + status) }"
+    index=$((index + 1))
+  done
+  echo '  Timer { interval: 6000; running: true; onTriggered: Qt.quit() }'
+  echo '}'
+} >"$tmp/shell.qml"
+
+log="$tmp/log"
+QUILL_DATA_DIR="$tmp/data" \
+QUILL_E2E=1 \
+QML_IMPORT_PATH="$tmp/imports" \
+QT_QPA_PLATFORM=offscreen \
+QS_DISABLE_FILE_WATCHER=1 \
+  timeout 60 quickshell -p "$tmp" >"$log" 2>&1
+status=$?
+
+# Loader.Status: 1 ready, 2 loading, 3 error. Anything that never finished is
+# a failure too: a component that hangs is as broken as one that throws.
+failed=0
+for component in "${components[@]}"; do
+  line=$(grep -F "QMLCHECK $component=" "$log" | tail -n 1)
+  if [[ -z $line ]]; then
+    echo "QML load: $component did not report a status"
+    failed=1
+    continue
+  fi
+  value=${line##*=}
+  value=${value%$'\r'}
+  if [[ $value != "1" ]]; then
+    echo "QML load: $component failed (status $value, expected 1=ready)"
+    failed=1
+  fi
+done
+
+# Report the actual QML diagnostics; the platform warnings around them are noise.
+if grep -qE "Cannot assign to non-existent property|is not a type|Type .* unavailable|Non-existent attached object" "$log"; then
+  echo "QML load: compiler reported errors"
+  grep -E "Cannot assign to non-existent property|is not a type|Type .* unavailable|Non-existent attached object" "$log" | head -20
+  failed=1
+fi
+
+if ((failed)); then
+  echo "See the full log: $log"
+  # Keep the log for inspection; the trap would delete it.
+  trap - EXIT
+  exit 1
+fi
+
+if ((status != 0)); then
+  echo "QML load: quickshell exited with status $status"
+  tail -20 "$log"
+  trap - EXIT
+  exit 1
+fi
+
+echo "QML load: ${#components[@]} components ready"
+exit 0

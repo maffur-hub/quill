@@ -1,0 +1,4 @@
+// greet the caller
+function greet(name) {
+  return `hi ${name}` // template
+}

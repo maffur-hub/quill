@@ -10,6 +10,9 @@ BorderSurface {
 
   property var notes: []
   property string selectedId: ""
+  // Multi-selection owned by Library. `selectedId` remains the active row the
+  // editor shows; this array is only the additional Shift/Ctrl selection.
+  property var selectedIds: []
   property string searchText: ""
   property bool searching: false
   property bool showTrash: false
@@ -23,7 +26,16 @@ BorderSurface {
   property real menuAnchorX: 0
   property real menuAnchorY: 0
 
+  // Saved searches and "advanced search" set searchText from outside; mirror
+  // that into the field so the box never disagrees with the results. The
+  // equality guard stops the textChanged signal from bouncing back.
+  onSearchTextChanged: if (searchField.text !== root.searchText) searchField.text = root.searchText
+
   signal noteSelected(string id)
+  signal selectionToggleRequested(string id)
+  signal selectionRangeRequested(string id)
+  signal selectAllRequested()
+  signal selectionCleared()
   signal searchQueryChanged(string text)
   signal escapePressed()
   signal editorFocusRequested()
@@ -39,6 +51,43 @@ BorderSurface {
 
   function focusList() {
     root.forceActiveFocus()
+  }
+
+  function isSelected(id) {
+    var key = String(id || "")
+    if (key === "") return false
+    for (var i = 0; i < root.selectedIds.length; i++) {
+      if (String(root.selectedIds[i]) === key) return true
+    }
+    return false
+  }
+
+  // The row a plain Up/Down or Shift+Up/Down should land on. Shift ranges are
+  // extended by Library, so this only computes the next id and keeps it
+  // visible.
+  function adjacentId(delta) {
+    if (root.notes.length === 0) return ""
+    var index = -1
+    for (var i = 0; i < root.notes.length; i++) {
+      if (String(root.notes[i].id) === root.selectedId) { index = i; break }
+    }
+    if (index < 0) index = delta < 0 ? 0 : -1
+    index = Math.max(0, Math.min(root.notes.length - 1, index + delta))
+    var id = String(root.notes[index].id)
+    noteList.positionViewAtIndex(index, ListView.Contain)
+    return id
+  }
+
+  // A dragged row carries the whole selection when it is part of one of two or
+  // more rows; otherwise it carries just itself.
+  function dragPayload(id) {
+    var key = String(id || "")
+    if (root.selectedIds.length > 1 && root.isSelected(key)) {
+      var ids = []
+      for (var i = 0; i < root.selectedIds.length; i++) ids.push(String(root.selectedIds[i]))
+      return ids.join("\n")
+    }
+    return key
   }
 
   function relativeTime(milliseconds) {
@@ -105,7 +154,29 @@ BorderSurface {
     var trashed = !!root.showTrash || !!note.trashed
     var menu = trashed ? trashMenu : noteMenu
     menu.menuNoteId = String(note.id || "")
-    if (!trashed) menu.menuPinned = !!note.pinned
+    // A right-click inside a multi-selection keeps it and shows plural labels.
+    menu.bulkCount = root.selectedIds.length > 1 && root.isSelected(String(note.id))
+      ? root.selectedIds.length : 1
+    if (!trashed) {
+      // The bulk label must match pinNotes()'s rule: only unpin when every
+      // selected note is already pinned.
+      if (menu.bulkCount > 1) {
+        var allPinned = true
+        for (var s = 0; s < root.selectedIds.length; s++) {
+          var selectedNote = null
+          for (var n = 0; n < root.notes.length; n++) {
+            if (String(root.notes[n].id) === String(root.selectedIds[s])) {
+              selectedNote = root.notes[n]
+              break
+            }
+          }
+          if (!selectedNote || !selectedNote.pinned) { allPinned = false; break }
+        }
+        menu.menuPinned = allPinned
+      } else {
+        menu.menuPinned = !!note.pinned
+      }
+    }
     root.menuAnchorX = Number(point.x || 0)
     root.menuAnchorY = Number(point.y || 0)
     var target = root.popupPoint(menu, point)
@@ -143,7 +214,20 @@ BorderSurface {
   focus: true
 
   Keys.onPressed: function(event) {
-    if (event.key === Qt.Key_Up || event.key === Qt.Key_K) {
+    var command = event.modifiers & (Qt.ControlModifier | Qt.MetaModifier)
+    if (event.key === Qt.Key_A && command) {
+      root.selectAllRequested()
+      event.accepted = true
+    } else if (event.key === Qt.Key_Escape) {
+      if (root.selectedIds.length > 1) root.selectionCleared()
+      else root.escapePressed()
+      event.accepted = true
+    } else if ((event.key === Qt.Key_Up || event.key === Qt.Key_Down)
+      && (event.modifiers & Qt.ShiftModifier)) {
+      var rangeId = root.adjacentId(event.key === Qt.Key_Up ? -1 : 1)
+      if (rangeId !== "") root.selectionRangeRequested(rangeId)
+      event.accepted = true
+    } else if (event.key === Qt.Key_Up || event.key === Qt.Key_K) {
       root.moveSelection(-1)
       event.accepted = true
     } else if (event.key === Qt.Key_Down || event.key === Qt.Key_J) {
@@ -215,7 +299,20 @@ BorderSurface {
         boundsBehavior: Flickable.StopAtBounds
 
         Keys.onPressed: function(event) {
-          if (event.key === Qt.Key_Up || event.key === Qt.Key_K) {
+          var command = event.modifiers & (Qt.ControlModifier | Qt.MetaModifier)
+          if (event.key === Qt.Key_A && command) {
+            root.selectAllRequested()
+            event.accepted = true
+          } else if (event.key === Qt.Key_Escape) {
+            if (root.selectedIds.length > 1) root.selectionCleared()
+            else root.escapePressed()
+            event.accepted = true
+          } else if ((event.key === Qt.Key_Up || event.key === Qt.Key_Down)
+            && (event.modifiers & Qt.ShiftModifier)) {
+            var rangeId = root.adjacentId(event.key === Qt.Key_Up ? -1 : 1)
+            if (rangeId !== "") root.selectionRangeRequested(rangeId)
+            event.accepted = true
+          } else if (event.key === Qt.Key_Up || event.key === Qt.Key_K) {
             root.moveSelection(-1)
             event.accepted = true
           } else if (event.key === Qt.Key_Down || event.key === Qt.Key_J) {
@@ -239,21 +336,34 @@ BorderSurface {
           required property var modelData
           required property int index
 
-          readonly property bool rowSelected: String(modelData.id) === root.selectedId
+          readonly property bool rowActive: String(modelData.id) === root.selectedId
+          readonly property bool rowSelected: rowActive || root.isSelected(String(modelData.id))
 
           objectName: "noteRow-" + String(modelData.id)
           width: noteList.width
           height: Style.space(80)
-          color: rowSelected
+          color: rowActive
             ? Style.selectedAccentFill
-            : rowMouse.containsMouse ? Style.hoverFillFor(Commons.Color.foreground, Commons.Color.accent) : "transparent"
-          borderSpec: rowSelected
+            : rowSelected
+              ? Util.alpha(Commons.Color.accent, 0.14)
+              : rowMouse.containsMouse ? Style.hoverFillFor(Commons.Color.foreground, Commons.Color.accent) : "transparent"
+          borderSpec: rowActive
             ? Border.controlSpec("selected", Commons.Color.accent, Commons.Color.accent)
-            : rowMouse.containsMouse ? Border.controlSpec("hover-cursor", Commons.Color.foreground, Commons.Color.accent) : Border.none
+            : rowSelected
+              ? Border.flat(Util.alpha(Commons.Color.accent, 0.4), 1)
+              : rowMouse.containsMouse ? Border.controlSpec("hover-cursor", Commons.Color.foreground, Commons.Color.accent) : Border.none
           radius: Style.cornerRadius
 
+          Drag.active: rowMouse.dragStarted
+          Drag.dragType: Drag.Internal
+          Drag.supportedActions: Qt.MoveAction
+          Drag.proposedAction: Qt.MoveAction
+          Drag.hotSpot: Qt.point(Style.space(12), Style.space(12))
+          Drag.keys: ["text/x-quill-note"]
+          Drag.mimeData: ({ "text/x-quill-note": root.dragPayload(String(modelData.id)) })
+
           Rectangle {
-            visible: noteRow.rowSelected
+            visible: noteRow.rowActive
             anchors.left: parent.left
             anchors.top: parent.top
             anchors.bottom: parent.bottom
@@ -289,7 +399,7 @@ BorderSurface {
                 color: Commons.Color.foreground
                 font.family: Style.font.family
                 font.pixelSize: Style.font.body
-                font.bold: noteRow.rowSelected
+                font.bold: noteRow.rowActive
                 elide: Text.ElideRight
               }
               Text {
@@ -348,13 +458,29 @@ BorderSurface {
 
           MouseArea {
             id: rowMouse
+            property bool dragStarted: false
+            property real pressX: 0
+            property real pressY: 0
+
             anchors.fill: parent
             hoverEnabled: true
             acceptedButtons: Qt.LeftButton | Qt.RightButton
             cursorShape: Qt.PointingHandCursor
             onPressed: function(mouse) {
+              if (mouse.button === Qt.LeftButton) {
+                root.forceActiveFocus()
+                dragStarted = false
+                pressX = mouse.x
+                pressY = mouse.y
+                return
+              }
               if (mouse.button !== Qt.RightButton) return
-              root.noteSelected(String(noteRow.modelData.id))
+              var id = String(noteRow.modelData.id)
+              // Right-click inside a multi-selection keeps it; anywhere else it
+              // selects just this row first, exactly like a plain click.
+              if (!root.isSelected(id) || root.selectedIds.length < 2) {
+                root.noteSelected(id)
+              }
               root.forceActiveFocus()
               var overlay = Overlay.overlay
               if (!overlay) return
@@ -362,13 +488,39 @@ BorderSurface {
               root.openNoteMenu(noteRow.modelData, point)
               mouse.accepted = true
             }
+            onPositionChanged: function(mouse) {
+              if (!pressed || dragStarted) return
+              if (Math.abs(mouse.x - pressX) + Math.abs(mouse.y - pressY) < Style.space(4)) return
+              // A real drag suppresses the click that would otherwise reset
+              // the selection under the pointer.
+              dragStarted = true
+            }
+            onReleased: {
+              if (!dragStarted) return
+              // Let onClicked see the flag first; it is what suppresses the
+              // accidental click after a drop.
+              Qt.callLater(function() { rowMouse.dragStarted = false })
+            }
             onClicked: function(mouse) {
               if (mouse.button !== Qt.LeftButton) return
-              root.noteSelected(String(noteRow.modelData.id))
-              root.forceActiveFocus()
+              if (dragStarted) {
+                dragStarted = false
+                return
+              }
+              var id = String(noteRow.modelData.id)
+              if (mouse.modifiers & (Qt.ControlModifier | Qt.MetaModifier)) {
+                root.selectionToggleRequested(id)
+                return
+              }
+              if (mouse.modifiers & Qt.ShiftModifier) {
+                root.selectionRangeRequested(id)
+                return
+              }
+              root.noteSelected(id)
             }
             onDoubleClicked: function(mouse) {
               if (mouse.button !== Qt.LeftButton) return
+              if (dragStarted) return
               root.noteSelected(String(noteRow.modelData.id))
               root.editorFocusRequested()
             }
@@ -419,6 +571,7 @@ BorderSurface {
     parent: Overlay.overlay
     property string menuNoteId: ""
     property bool menuPinned: false
+    property int bulkCount: 1
     width: Style.space(220)
     padding: Style.space(4)
     popupType: Qt.platform.pluginName !== "wayland" ? Popup.Window : Popup.Item
@@ -440,23 +593,40 @@ BorderSurface {
 
     ContextMenuItem {
       objectName: "noteMenuPin"
-      text: noteMenu.menuPinned ? "Unpin" : "Pin"
+      text: noteMenu.bulkCount > 1
+        ? (noteMenu.menuPinned
+          ? "Unpin " + noteMenu.bulkCount + " notes"
+          : "Pin " + noteMenu.bulkCount + " notes")
+        : (noteMenu.menuPinned ? "Unpin" : "Pin")
       onTriggered: root.noteActionRequested(noteMenu.menuNoteId, "pin")
     }
     ContextMenuItem {
       objectName: "noteMenuRename"
       text: "Rename…"
+      visible: noteMenu.bulkCount <= 1
       onTriggered: root.noteRenameRequested(noteMenu.menuNoteId)
     }
     ContextMenuItem {
       objectName: "noteMenuDuplicate"
       text: "Duplicate"
+      visible: noteMenu.bulkCount <= 1
       onTriggered: root.noteActionRequested(noteMenu.menuNoteId, "duplicate")
     }
     ContextMenuItem {
       objectName: "noteMenuMove"
-      text: "Move to folder…"
+      text: noteMenu.bulkCount > 1
+        ? "Move " + noteMenu.bulkCount + " notes to folder…" : "Move to folder…"
       onTriggered: root.openMoveMenu()
+    }
+    ContextMenuItem {
+      objectName: "noteMenuTagAdd"
+      text: "Add tag…"
+      onTriggered: root.noteActionRequested(noteMenu.menuNoteId, "tag-add")
+    }
+    ContextMenuItem {
+      objectName: "noteMenuTagRemove"
+      text: "Remove tag…"
+      onTriggered: root.noteActionRequested(noteMenu.menuNoteId, "tag-remove")
     }
 
     MenuSeparator {
@@ -465,8 +635,21 @@ BorderSurface {
 
     ContextMenuItem {
       objectName: "noteMenuTrash"
-      text: "Move to Trash"
+      text: noteMenu.bulkCount > 1
+        ? "Move " + noteMenu.bulkCount + " notes to Trash" : "Move to Trash"
       onTriggered: root.noteActionRequested(noteMenu.menuNoteId, "trash")
+    }
+
+    MenuSeparator {
+      objectName: "noteMenuSelectAllSeparator"
+      visible: root.notes.length > 1
+    }
+
+    ContextMenuItem {
+      objectName: "noteMenuSelectAll"
+      text: "Select all"
+      visible: root.notes.length > 1
+      onTriggered: root.selectAllRequested()
     }
   }
 
@@ -475,6 +658,7 @@ BorderSurface {
     objectName: "noteListTrashMenu"
     parent: Overlay.overlay
     property string menuNoteId: ""
+    property int bulkCount: 1
     width: Style.space(220)
     padding: Style.space(4)
     popupType: Qt.platform.pluginName !== "wayland" ? Popup.Window : Popup.Item
@@ -496,7 +680,8 @@ BorderSurface {
 
     ContextMenuItem {
       objectName: "trashNoteMenuRestore"
-      text: "Restore"
+      text: trashMenu.bulkCount > 1
+        ? "Restore " + trashMenu.bulkCount + " notes" : "Restore"
       onTriggered: root.noteActionRequested(trashMenu.menuNoteId, "restore")
     }
 
@@ -506,7 +691,8 @@ BorderSurface {
 
     ContextMenuItem {
       objectName: "trashNoteMenuDelete"
-      text: "Delete forever…"
+      text: trashMenu.bulkCount > 1
+        ? "Delete " + trashMenu.bulkCount + " notes forever…" : "Delete forever…"
       onTriggered: root.noteActionRequested(trashMenu.menuNoteId, "delete-forever")
     }
   }
@@ -573,14 +759,7 @@ BorderSurface {
   }
 
   function moveSelection(delta) {
-    if (root.notes.length === 0) return
-    var index = -1
-    for (var i = 0; i < root.notes.length; i++) {
-      if (String(root.notes[i].id) === root.selectedId) { index = i; break }
-    }
-    if (index < 0) index = delta < 0 ? 0 : -1
-    index = Math.max(0, Math.min(root.notes.length - 1, index + delta))
-    root.noteSelected(String(root.notes[index].id))
-    noteList.positionViewAtIndex(index, ListView.Contain)
+    var id = root.adjacentId(delta)
+    if (id !== "") root.noteSelected(id)
   }
 }

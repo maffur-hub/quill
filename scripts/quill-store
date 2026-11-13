@@ -13,24 +13,36 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import ctypes
+import datetime
 import fcntl
 import hashlib
 import json
 import mimetypes
 import os
+import queue
 import re
+import select
 import shutil
+import socket
 import sqlite3
 import stat
+import struct
 import sys
 import tempfile
+import threading
 import time
 import unicodedata
 import urllib.parse
 import uuid
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+# 3: notes.body dropped (the FTS table keeps its own body copy); 2: links.target_norm
+SCHEMA_VERSION = 3
+SERVE_STDIN: bytes | None = None
+INDEX_TRUSTED = False
+EXEC_LOCK = threading.RLock()
+MAX_REQUEST_BYTES = 32 * 1024 * 1024
 MAX_NOTE_BYTES = 1024 * 1024
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
 MAX_REFERENCE_BYTES = 8 * 1024 * 1024
@@ -39,6 +51,8 @@ MAX_LIST_NOTES = 2000
 MAX_LIST_FOLDERS = 2000
 MAX_STATE_BYTES = 1024 * 1024
 MAX_SEARCH_LIMIT = 500
+MAX_TITLES_LIMIT = 20000
+MAX_SAVED_SEARCHES = 50
 FUZZY_TRIGGER = 5      # run the fallback when exact hits are fewer than this
 FUZZY_MIN_TOKEN = 3    # shorter tokens stay plain prefix matches
 FUZZY_TERMS = 4        # expansions kept per token
@@ -82,12 +96,17 @@ HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+")
 LIST_RE = re.compile(r"^\s{0,3}(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s*)?")
 
 # Built-in new-note templates. Ids are part of the CLI contract (the Library
-# menu and ``create --template`` both use them), so keep them stable. Bodies
-# end with a newline and use literal Markdown: callers may edit the result
-# immediately without a second render step.
-TEMPLATES = {
+# menu and ``create --template`` both use them), so keep them stable. They are
+# only *seeds*: on first use the store writes one file per id to
+# ``<root>/templates/<id>.md`` and the files become the source of truth. Once
+# ``templates/`` exists the store never re-seeds it, even if every file is
+# deleted. Bodies end with a newline and use literal Markdown: callers may
+# edit the result immediately without a second render step.
+SEED_TEMPLATES = {
     "meeting": {
         "name": "Meeting notes",
+        "description": "Attendees, agenda and action items",
+        "icon": "◷",
         "content": (
             "# Meeting notes — {{date}}\n\n"
             "**Attendees:**\n- \n\n"
@@ -99,6 +118,8 @@ TEMPLATES = {
     },
     "daily": {
         "name": "Daily log",
+        "description": "Focus, log and tomorrow",
+        "icon": "☀",
         "content": (
             "# {{date}}\n\n"
             "## Focus\n- [ ] \n\n"
@@ -108,6 +129,8 @@ TEMPLATES = {
     },
     "project": {
         "name": "Project spec",
+        "description": "Goal, scope and milestones",
+        "icon": "◆",
         "content": (
             "# Project spec\n\n"
             "## Goal\n\n"
@@ -119,6 +142,8 @@ TEMPLATES = {
     },
     "tasks": {
         "name": "Task list",
+        "description": "A quick checklist",
+        "icon": "☑",
         "content": (
             "# Tasks — {{date}}\n\n"
             "- [ ] \n- [ ] \n- [ ] \n"
@@ -126,30 +151,9 @@ TEMPLATES = {
     },
 }
 
-
-def render_template(template_id, now=None) -> str:
-    """Render a built-in template with local date/time placeholders.
-
-    ``now`` accepts a ``datetime`` or ``time.struct_time`` for tests; the
-    default is the current local time. Unknown ids are a caller error.
-    """
-    template = TEMPLATES.get(str(template_id or ""))
-    if template is None:
-        choices = ", ".join(TEMPLATES)
-        raise StoreError(
-            f"unknown template: {template_id} (choose from {choices})")
-    stamp = now if now is not None else time.localtime()
-    if hasattr(stamp, "timetuple"):
-        stamp = stamp.timetuple()
-    values = {
-        "date": time.strftime("%Y-%m-%d", stamp),
-        "time": time.strftime("%H:%M", stamp),
-        "datetime": time.strftime("%Y-%m-%d %H:%M", stamp),
-    }
-    content = template["content"]
-    for key, value in values.items():
-        content = content.replace("{{" + key + "}}", value)
-    return content
+TEMPLATE_KEYS = ("name", "description", "icon")
+TEMPLATE_ID_MAX = 64
+BARE_YAML_VALUE_RE = re.compile(r"^[^\s:#\[\]{}\"'`&*!|>%@,?-](?:[^:#\[\]{}\"'`\n]*)$")
 
 
 def data_root() -> Path:
@@ -160,6 +164,7 @@ def data_root() -> Path:
 ROOT = data_root()
 NOTES = ROOT / "notes"
 TRASH = ROOT / "trash"
+TEMPLATES_DIR = ROOT / "templates"
 ATTACHMENTS = ROOT / "attachments"
 STATE = ROOT / "state.json"
 INDEX = ROOT / "index.db"
@@ -173,6 +178,13 @@ class StoreError(Exception):
     pass
 
 
+def read_stdin(limit: int) -> bytes:
+    """Read at most `limit + 1` bytes from stdin or a served request payload."""
+    if SERVE_STDIN is not None:
+        return SERVE_STDIN[: limit + 1]
+    return sys.stdin.buffer.read(limit + 1)
+
+
 # --------------------------------------------------------------------------
 # storage primitives
 
@@ -182,6 +194,7 @@ def ensure_store() -> None:
     TRASH.mkdir(parents=True, exist_ok=True)
     if not STATE.exists():
         write_json(STATE, {"version": 1, "pinned": []})
+    seed_templates()
 
 
 @contextlib.contextmanager
@@ -690,6 +703,207 @@ def split_frontmatter(text: str) -> tuple[str | None, str]:
     return None, text
 
 
+# --------------------------------------------------------------------------
+# note templates
+#
+# On disk one file per template: ``<root>/templates/<id>.md``. The YAML
+# frontmatter may carry ``name``, ``description`` and ``icon`` (single-line
+# values); everything else is preserved verbatim when a template is saved. The
+# body is ordinary Markdown. ``create --template`` renders the stored body.
+
+
+def template_default_name(template_id: str) -> str:
+    """Derive a display name from an id: ``weekly-review`` -> Weekly review."""
+    words = str(template_id or "").replace("-", " ").strip()
+    return words[:1].upper() + words[1:] if words else ""
+
+
+def template_slug(raw) -> str:
+    """Validate and normalise a template id.
+
+    Lowercase, spaces/underscores to hyphens, only ``[a-z0-9-]`` kept,
+    repeated hyphens collapsed, edges stripped, at most 64 characters. A
+    path-like or dot-leading id is rejected rather than cleaned, because
+    ``..`` must never become part of a filename.
+    """
+    value = str(raw or "").strip()
+    if not value:
+        raise StoreError("template id is empty")
+    if ("/" in value or "\\" in value or ".." in value
+            or value.startswith(".")):
+        raise StoreError(
+            f"invalid template id: {raw!r} (no '/', '\\', '..' or leading '.')")
+    slug = value.casefold().replace("_", "-")
+    slug = re.sub(r"\s+", "-", slug)
+    slug = re.sub(r"[^a-z0-9-]+", "", slug)
+    slug = re.sub(r"-{2,}", "-", slug).strip("-")
+    slug = slug[:TEMPLATE_ID_MAX].strip("-")
+    if not slug:
+        raise StoreError(
+            f"invalid template id: {raw!r} (no usable [a-z0-9-] characters)")
+    return slug
+
+
+def template_available_ids() -> list[str]:
+    if not TEMPLATES_DIR.is_dir():
+        return []
+    return sorted(
+        path.stem for path in TEMPLATES_DIR.glob("*.md") if path.is_file()
+    )
+
+
+def find_template_path(identifier, strict: bool = False) -> Path | None:
+    """Resolve an id to an existing ``<id>.md`` without escaping the root.
+
+    Lookup is case-insensitive (the file stem is the canonical id) and also
+    accepts the slugified form, so ``Weekly Review`` finds ``weekly-review.md``.
+    A path-like id is rejected when ``strict``; otherwise it simply misses.
+    """
+    raw = str(identifier or "").strip()
+    if not raw:
+        if strict:
+            raise StoreError("template id is empty")
+        return None
+    try:
+        slug = template_slug(raw)
+    except StoreError:
+        if strict:
+            raise
+        return None
+    if not TEMPLATES_DIR.is_dir():
+        return None
+    wanted = {raw.casefold(), slug.casefold()}
+    matches = sorted(
+        path for path in TEMPLATES_DIR.glob("*.md")
+        if path.is_file() and path.stem.casefold() in wanted
+    )
+    return matches[0] if matches else None
+
+
+def parse_template_value(raw) -> str:
+    """Read one single-line YAML value, quoted or bare, and strip quotes."""
+    text = str(raw or "").strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        inner = text[1:-1]
+        if text[0] == '"':
+            try:
+                return str(json.loads(text))
+            except (json.JSONDecodeError, TypeError):
+                return inner
+        return inner.replace("''", "'")
+    return text
+
+
+def template_value(value) -> str:
+    """Serialise a single-line YAML scalar, quoting when it needs it."""
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text:
+        return '""'
+    if BARE_YAML_VALUE_RE.match(text):
+        return text
+    return json.dumps(text, ensure_ascii=False)
+
+
+def parse_template_document(text: str) -> tuple[dict, list[str], str]:
+    """Return (owned fields, unknown frontmatter lines, body)."""
+    fields = {key: "" for key in TEMPLATE_KEYS}
+    unknown: list[str] = []
+    frontmatter, body = split_frontmatter(text)
+    if frontmatter is not None:
+        for line in frontmatter.splitlines():
+            match = re.match(r"^\s*([^\s:#\-][^:]*?)\s*:\s*(.*)$", line)
+            key = match.group(1).strip().casefold() if match else ""
+            if key in fields:
+                fields[key] = parse_template_value(match.group(2))
+            else:
+                unknown.append(line)
+    return fields, unknown, body
+
+
+def compose_template_document(fields: dict, unknown: list[str], body: str) -> str:
+    """Frontmatter in name/description/icon order, then preserved keys."""
+    lines = ["---\n"]
+    for key in TEMPLATE_KEYS:
+        lines.append(f"{key}: {template_value(fields.get(key, ''))}\n")
+    for line in unknown:
+        lines.append(line if line.endswith("\n") else line + "\n")
+    lines.append("---\n")
+    return "".join(lines) + body
+
+
+def seed_templates() -> None:
+    """Write the four built-ins the first time ``templates/`` is created.
+
+    Seeding is keyed on the directory, not on the individual files: once the
+    directory exists an empty folder is a deliberate user choice and is never
+    re-populated. Seeding is idempotent across racing processes because every
+    file uses the atomic-write primitive and an existing file is left alone.
+    """
+    if TEMPLATES_DIR.exists():
+        return
+    try:
+        TEMPLATES_DIR.mkdir(parents=True)
+    except OSError:
+        return
+    for template_id, template in SEED_TEMPLATES.items():
+        path = TEMPLATES_DIR / f"{template_id}.md"
+        try:
+            if path.exists():
+                continue
+            fields = {key: template.get(key, "") for key in TEMPLATE_KEYS}
+            document = compose_template_document(fields, [], template["content"])
+            atomic_write(path, document.encode("utf-8"))
+        except OSError:
+            continue
+
+
+def load_template(template_id, list_available: bool = False):
+    """Read one stored template: (path, fields, unknown lines, body)."""
+    path = find_template_path(template_id, strict=True)
+    if path is None:
+        message = f"template not found: {template_id}"
+        if list_available:
+            choices = ", ".join(template_available_ids()) or "none installed"
+            message += f" (available: {choices})"
+        raise StoreError(message)
+    try:
+        raw = path.read_bytes()
+    except OSError as error:
+        raise StoreError(f"could not read template {path.stem}: {error}") from error
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise StoreError(f"template is not valid UTF-8: {path.stem}") from error
+    fields, unknown, body = parse_template_document(text)
+    return path, fields, unknown, body
+
+
+def render_template_body(body: str, now=None) -> str:
+    """Substitute the three supported placeholders, leaving others literal."""
+    stamp = now if now is not None else time.localtime()
+    if hasattr(stamp, "timetuple"):
+        stamp = stamp.timetuple()
+    values = {
+        "date": time.strftime("%Y-%m-%d", stamp),
+        "time": time.strftime("%H:%M", stamp),
+        "datetime": time.strftime("%Y-%m-%d %H:%M", stamp),
+    }
+    for key, value in values.items():
+        body = body.replace("{{" + key + "}}", value)
+    return body
+
+
+def render_template(template_id, now=None) -> str:
+    """Render a stored template body with local date/time placeholders.
+
+    ``now`` accepts a ``datetime`` or ``time.struct_time`` for tests; the
+    default is the current local time. Unknown ids are a caller error.
+    """
+    _path, _fields, _unknown, body = load_template(
+        template_id, list_available=True)
+    return render_template_body(body, now)
+
+
 def frontmatter_title(frontmatter: str | None) -> str:
     if not frontmatter:
         return ""
@@ -772,6 +986,21 @@ def tag_key(value: str) -> str:
     """Comparison key for a raw tag or `#tag` token (accents folded)."""
     normalized = normalize_tags([value])
     return normalized[0].casefold() if normalized else ""
+
+
+def link_key(value: str) -> str:
+    """Comparison key for a wiki-link target, note title, or file stem.
+
+    Shared by indexing, link resolution, and preview rendering so a link and
+    the title it names always normalise identically (casefold, then NFC, then
+    casefold again so the key is stable).
+    """
+    return unicodedata.normalize("NFC", str(value).casefold()).casefold()
+
+
+def clean_title(value) -> str:
+    """Normalise a user-supplied title for storage and reporting."""
+    return str(value or "").strip().replace("\n", " ")[:120] or "Untitled"
 
 
 TAG_ONLY_LINE_RE = re.compile(
@@ -895,7 +1124,7 @@ def extract_wiki_links(text: str) -> list[dict]:
                 links.append(
                     {
                         "target": target_part,
-                        "norm": target_part.casefold(),
+                        "norm": link_key(target_part),
                         "heading": heading,
                         "alias": alias.strip(),
                     }
@@ -944,6 +1173,92 @@ def title_and_snippet(content: str) -> tuple[str, str]:
     return (title or "Untitled"), " ".join(useful)[:180]
 
 
+def sanitise_link_title(value) -> str:
+    """Make a title safe to inject inside `[[...]]` link syntax."""
+    title = clean_title(value)
+    return (
+        title.replace("|", "-")
+        .replace("#", "-")
+        .replace("[", "(")
+        .replace("]", ")")
+    )
+
+
+def rewrite_wiki_links(text: str, old_keys: set[str], new_title: str) -> tuple[str, int]:
+    """Rewrite `[[old]]` wiki links to point at `new_title`.
+
+    Only link targets whose `link_key` is in `old_keys` are touched. Fenced
+    code, fence delimiter lines, and inline code spans are left byte-identical,
+    as is all other text (including CRLF line endings). Aliases, headings, and
+    the presence of `|`/`#` are preserved exactly as written.
+    """
+    keys = {link_key(value) for value in old_keys if value is not None}
+    if not keys:
+        return text, 0
+    replacement_title = sanitise_link_title(new_title)
+    in_code = False
+    changes = 0
+    output_lines: list[str] = []
+
+    def replace(match: re.Match) -> str | None:
+        nonlocal changes
+        raw = match.group(1)
+        target_part, sep, alias = raw.partition("|")
+        stripped = target_part.strip()
+        heading = None
+        if "#" in stripped:
+            stripped, heading = stripped.split("#", 1)
+        if not stripped.strip():
+            return None
+        if link_key(stripped.strip()) not in keys:
+            return None
+        parts = replacement_title
+        if heading is not None:
+            parts += "#" + heading
+        if sep:
+            parts += "|" + alias
+        rewritten = "[[" + parts + "]]"
+        if rewritten == match.group(0):
+            return None
+        changes += 1
+        return rewritten
+
+    for line in text.splitlines(keepends=True):
+        if FENCE_RE.match(line):
+            in_code = not in_code
+            output_lines.append(line)
+            continue
+        if in_code:
+            output_lines.append(line)
+            continue
+        segments: list[tuple[int, int, bool]] = []
+        cursor = 0
+        for match in INLINE_CODE_RE.finditer(line):
+            segments.append((cursor, match.start(), False))
+            segments.append((match.start(), match.end(), True))
+            cursor = match.end()
+        segments.append((cursor, len(line), False))
+        rewritten_line: list[str] = []
+        for start, end, is_code in segments:
+            segment = line[start:end]
+            if is_code:
+                rewritten_line.append(segment)
+                continue
+            pieces: list[str] = []
+            last = 0
+            for match in WIKI_RE.finditer(segment):
+                changed = replace(match)
+                if changed is None:
+                    continue
+                pieces.append(segment[last : match.start()])
+                pieces.append(changed)
+                last = match.end()
+            pieces.append(segment[last:])
+            rewritten_line.append("".join(pieces))
+        output_lines.append("".join(rewritten_line))
+    return "".join(output_lines), changes
+
+
 # --------------------------------------------------------------------------
 # index
 
@@ -985,8 +1300,7 @@ def create_schema(conn: sqlite3.Connection) -> None:
           snippet TEXT NOT NULL DEFAULT '',
           size INTEGER NOT NULL DEFAULT 0,
           mtime_ms INTEGER NOT NULL DEFAULT 0,
-          pinned INTEGER NOT NULL DEFAULT 0,
-          body TEXT NOT NULL DEFAULT ''
+          pinned INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS notes_id ON notes(id);
         CREATE TABLE IF NOT EXISTS tags (
@@ -1009,21 +1323,41 @@ def create_schema(conn: sqlite3.Connection) -> None:
           id UNINDEXED, title, body, tokenize='unicode61 remove_diacritics 2'
         );
         CREATE VIRTUAL TABLE IF NOT EXISTS notes_vocab USING fts5vocab(notes_fts, 'row');
-        PRAGMA user_version=1;
+        PRAGMA user_version=%d;
         """
+        % SCHEMA_VERSION
     )
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
     conn.commit()
 
 
+def read_state() -> dict:
+    """Return state.json as a dict, preserving unknown keys.
+
+    A missing or malformed file reads as an empty state; callers supply their
+    own defaults so pins and saved searches survive independently.
+    """
+    state = read_json(STATE, {})
+    return state if isinstance(state, dict) else {}
+
+
+def update_state(**changes) -> dict:
+    """Merge changes into state.json without dropping unrelated keys."""
+    state = read_state()
+    state.update(changes)
+    state.setdefault("version", 1)
+    write_json(STATE, state)
+    return state
+
+
 def pinned_set() -> set[str]:
-    state = read_json(STATE, {"pinned": []})
-    values = state.get("pinned", []) if isinstance(state, dict) else []
+    state = read_state()
+    values = state.get("pinned", [])
     return {str(value) for value in values if isinstance(value, str)}
 
 
 def save_pinned(values: set[str]) -> None:
-    write_json(STATE, {"version": 1, "pinned": sorted(values)})
+    update_state(pinned=sorted(values))
 
 
 def note_key(identifier: str, trashed: bool) -> str:
@@ -1060,13 +1394,12 @@ def index_file(conn: sqlite3.Connection, path: Path, trashed: bool, pinned: set[
 
     conn.execute(
         """
-        INSERT INTO notes(key,id,trashed,folder,title,stem,snippet,size,mtime_ms,pinned,body)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?)
+        INSERT INTO notes(key,id,trashed,folder,title,stem,snippet,size,mtime_ms,pinned)
+        VALUES(?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(key) DO UPDATE SET
           id=excluded.id, trashed=excluded.trashed, folder=excluded.folder,
           title=excluded.title, stem=excluded.stem, snippet=excluded.snippet,
-          size=excluded.size, mtime_ms=excluded.mtime_ms, pinned=excluded.pinned,
-          body=excluded.body
+          size=excluded.size, mtime_ms=excluded.mtime_ms, pinned=excluded.pinned
         """,
         (
             key,
@@ -1079,7 +1412,6 @@ def index_file(conn: sqlite3.Connection, path: Path, trashed: bool, pinned: set[
             stat.st_size,
             int(stat.st_mtime * 1000),
             is_pinned,
-            body[:MAX_INDEX_BYTES],
         ),
     )
     conn.execute("DELETE FROM tags WHERE note_key=?", (key,))
@@ -1100,20 +1432,87 @@ def index_file(conn: sqlite3.Connection, path: Path, trashed: bool, pinned: set[
     return True
 
 
-def resolve_links(conn: sqlite3.Connection) -> None:
+LINK_UPDATE_CHUNK = 400
+
+
+def _chunks(values, size: int = LINK_UPDATE_CHUNK):
+    for start in range(0, len(values), size):
+        yield values[start : start + size]
+
+
+def resolve_links(
+    conn: sqlite3.Connection,
+    src_keys=None,
+    target_norms=None,
+) -> None:
+    """Fill `links.resolved_id` from the current (non-trashed) note titles.
+
+    With both selectors omitted every link row is recomputed. Otherwise only
+    rows whose source note is in `src_keys` or whose normalised target is in
+    `target_norms` are touched, which keeps autosave and single-note mutations
+    proportional to what actually changed.
+    """
     rows = conn.execute(
         "SELECT id,title,stem FROM notes WHERE trashed=0 ORDER BY pinned DESC, mtime_ms DESC, id"
     ).fetchall()
     by_title: dict[str, str] = {}
     by_stem: dict[str, str] = {}
     for identifier, title, stem in rows:
-        by_title.setdefault(unicodedata.normalize("NFC", str(title)).casefold(), str(identifier))
-        by_stem.setdefault(unicodedata.normalize("NFC", str(stem)).casefold(), str(identifier))
-    links = conn.execute("SELECT rowid,target_norm FROM links").fetchall()
+        by_title.setdefault(link_key(title), str(identifier))
+        by_stem.setdefault(link_key(stem), str(identifier))
+
+    if src_keys is None and target_norms is None:
+        links = conn.execute("SELECT rowid,target_norm FROM links").fetchall()
+    else:
+        selected: dict[int, str] = {}
+        source_values = [str(value) for value in (src_keys or ()) if value is not None]
+        for chunk in _chunks(source_values):
+            placeholders = ",".join("?" for _ in chunk)
+            for rowid, target_norm in conn.execute(
+                f"SELECT rowid,target_norm FROM links WHERE src_key IN ({placeholders})",
+                chunk,
+            ):
+                selected[rowid] = str(target_norm)
+        target_values = [
+            link_key(value) for value in (target_norms or ()) if value is not None
+        ]
+        # Preserve order while removing duplicates so the IN lists stay small.
+        target_values = list(dict.fromkeys(target_values))
+        for chunk in _chunks(target_values):
+            placeholders = ",".join("?" for _ in chunk)
+            for rowid, target_norm in conn.execute(
+                f"SELECT rowid,target_norm FROM links WHERE target_norm IN ({placeholders})",
+                chunk,
+            ):
+                selected[rowid] = str(target_norm)
+        links = list(selected.items())
+
     for rowid, target_norm in links:
-        norm = unicodedata.normalize("NFC", str(target_norm)).casefold()
+        norm = link_key(target_norm)
         resolved = by_title.get(norm) or by_stem.get(norm)
         conn.execute("UPDATE links SET resolved_id=? WHERE rowid=?", (resolved, rowid))
+
+
+def index_and_resolve(conn: sqlite3.Connection, path: Path, trashed: bool = False) -> bool:
+    """Reindex one note and resolve only the links affected by its title/stem."""
+    root = TRASH if trashed else NOTES
+    key = note_key(path.relative_to(root).as_posix(), trashed)
+    old_row = conn.execute(
+        "SELECT title,stem FROM notes WHERE key=?", (key,)
+    ).fetchone()
+    changed = index_file(conn, path, trashed, pinned_set())
+    new_row = conn.execute(
+        "SELECT title,stem FROM notes WHERE key=?", (key,)
+    ).fetchone()
+    norms: set[str] = set()
+    for row in (old_row, new_row):
+        if row is None:
+            continue
+        norms.add(link_key(row[0]))
+        norms.add(link_key(row[1]))
+    norms.discard(None)
+    resolve_links(conn, src_keys={key}, target_norms=norms)
+    return changed
 
 
 def sync_index(conn: sqlite3.Connection, full: bool = False) -> bool:
@@ -1124,6 +1523,8 @@ def sync_index(conn: sqlite3.Connection, full: bool = False) -> bool:
     }
     seen: set[tuple[str, int]] = set()
     changed = full
+    changed_keys: set[str] = set()
+    affected_norms: set[str] = set()
     for trashed, root in ((False, NOTES), (True, TRASH)):
         if not root.exists():
             continue
@@ -1139,10 +1540,34 @@ def sync_index(conn: sqlite3.Connection, full: bool = False) -> bool:
             seen.add((key, 1 if trashed else 0))
             previous = existing.get((key, 1 if trashed else 0))
             if full or previous is None or previous != (stat.st_size, int(stat.st_mtime * 1000)):
+                old_row = conn.execute(
+                    "SELECT title,stem FROM notes WHERE key=?", (key,)
+                ).fetchone()
                 if index_file(conn, path, trashed, pinned):
                     changed = True
+                    changed_keys.add(key)
+                    new_row = conn.execute(
+                        "SELECT title,stem FROM notes WHERE key=?", (key,)
+                    ).fetchone()
+                    for row in (old_row, new_row):
+                        if row is None:
+                            continue
+                        affected_norms.add(link_key(row[0]))
+                        affected_norms.add(link_key(row[1]))
     for (key, _trashed), _value in existing.items():
         if (key, _trashed) not in seen:
+            # Links resolved to this note now become broken (trash/delete) and
+            # a later restore must be able to resolve them again, so their
+            # targets are part of the affected set either way.
+            previous_id = conn.execute(
+                "SELECT id FROM notes WHERE key=?", (key,)
+            ).fetchone()
+            if previous_id is not None:
+                for (target_norm,) in conn.execute(
+                    "SELECT DISTINCT target_norm FROM links WHERE resolved_id=?",
+                    (str(previous_id[0]),),
+                ).fetchall():
+                    affected_norms.add(str(target_norm))
             conn.execute("DELETE FROM notes WHERE key=?", (key,))
             conn.execute("DELETE FROM tags WHERE note_key=?", (key,))
             conn.execute("DELETE FROM links WHERE src_key=?", (key,))
@@ -1153,7 +1578,8 @@ def sync_index(conn: sqlite3.Connection, full: bool = False) -> bool:
     # changed.
     desired = {(note_key(identifier, False)) for identifier in pinned}
     current = {row[0] for row in conn.execute("SELECT key FROM notes WHERE pinned=1").fetchall()}
-    if desired != current:
+    pinned_changed = desired != current
+    if pinned_changed:
         conn.execute("UPDATE notes SET pinned=0")
         if pinned:
             conn.executemany(
@@ -1162,14 +1588,21 @@ def sync_index(conn: sqlite3.Connection, full: bool = False) -> bool:
             )
         changed = True
     if changed:
-        resolve_links(conn)
+        # Pinned ordering decides which of two equal titles wins, so a pin
+        # change always needs a global resolve. Otherwise scope to the notes
+        # that were indexed plus every target whose resolution may have moved.
+        if full or pinned_changed:
+            resolve_links(conn)
+        else:
+            resolve_links(conn, src_keys=changed_keys, target_norms=affected_norms)
         conn.commit()
     return changed
 
 
 def with_index():
     conn = index_connect()
-    sync_index(conn)
+    if not INDEX_TRUSTED:
+        sync_index(conn)
     return conn
 
 
@@ -1340,7 +1773,7 @@ def write_note(args, content_path: Path | None) -> dict:
         except OSError as error:
             raise StoreError(f"could not read content file: {error}") from error
     else:
-        payload = sys.stdin.buffer.read(MAX_NOTE_BYTES + 1)
+        payload = read_stdin(MAX_NOTE_BYTES)
     if len(payload) > MAX_NOTE_BYTES:
         raise StoreError(f"note exceeds {MAX_NOTE_BYTES} bytes")
     try:
@@ -1382,8 +1815,7 @@ def write_note(args, content_path: Path | None) -> dict:
         stat = path.stat()
         conn = index_connect()
         try:
-            index_file(conn, path, False, pinned_set())
-            resolve_links(conn)
+            index_and_resolve(conn, path)
             conn.commit()
         finally:
             conn.close()
@@ -1424,7 +1856,7 @@ def command_create(args) -> dict:
         # The template owns its H1, so --title is ignored for its content.
         content = render_template(template_id)
     elif args.content_stdin:
-        payload = sys.stdin.buffer.read(MAX_NOTE_BYTES + 1)
+        payload = read_stdin(MAX_NOTE_BYTES)
         if len(payload) > MAX_NOTE_BYTES:
             raise StoreError(f"note exceeds {MAX_NOTE_BYTES} bytes")
         try:
@@ -1451,16 +1883,130 @@ def command_create(args) -> dict:
         atomic_write(path, encoded)
         conn = index_connect()
         try:
-            index_file(conn, path, False, pinned_set())
-            resolve_links(conn)
+            index_and_resolve(conn, path)
             conn.commit()
         finally:
             conn.close()
         return {"id": path.relative_to(NOTES).as_posix(), "modified": int(path.stat().st_mtime * 1000)}
 
 
+def template_result(path: Path, fields: dict, body: str) -> dict:
+    stat = path.stat()
+    return {
+        "id": path.stem,
+        **{key: fields.get(key, "") for key in TEMPLATE_KEYS},
+        "content": body,
+        "modified": int(stat.st_mtime * 1000),
+    }
+
+
+def command_templates(args) -> dict:
+    ensure_store()
+    action = str(getattr(args, "templates_action", "") or "")
+    if action == "list":
+        entries = []
+        for path in (TEMPLATES_DIR.glob("*.md")
+                     if TEMPLATES_DIR.is_dir() else []):
+            if not path.is_file():
+                continue
+            try:
+                fields, _unknown, _body = parse_template_document(
+                    path.read_text(encoding="utf-8"))
+                modified = int(path.stat().st_mtime * 1000)
+            except (OSError, UnicodeDecodeError):
+                continue
+            entry = {"id": path.stem}
+            entry.update({key: fields[key] for key in TEMPLATE_KEYS})
+            entry["modified"] = modified
+            entries.append(entry)
+        entries.sort(key=lambda item: (item["name"].casefold(), item["id"]))
+        return {"templates": entries}
+    if action == "show":
+        path, fields, _unknown, body = load_template(args.template_id)
+        return template_result(path, fields, body)
+    if action == "save":
+        return save_template(args)
+    if action == "delete":
+        path, _fields, _unknown, _body = load_template(args.template_id)
+        identifier = path.stem
+        try:
+            path.unlink()
+        except OSError as error:
+            raise StoreError(f"could not delete template {identifier}: {error}") from error
+        return {"deleted": True, "id": identifier}
+    raise StoreError(f"unknown templates action: {action}")
+
+
+def save_template(args) -> dict:
+    """Upsert one template file, owning only name/description/icon."""
+    requested = template_slug(getattr(args, "template_id", ""))
+    stdin_flag = bool(getattr(args, "content_stdin", False))
+    raw_content_file = getattr(args, "content_file", None)
+    with locked():
+        path = find_template_path(requested, strict=True)
+        if path is None:
+            identifier = requested
+            path = TEMPLATES_DIR / f"{identifier}.md"
+            fields = {key: "" for key in TEMPLATE_KEYS}
+            unknown: list[str] = []
+            body = ""
+        else:
+            # The on-disk stem is canonical, so a case-insensitive collision
+            # saves the existing file instead of creating a second one.
+            identifier = path.stem
+            try:
+                existing_text = path.read_bytes().decode("utf-8")
+            except OSError as error:
+                raise StoreError(f"could not read template {identifier}: {error}") from error
+            except UnicodeDecodeError as error:
+                raise StoreError(f"template is not valid UTF-8: {identifier}") from error
+            fields, unknown, body = parse_template_document(existing_text)
+        if stdin_flag:
+            payload = read_stdin(MAX_NOTE_BYTES)
+        elif raw_content_file:
+            source = Path(os.path.expanduser(str(raw_content_file)))
+            try:
+                payload = source.read_bytes()
+            except OSError as error:
+                raise StoreError(f"could not read content file: {error}") from error
+        else:
+            payload = None
+        if payload is not None:
+            if len(payload) > MAX_NOTE_BYTES:
+                raise StoreError(f"template exceeds {MAX_NOTE_BYTES} bytes")
+            try:
+                body = payload.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise StoreError("template content is not valid UTF-8") from error
+        name = getattr(args, "name", None)
+        if name is None or not str(name).strip():
+            name = fields.get("name") or template_default_name(identifier)
+        else:
+            name = str(name).strip()
+        description = getattr(args, "description", None)
+        if description is None:
+            description = fields.get("description", "")
+        icon = getattr(args, "icon", None)
+        if icon is None:
+            icon = fields.get("icon", "")
+        fields = {
+            "name": name,
+            "description": str(description or "").strip(),
+            "icon": str(icon or "").strip(),
+        }
+        try:
+            encoded = body.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise StoreError("template content is not valid UTF-8") from error
+        if len(encoded) > MAX_NOTE_BYTES:
+            raise StoreError(f"template exceeds {MAX_NOTE_BYTES} bytes")
+        document = compose_template_document(fields, unknown, body)
+        atomic_write(path, document.encode("utf-8"))
+        return template_result(path, fields, body)
+
+
 def rewrite_title(content: str, title: str) -> str:
-    clean = title.strip().replace("\n", " ")[:120] or "Untitled"
+    clean = clean_title(title)
     newline = detect_newline(content)
     lines = content.splitlines(keepends=True)
     # Update frontmatter title when one exists, because it wins over headings.
@@ -1555,8 +2101,7 @@ def command_duplicate(args) -> dict:
                 new_id = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}.md"
                 target = target_dir / new_id
             atomic_write(target, encoded)
-            index_file(conn, target, False, pinned_set())
-            resolve_links(conn)
+            index_and_resolve(conn, target)
             conn.commit()
         finally:
             conn.close()
@@ -1573,26 +2118,134 @@ def command_rename(args) -> dict:
     path = note_path(identifier)
     if not path.is_file():
         raise StoreError(f"note not found: {args.id}")
+    title = clean_title(getattr(args, "title", ""))
+    update_links = str(getattr(args, "links", "update") or "update") != "skip"
+    dry_run = bool(getattr(args, "dry_run", False))
     with locked():
         try:
             previous_raw = path.read_bytes()
         except OSError as error:
             raise StoreError(f"could not read the existing note: {error}") from error
         content = previous_raw.decode("utf-8", errors="replace")
-        updated = rewrite_title(content, str(args.title)).encode("utf-8")
+        # Open the index first so a stale cache cannot hide inbound links.
+        old_norms: set[str] = set()
+        conn = with_index()
+        try:
+            old_norms = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT DISTINCT target_norm FROM links WHERE resolved_id=?",
+                    (identifier,),
+                ).fetchall()
+            }
+        finally:
+            conn.close()
+        updated_content = rewrite_title(content, title)
+        rewrite = update_links and bool(old_norms)
+
+        if dry_run:
+            links_updated = 0
+            sources: list[dict] = []
+            for candidate in sorted(NOTES.rglob("*.md")):
+                if not candidate.is_file():
+                    continue
+                try:
+                    raw = candidate.read_bytes()
+                except OSError:
+                    continue
+                if len(raw) > MAX_NOTE_BYTES:
+                    continue
+                try:
+                    note_content = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    continue
+                source_id = candidate.relative_to(NOTES).as_posix()
+                if source_id == identifier:
+                    if rewrite:
+                        _text, count = rewrite_wiki_links(updated_content, old_norms, title)
+                        links_updated += count
+                    continue
+                if not rewrite:
+                    continue
+                _text, count = rewrite_wiki_links(note_content, old_norms, title)
+                if not count:
+                    continue
+                source_title, _snippet = title_and_snippet(note_content)
+                links_updated += count
+                sources.append(
+                    {"id": source_id, "title": source_title, "count": count}
+                )
+            return {
+                "id": identifier,
+                "title": title,
+                "dryRun": True,
+                "linksUpdated": links_updated,
+                "notesUpdated": len(sources),
+                "sources": sources,
+            }
+
+        updated = updated_content.encode("utf-8")
         if updated != previous_raw:
             snapshot_note(identifier, previous_raw, "rename", destructive=True)
         atomic_write(path, updated)
-        stat = path.stat()
+        links_updated = 0
+        sources: list[dict] = []
+        if rewrite:
+            # Live notes only: trashed notes must stay byte-identical, and a
+            # draft is never scanned because it is not a `*.md` file.
+            for candidate in sorted(NOTES.rglob("*.md")):
+                if not candidate.is_file():
+                    continue
+                try:
+                    raw = candidate.read_bytes()
+                except OSError:
+                    continue
+                if len(raw) > MAX_NOTE_BYTES:
+                    continue
+                try:
+                    note_content = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    continue
+                rewritten, count = rewrite_wiki_links(note_content, old_norms, title)
+                if not count:
+                    continue
+                encoded = rewritten.encode("utf-8")
+                if encoded == raw:
+                    continue
+                source_id = candidate.relative_to(NOTES).as_posix()
+                snapshot_note(source_id, raw, "link-rename", destructive=True)
+                atomic_write(candidate, encoded)
+                links_updated += count
+                if source_id != identifier:
+                    source_title, _snippet = title_and_snippet(note_content)
+                    sources.append(
+                        {"id": source_id, "title": source_title, "count": count}
+                    )
         conn = index_connect()
         try:
-            index_file(conn, path, False, pinned_set())
-            resolve_links(conn)
+            changed_keys: set[str] = set()
+            for source_id in [identifier] + [source["id"] for source in sources]:
+                source_path = note_path(source_id)
+                changed_keys.add(note_key(source_id, False))
+                index_file(conn, source_path, False, pinned_set())
+            target_norms = set(old_norms)
+            target_norms.add(link_key(title))
+            resolve_links(conn, src_keys=changed_keys, target_norms=target_norms)
             conn.commit()
         finally:
             conn.close()
+        for source in sources:
+            prune_versions(source["id"])
         prune_versions(identifier)
-    return {"id": identifier, "modified": int(stat.st_mtime * 1000)}
+        stat = path.stat()
+    return {
+        "id": identifier,
+        "modified": int(stat.st_mtime * 1000),
+        "title": title,
+        "linksUpdated": links_updated,
+        "notesUpdated": len(sources),
+        "sources": sources,
+    }
 
 
 def unique_target(directory: Path, name: str, suffix: str = "") -> Path:
@@ -1609,124 +2262,205 @@ def unique_target(directory: Path, name: str, suffix: str = "") -> Path:
         counter += 1
 
 
+def collect_ids(args) -> list[str]:
+    """Every id for a bulk call: the positional primary id, then ``--id``.
+
+    Deduplicated in order so `trash <id> --id <id>` stays a single-note call.
+    """
+    values: list[str] = []
+    primary = getattr(args, "id", None)
+    if primary is not None:
+        values.append(primary)
+    values.extend(getattr(args, "more_ids", None) or [])
+    seen: set[str] = set()
+    output: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        output.append(value)
+    return output
+
+
+def batch_targets(args, trashed: bool = False) -> list[tuple[str, Path]]:
+    """Validate every id before the caller performs any write.
+
+    All-or-nothing batches depend on this running first: one missing note
+    raises before a single file is touched, so the CLI exits 1 with the
+    store unchanged.
+    """
+    targets: list[tuple[str, Path]] = []
+    seen: set[str] = set()
+    for raw in collect_ids(args):
+        identifier = safe_relative(raw)
+        if identifier in seen:
+            continue
+        seen.add(identifier)
+        path = note_path(identifier, trashed=trashed)
+        if not path.is_file():
+            label = "note not found in trash" if trashed else "note not found"
+            raise StoreError(f"{label}: {identifier}")
+        targets.append((identifier, path))
+    return targets
+
+
+def sync_index_once() -> None:
+    """Refresh the derived index once, at the end of a bulk command."""
+    conn = index_connect()
+    try:
+        sync_index(conn)
+    finally:
+        conn.close()
+
+
+def apply_note_content(
+    identifier: str, path: Path, previous_raw: bytes, updated_content: str, reason: str
+) -> tuple[bool, bool]:
+    """Write changed bytes for one note; return (changed, draft_deleted)."""
+    updated = updated_content.encode("utf-8")
+    if updated == previous_raw:
+        return False, False
+    snapshot_note(identifier, previous_raw, reason)
+    atomic_write(path, updated)
+    draft_deleted = False
+    try:
+        draft = read_draft(path)
+        if (draft is not None
+                and normalize_newlines(draft[0], detect_newline(updated_content))
+                == updated_content):
+            draft_path(path).unlink()
+            draft_deleted = True
+    except OSError:
+        pass
+    return True, draft_deleted
+
+
+def move_note(identifier: str, source: Path, target_dir: Path, pins: set[str]) -> str:
+    """Move one live note; remap its pin in the shared in-memory set."""
+    target = target_dir / source.name
+    if target.resolve() == source.resolve():
+        return identifier
+    if target.exists():
+        target = unique_target(target_dir, source.name, "moved")
+    try:
+        data = source.read_bytes()
+    except OSError as error:
+        raise StoreError(f"could not read the note before moving it: {error}") from error
+    snapshot_note(identifier, data, "move", destructive=True)
+    shutil.move(str(source), str(target))
+    move_draft(source, target)
+    prune_empty_dirs(source.parent)
+    next_id = target.relative_to(NOTES).as_posix()
+    if identifier in pins:
+        pins.discard(identifier)
+        pins.add(next_id)
+    prune_versions(identifier)
+    return next_id
+
+
 def command_move(args) -> dict:
     ensure_store()
-    identifier = safe_relative(args.id)
-    source = note_path(identifier)
-    if not source.is_file():
-        raise StoreError(f"note not found: {identifier}")
     folder = clean_folder(args.folder)
+    targets = batch_targets(args)
     with locked():
         target_dir = NOTES / folder
         target_dir.mkdir(parents=True, exist_ok=True)
-        target = target_dir / source.name
-        if target.resolve() != source.resolve():
-            if target.exists():
-                target = unique_target(target_dir, source.name, "moved")
-            try:
-                data = source.read_bytes()
-            except OSError as error:
-                raise StoreError(f"could not read the note before moving it: {error}") from error
-            snapshot_note(identifier, data, "move", destructive=True)
-            shutil.move(str(source), str(target))
-            move_draft(source, target)
-            prune_empty_dirs(source.parent)
-            next_id = target.relative_to(NOTES).as_posix()
-            pins = pinned_set()
-            if identifier in pins:
-                pins.discard(identifier)
-                pins.add(next_id)
-                save_pinned(pins)
-            conn = index_connect()
-            try:
-                sync_index(conn)
-            finally:
-                conn.close()
-            prune_versions(identifier)
-        else:
-            next_id = identifier
-    return {"id": next_id}
+        pins = pinned_set()
+        pins_before = set(pins)
+        new_ids = [
+            move_note(identifier, source, target_dir, pins)
+            for identifier, source in targets
+        ]
+        if pins != pins_before:
+            save_pinned(pins)
+        sync_index_once()
+    return {"id": new_ids[0], "ids": new_ids, "count": len(new_ids)}
+
+
+def trash_note(identifier: str, source: Path, pins: set[str]) -> str:
+    """Move one live note into the trash, preserving its folder path."""
+    target_dir = TRASH / source.parent.relative_to(NOTES)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / source.name
+    if target.exists():
+        target = unique_target(target_dir, source.name, "trashed-")
+    try:
+        data = source.read_bytes()
+    except OSError as error:
+        raise StoreError(f"could not read the note before trashing it: {error}") from error
+    snapshot_note(identifier, data, "trash", destructive=True)
+    shutil.move(str(source), str(target))
+    move_draft(source, target)
+    prune_empty_dirs(source.parent)
+    pins.discard(identifier)
+    prune_versions(identifier)
+    return target.relative_to(TRASH).as_posix()
 
 
 def command_trash(args) -> dict:
     ensure_store()
-    identifier = safe_relative(args.id)
-    source = note_path(identifier)
-    if not source.is_file():
-        raise StoreError(f"note not found: {identifier}")
+    targets = batch_targets(args)
     with locked():
-        target_dir = TRASH / source.parent.relative_to(NOTES)
-        target_dir.mkdir(parents=True, exist_ok=True)
-        target = target_dir / source.name
-        if target.exists():
-            target = unique_target(target_dir, source.name, "trashed-")
-        try:
-            data = source.read_bytes()
-        except OSError as error:
-            raise StoreError(f"could not read the note before trashing it: {error}") from error
-        snapshot_note(identifier, data, "trash", destructive=True)
-        shutil.move(str(source), str(target))
-        move_draft(source, target)
-        prune_empty_dirs(source.parent)
         pins = pinned_set()
-        if identifier in pins:
-            pins.discard(identifier)
+        pins_before = set(pins)
+        new_ids = [
+            trash_note(identifier, source, pins)
+            for identifier, source in targets
+        ]
+        if pins != pins_before:
             save_pinned(pins)
-        new_id = target.relative_to(TRASH).as_posix()
-        conn = index_connect()
-        try:
-            sync_index(conn)
-        finally:
-            conn.close()
-        prune_versions(identifier)
-    return {"id": new_id}
+        sync_index_once()
+    return {"id": new_ids[0], "ids": new_ids, "count": len(new_ids)}
+
+
+def restore_note(identifier: str, source: Path) -> str:
+    """Move one trashed note back to its mirrored live folder."""
+    target_dir = NOTES / source.parent.relative_to(TRASH)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / source.name
+    if target.exists():
+        target = unique_target(target_dir, source.name, "restored-")
+    shutil.move(str(source), str(target))
+    move_draft(source, target)
+    prune_empty_dirs(source.parent)
+    return target.relative_to(NOTES).as_posix()
 
 
 def command_restore(args) -> dict:
     ensure_store()
-    identifier = safe_relative(args.id)
-    source = note_path(identifier, trashed=True)
-    if not source.is_file():
-        raise StoreError(f"note not found in trash: {identifier}")
+    targets = batch_targets(args, trashed=True)
     with locked():
-        target_dir = NOTES / source.parent.relative_to(TRASH)
-        target_dir.mkdir(parents=True, exist_ok=True)
-        target = target_dir / source.name
-        if target.exists():
-            target = unique_target(target_dir, source.name, "restored-")
-        shutil.move(str(source), str(target))
-        move_draft(source, target)
-        prune_empty_dirs(source.parent)
-        new_id = target.relative_to(NOTES).as_posix()
-        conn = index_connect()
-        try:
-            sync_index(conn)
-        finally:
-            conn.close()
-    return {"id": new_id}
+        new_ids = [restore_note(identifier, source) for identifier, source in targets]
+        sync_index_once()
+    return {"id": new_ids[0], "ids": new_ids, "count": len(new_ids)}
+
+
+def delete_note(identifier: str, path: Path) -> None:
+    """Permanently delete one note from the trash after snapshotting it."""
+    try:
+        data = path.read_bytes()
+    except OSError as error:
+        raise StoreError(f"could not read the note before deleting it: {error}") from error
+    snapshot_note(identifier, data, "delete", destructive=True)
+    path.unlink()
+    discard_draft(path)
+    prune_versions(identifier)
 
 
 def command_delete(args) -> dict:
     ensure_store()
-    identifier = safe_relative(args.id)
-    path = note_path(identifier, trashed=True)
-    if not path.is_file():
-        raise StoreError(f"note not found in trash: {args.id}")
+    targets = batch_targets(args, trashed=True)
     with locked():
-        try:
-            data = path.read_bytes()
-        except OSError as error:
-            raise StoreError(f"could not read the note before deleting it: {error}") from error
-        snapshot_note(identifier, data, "delete", destructive=True)
-        path.unlink()
-        discard_draft(path)
-        conn = index_connect()
-        try:
-            sync_index(conn)
-        finally:
-            conn.close()
-        prune_versions(identifier)
-    return {"deleted": True, "id": identifier}
+        for identifier, path in targets:
+            delete_note(identifier, path)
+        sync_index_once()
+    identifiers = [identifier for identifier, _path in targets]
+    return {
+        "deleted": True,
+        "id": identifiers[0],
+        "ids": identifiers,
+        "count": len(identifiers),
+    }
 
 
 def command_versions(args) -> dict:
@@ -1779,8 +2513,7 @@ def command_restore_version(args) -> dict:
         stat = path.stat()
         conn = index_connect()
         try:
-            index_file(conn, path, False, pinned_set())
-            resolve_links(conn)
+            index_and_resolve(conn, path)
             conn.commit()
         finally:
             conn.close()
@@ -1832,33 +2565,49 @@ def command_empty_trash(_args) -> dict:
     return {"deleted": deleted}
 
 
+def pin_note(identifier: str, path: Path, mode: str, pins: set[str]) -> bool:
+    """Apply one pin change; return True only when the state changed."""
+    current = identifier in pins
+    desired = not current if mode == "toggle" else mode == "on"
+    if desired == current:
+        return False
+    try:
+        data = path.read_bytes()
+    except OSError as error:
+        raise StoreError(f"could not read the note before pinning it: {error}") from error
+    snapshot_note(identifier, data, "pin", destructive=True)
+    if desired:
+        pins.add(identifier)
+    else:
+        pins.discard(identifier)
+    prune_versions(identifier)
+    return True
+
+
 def command_pin(args) -> dict:
     ensure_store()
-    identifier = safe_relative(args.id)
-    path = note_path(identifier)
-    if not path.is_file():
-        raise StoreError(f"note not found: {identifier}")
+    mode = str(getattr(args, "state", "toggle") or "toggle")
+    if mode not in {"on", "off", "toggle"}:
+        raise StoreError(f"invalid pin state: {mode}")
+    targets = batch_targets(args)
+    identifiers = [identifier for identifier, _path in targets]
     with locked():
-        try:
-            data = path.read_bytes()
-        except OSError as error:
-            raise StoreError(f"could not read the note before pinning it: {error}") from error
-        snapshot_note(identifier, data, "pin", destructive=True)
         pins = pinned_set()
-        if identifier in pins:
-            pins.discard(identifier)
-            state = False
-        else:
-            pins.add(identifier)
-            state = True
-        save_pinned(pins)
-        conn = index_connect()
-        try:
-            sync_index(conn)
-        finally:
-            conn.close()
-        prune_versions(identifier)
-    return {"id": identifier, "pinned": state}
+        pins_before = set(pins)
+        updated = 0
+        for identifier, path in targets:
+            if pin_note(identifier, path, mode, pins):
+                updated += 1
+        if pins != pins_before:
+            save_pinned(pins)
+        sync_index_once()
+        state = identifiers[0] in pins
+    return {
+        "id": identifiers[0],
+        "ids": identifiers,
+        "pinned": state,
+        "updated": updated,
+    }
 
 
 def command_folder(args) -> dict:
@@ -2090,6 +2839,212 @@ def fts_query(raw: str) -> str:
     return " AND ".join(parts)
 
 
+SEARCH_FILTER_KEYS = ("tag", "folder", "before", "after")
+DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _read_quoted(text: str, start: int) -> tuple[str, int]:
+    """Read a double-quoted value from ``text[start]``.
+
+    A doubled quote is one literal quote inside the value. An unterminated
+    quote is a user error rather than a partial match.
+    """
+    index = start + 1
+    output: list[str] = []
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if char == '"':
+            if index + 1 < length and text[index + 1] == '"':
+                output.append('"')
+                index += 2
+                continue
+            return "".join(output), index + 1
+        output.append(char)
+        index += 1
+    raise StoreError("unterminated quote in search query")
+
+
+def local_day_start_ms(value: str, key: str) -> int:
+    """Return local midnight for a strict YYYY-MM-DD value, as Unix ms."""
+    if not DATE_ONLY_RE.match(value):
+        raise StoreError(f"invalid date in {key}:{value}; expected YYYY-MM-DD")
+    try:
+        day = datetime.date.fromisoformat(value)
+    except ValueError as error:
+        raise StoreError(f"invalid date in {key}:{value}; expected YYYY-MM-DD") from error
+    return int(datetime.datetime.combine(day, datetime.time.min).timestamp() * 1000)
+
+
+def parse_search_query(raw: str) -> dict:
+    """Split a search string into free terms, filters, and negations.
+
+    Recognised filters are only created by a leading, unquoted ``key:``. A
+    quoted value may contain anything, including ``tag:``. Unknown ``foo:bar``
+    stays a free-text token.
+    """
+    text = str(raw or "")
+    parsed = {
+        "empty": True,
+        "plain": False,
+        "structured": False,
+        "negated": False,
+        "phrase": False,
+        "free": [],      # {"kind": "word"|"phrase", "value", "negated"}
+        "tags": [],      # (value, negated)
+        "folders": [],   # (value, negated)
+        "dates": [],     # (key, mtime_ms, negated)
+        "positive_free": 0,
+    }
+    index = 0
+    length = len(text)
+    while index < length:
+        while index < length and text[index].isspace():
+            index += 1
+        if index >= length:
+            break
+        parsed["empty"] = False
+        negated = False
+        if (
+            text[index] == "-"
+            and index + 1 < length
+            and not text[index + 1].isspace()
+        ):
+            negated = True
+            parsed["negated"] = True
+            index += 1
+        if text[index] == '"':
+            value, index = _read_quoted(text, index)
+            parsed["free"].append({"kind": "phrase", "value": value, "negated": negated})
+            parsed["phrase"] = True
+            if not negated and value:
+                parsed["positive_free"] += 1
+            continue
+        start = index
+        while index < length and not text[index].isspace() and text[index] != '"':
+            index += 1
+        bare = text[start:index]
+        key = ""
+        value = bare
+        colon = bare.find(":")
+        if colon > 0:
+            candidate = bare[:colon].lower()
+            if candidate in SEARCH_FILTER_KEYS:
+                key = candidate
+                value = bare[colon + 1:]
+        if key:
+            if index < length and text[index] == '"':
+                quoted, index = _read_quoted(text, index)
+                value = value + quoted
+        elif index < length and text[index] == '"':
+            # A quote glued to a bare word: keep it as one free-text token.
+            quoted, index = _read_quoted(text, index)
+            value = bare + quoted
+        if key:
+            parsed["structured"] = True
+            if key in ("tag", "folder"):
+                parsed[key + "s"].append((value, negated))
+            else:
+                parsed["dates"].append((key, local_day_start_ms(value, key), negated))
+            continue
+        parsed["free"].append({"kind": "word", "value": value, "negated": negated})
+        if not negated and value.strip('"*'):
+            parsed["positive_free"] += 1
+    parsed["plain"] = (
+        not parsed["empty"]
+        and not parsed["structured"]
+        and not parsed["negated"]
+        and not parsed["phrase"]
+        and parsed["positive_free"] > 0
+    )
+    return parsed
+
+
+def _search_term_expression(term: dict) -> str:
+    value = str(term["value"]).replace('"', '""')
+    return f'"{value}"' if term["kind"] == "phrase" else f'"{value}"*'
+
+
+def _like_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _folder_clause(value: str) -> tuple[str, list]:
+    folder = str(value)
+    if not folder:
+        return "n.folder = ''", []
+    return (
+        "(n.folder = ? COLLATE NOCASE OR n.folder LIKE ? ESCAPE '\\')",
+        [folder, _like_escape(folder) + "/%"],
+    )
+
+
+def _date_clause(key: str, mtime_ms: int) -> tuple[str, list]:
+    if key == "before":
+        return "n.mtime_ms < ?", [mtime_ms]
+    return "n.mtime_ms >= ?", [mtime_ms]
+
+
+def search_rows_filtered(conn: sqlite3.Connection, parsed: dict, limit: int) -> list:
+    """Run an advanced search, using FTS only when positive free text exists."""
+    clauses: list[str] = []
+    params: list = []
+    for value, negated in parsed["tags"]:
+        expression = "EXISTS (SELECT 1 FROM tags t WHERE t.note_key=n.key AND t.tag_key=?)"
+        clauses.append(f"NOT ({expression})" if negated else expression)
+        params.append(tag_key(value))
+    for value, negated in parsed["folders"]:
+        expression, expression_params = _folder_clause(value)
+        clauses.append(f"NOT ({expression})" if negated else expression)
+        params.extend(expression_params)
+    for key, mtime_ms, negated in parsed["dates"]:
+        expression, expression_params = _date_clause(key, mtime_ms)
+        clauses.append(f"NOT ({expression})" if negated else expression)
+        params.extend(expression_params)
+    for term in parsed["free"]:
+        if not term["negated"] or not term["value"]:
+            continue
+        clauses.append(
+            "n.key NOT IN (SELECT id FROM notes_fts WHERE notes_fts MATCH ?)"
+        )
+        params.append(_search_term_expression(term))
+
+    positive_terms = [
+        term for term in parsed["free"] if not term["negated"] and term["value"]
+    ][:12]
+    fts_expression = " AND ".join(_search_term_expression(term) for term in positive_terms)
+    if not fts_expression and not clauses:
+        # A query made only of empty/stripped tokens must not fall through to
+        # an unfiltered listing of every note.
+        return []
+    where = " AND ".join(["n.trashed=0"] + clauses)
+    try:
+        if fts_expression:
+            statement = (
+                "SELECT n.id, n.title, "
+                "snippet(notes_fts, 2, '⟪', '⟫', '…', 14) AS snip, "
+                "n.folder, n.mtime_ms, n.key, n.pinned, n.size "
+                "FROM notes_fts JOIN notes n ON n.key=notes_fts.id "
+                f"WHERE notes_fts MATCH ? AND {where} "
+                "ORDER BY bm25(notes_fts, 4.0, 1.0), n.mtime_ms DESC "
+                "LIMIT ?"
+            )
+            values = [fts_expression] + params + [limit]
+        else:
+            statement = (
+                "SELECT n.id, n.title, n.snippet AS snip, "
+                "n.folder, n.mtime_ms, n.key, n.pinned, n.size "
+                "FROM notes n "
+                f"WHERE {where} "
+                "ORDER BY n.pinned DESC, n.mtime_ms DESC, n.id "
+                "LIMIT ?"
+            )
+            values = params + [limit]
+        return conn.execute(statement, values).fetchall()
+    except sqlite3.OperationalError as error:
+        raise StoreError(f"search failed: {error}") from error
+
+
 def search_rows(conn: sqlite3.Connection, query: str, limit: int) -> list:
     try:
         return conn.execute(
@@ -2131,13 +3086,100 @@ def search_result(conn: sqlite3.Connection, row, fuzzy: bool) -> dict:
     return result
 
 
+def command_titles(args) -> dict:
+    ensure_store()
+    limit = max(1, min(MAX_TITLES_LIMIT, int(args.limit)))
+    with locked():
+        conn = with_index()
+        try:
+            rows = conn.execute(
+                """
+                SELECT id,title,folder,mtime_ms,pinned
+                FROM notes
+                WHERE trashed=0 AND id NOT LIKE '.quill-%'
+                ORDER BY pinned DESC, mtime_ms DESC, id
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        finally:
+            conn.close()
+    return {
+        "notes": [
+            {
+                "id": str(identifier),
+                "title": str(title),
+                "folder": str(folder),
+                "modified": int(mtime_ms),
+                "pinned": bool(pinned),
+            }
+            for identifier, title, folder, mtime_ms, pinned in rows
+        ]
+    }
+
+
+def saved_searches() -> list[dict]:
+    state = read_state()
+    raw = state.get("searches", [])
+    output: list[dict] = []
+    if not isinstance(raw, list):
+        return output
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        query = entry.get("query")
+        if not isinstance(query, str) or not query:
+            continue
+        label = entry.get("label")
+        if not isinstance(label, str) or not label.strip():
+            label = query
+        output.append({"query": query, "label": label})
+    return output
+
+
+def command_searches(args) -> dict:
+    ensure_store()
+    action = args.searches_action
+    if action == "list":
+        return {"searches": saved_searches()}
+    query = str(args.query).strip()
+    with locked():
+        entries = saved_searches()
+        if action == "add":
+            if not query:
+                raise StoreError("saved search cannot be empty")
+            label = str(getattr(args, "label", "") or "").strip() or query
+            for entry in entries:
+                if entry["query"] == query:
+                    entry["label"] = label
+                    break
+            else:
+                if len(entries) >= MAX_SAVED_SEARCHES:
+                    raise StoreError(f"too many saved searches (max {MAX_SAVED_SEARCHES})")
+                entries.append({"query": query, "label": label})
+            update_state(searches=entries)
+        elif action == "remove":
+            entries = [entry for entry in entries if entry["query"] != query]
+            update_state(searches=entries)
+    return {"searches": entries}
+
+
 def command_search(args) -> dict:
     ensure_store()
-    query = fts_query(args.query)
+    parsed = parse_search_query(args.query)
     limit = max(1, min(MAX_SEARCH_LIMIT, int(args.limit)))
     with locked():
         conn = with_index()
         try:
+            if parsed["empty"]:
+                return {"results": [], "fuzzy": False}
+            if not parsed["plain"]:
+                rows = search_rows_filtered(conn, parsed, limit)
+                return {
+                    "results": [search_result(conn, row, False) for row in rows],
+                    "fuzzy": False,
+                }
+            query = fts_query(args.query)
             if not query:
                 return {"results": [], "fuzzy": False}
             results_rows = search_rows(conn, query, limit)
@@ -2185,69 +3227,71 @@ def command_tags(_args) -> dict:
     return {"tags": [{"tag": str(tag), "count": int(count)} for tag, count in rows]}
 
 
-def command_tag_add(args) -> dict:
-    ensure_store()
-    identifier = safe_relative(args.id)
-    path = note_path(identifier)
-    if not path.is_file():
-        raise StoreError(f"note not found: {args.id}")
-    requested = normalize_tags(getattr(args, "tags", []) or [])
-    draft_deleted = False
-    with locked():
-        try:
-            previous_raw = path.read_bytes()
-        except OSError as error:
-            raise StoreError(f"could not read the note: {error}") from error
-        try:
-            content = previous_raw.decode("utf-8")
-        except UnicodeDecodeError as error:
-            raise StoreError("note is not valid UTF-8") from error
-        newline = detect_newline(content)
-        present = {tag.casefold() for tag in note_tags(content)}
-        missing: list[str] = []
-        for tag in requested:
-            key = tag.casefold()
-            if key in present:
-                continue
-            present.add(key)
-            missing.append(tag)
-            if len(missing) >= 20:
-                break
-        # Tags appended inside an open fence would be invisible to
-        # `extract_inline_tags`, so refuse rather than silently losing them.
-        # A request whose tags are all present still succeeds as a no-op.
-        if missing and has_unclosed_fence(content):
-            raise StoreError("cannot add tags while a fenced code block is open")
-        updated_content = append_inline_tags(content, missing)
-        updated = updated_content.encode("utf-8")
-        if updated != previous_raw:
-            snapshot_note(identifier, previous_raw, "tag-add")
-            atomic_write(path, updated)
-            # As with `write`, a draft is redundant only once it matches the
-            # bytes now on disk; a newer draft must survive.
-            try:
-                draft = read_draft(path)
-                if (draft is not None
-                        and normalize_newlines(draft[0], newline) == updated_content):
-                    draft_path(path).unlink()
-                    draft_deleted = True
-            except OSError:
-                pass
-            conn = index_connect()
-            try:
-                index_file(conn, path, False, pinned_set())
-                resolve_links(conn)
-                conn.commit()
-            finally:
-                conn.close()
-            prune_versions(identifier)
-        stat = path.stat()
+def plan_tag_add(identifier: str, path: Path, requested: list[str]) -> dict:
+    """Plan one tag-add without writing (so a batch is all-or-nothing)."""
+    try:
+        previous_raw = path.read_bytes()
+    except OSError as error:
+        raise StoreError(f"could not read the note: {error}") from error
+    try:
+        content = previous_raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise StoreError("note is not valid UTF-8") from error
+    present = {tag.casefold() for tag in note_tags(content)}
+    missing: list[str] = []
+    for tag in requested:
+        key = tag.casefold()
+        if key in present:
+            continue
+        present.add(key)
+        missing.append(tag)
+        if len(missing) >= 20:
+            break
+    # Tags appended inside an open fence would be invisible to
+    # `extract_inline_tags`, so refuse rather than silently losing them.
+    # A request whose tags are all present still succeeds as a no-op.
+    if missing and has_unclosed_fence(content):
+        raise StoreError("cannot add tags while a fenced code block is open")
     return {
         "id": identifier,
-        "tags": note_tags(updated_content),
-        "content": updated_content,
+        "path": path,
+        "previous": previous_raw,
+        "content": append_inline_tags(content, missing),
+    }
+
+
+def command_tag_add(args) -> dict:
+    ensure_store()
+    targets = batch_targets(args)
+    requested = normalize_tags(getattr(args, "tags", []) or [])
+    with locked():
+        plans = [
+            plan_tag_add(identifier, path, requested)
+            for identifier, path in targets
+        ]
+        updated = 0
+        draft_deleted = False
+        for index, plan in enumerate(plans):
+            changed, consumed_draft = apply_note_content(
+                plan["id"], plan["path"], plan["previous"], plan["content"], "tag-add"
+            )
+            if changed:
+                updated += 1
+                prune_versions(plan["id"])
+            if index == 0:
+                draft_deleted = consumed_draft
+        if updated:
+            sync_index_once()
+        first = plans[0]
+        stat = first["path"].stat()
+    return {
+        "id": first["id"],
+        "tags": note_tags(first["content"]),
+        "content": first["content"],
         "modified": int(stat.st_mtime * 1000),
         "draftDeleted": draft_deleted,
+        "ids": [plan["id"] for plan in plans],
+        "updated": updated,
     }
 
 
@@ -2369,6 +3413,410 @@ def rewrite_tags(content: str, old: str, new: str) -> tuple[str, int]:
     return body, changes
 
 
+def remove_frontmatter_tags(frontmatter: str, keys: set[str]) -> tuple[str, int]:
+    """Drop matching entries from `tags:` in frontmatter, both YAML forms."""
+    lines = frontmatter.splitlines(keepends=True)
+    output: list[str] = []
+    changes = 0
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        body = line.rstrip("\r\n")
+        ending = line[len(body):]
+        key_match = re.match(r"^(\s*)([^\s:#\-][^:]*?)\s*:\s*(.*)$", body)
+        if key_match is None or key_match.group(2).strip().lower() != "tags":
+            output.append(line)
+            index += 1
+            continue
+        rest = key_match.group(3)
+        stripped = rest.strip()
+        if stripped.startswith("["):
+            closing = stripped.find("]")
+            if closing == -1:
+                output.append(line)
+                index += 1
+                continue
+            inner = stripped[1:closing]
+            tail = stripped[closing + 1:]
+            items = [part.strip() for part in inner.split(",")]
+            kept: list[str] = []
+            for item in items:
+                value = item.strip().strip("'\"").strip()
+                if not value:
+                    continue
+                if tag_key(value) in keys:
+                    changes += 1
+                    continue
+                kept.append(item)
+            prefix = body[:key_match.start(3)]
+            replacement = "[" + ", ".join(kept) + "]"
+            if tail:
+                replacement += tail if tail.startswith(" ") else " " + tail
+            output.append(prefix + replacement + ending)
+            index += 1
+            continue
+        if stripped and tag_key(stripped.strip("'\"").strip()) in keys:
+            # A scalar `tags: alpha` line loses the whole key when it matches.
+            changes += 1
+            index += 1
+            continue
+        if stripped:
+            # A non-matching scalar tag: leave the line and its siblings alone.
+            output.append(line)
+            index += 1
+            continue
+        # `tags:` with an empty value starts a block list.
+        output.append(line)
+        index += 1
+        key_indent = len(key_match.group(1))
+        while index < len(lines):
+            follow = lines[index]
+            follow_body = follow.rstrip("\r\n")
+            item = re.match(r"^(\s*)-\s*(.+?)\s*$", follow_body)
+            if item is None or len(item.group(1)) < key_indent:
+                break
+            value = item.group(2).strip().strip("'\"").strip()
+            if tag_key(value) in keys:
+                changes += 1
+                index += 1
+                continue
+            output.append(follow)
+            index += 1
+    return "".join(output), changes
+
+
+def remove_inline_tags_from_line(line: str, keys: set[str]) -> tuple[str, int]:
+    """Remove matching `#tag` tokens outside code/URLs and tidy the gap.
+
+    One adjacent whitespace run is swallowed so `hello #tag world` becomes
+    `hello world` and `hello #tag` becomes `hello`.
+    """
+    blocked = [match.span() for match in INLINE_CODE_RE.finditer(line)]
+    blocked.extend(protected_spans(line))
+    output: list[str] = []
+    cursor = 0
+    retained = False
+    changes = 0
+    for match in TAG_RE.finditer(line):
+        if tag_key(match.group(1)) not in keys:
+            continue
+        if overlaps(match.span(), blocked):
+            continue
+        chunk = line[cursor:match.start()]
+        output.append(chunk)
+        if (chunk and chunk[-1] in " \t"
+                and (retained or chunk[:-1].strip(" \t"))):
+            output[-1] = chunk[:-1]
+            cursor = match.end()
+        else:
+            cursor = match.end()
+            if cursor < len(line) and line[cursor] in " \t":
+                cursor += 1
+        if any(character not in " \t" for character in chunk):
+            retained = True
+        changes += 1
+    output.append(line[cursor:])
+    return "".join(output), changes
+
+
+def remove_inline_tags(text: str, keys: set[str]) -> tuple[str, int]:
+    """Remove inline tags from a body, skipping fenced code blocks."""
+    in_code = False
+    output: list[str] = []
+    changes = 0
+    for line in text.splitlines(keepends=True):
+        bare = line.rstrip("\r\n")
+        ending = line[len(bare):]
+        if FENCE_RE.match(bare):
+            in_code = not in_code
+            output.append(line)
+            continue
+        if in_code:
+            output.append(line)
+            continue
+        replaced, count = remove_inline_tags_from_line(bare, keys)
+        changes += count
+        output.append(replaced + ending)
+    return "".join(output), changes
+
+
+def remove_tags(content: str, keys: set[str]) -> tuple[str, int]:
+    """Remove tags from frontmatter and inline text; never edit code or URLs."""
+    if not keys:
+        return content, 0
+    newline = detect_newline(content)
+    frontmatter, body = split_frontmatter(content)
+    changes = 0
+    if frontmatter is not None:
+        frontmatter, frontmatter_changes = remove_frontmatter_tags(frontmatter, keys)
+        changes += frontmatter_changes
+        body, body_changes = remove_inline_tags(body, keys)
+        changes += body_changes
+        return "---" + newline + frontmatter + "---" + newline + body, changes
+    body, changes = remove_inline_tags(body, keys)
+    return body, changes
+
+
+def dedupe_frontmatter_tags(frontmatter: str) -> tuple[str, int]:
+    """Drop repeated entries from `tags:` in frontmatter, keeping the first.
+
+    Both YAML forms are handled: a flow list (`tags: [a, b, a]`) and a block
+    list (`tags:` followed by `- a` lines). Survivors keep their on-disk order
+    and formatting; only the duplicate entries are removed.
+    """
+    lines = frontmatter.splitlines(keepends=True)
+    output: list[str] = []
+    changes = 0
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        body = line.rstrip("\r\n")
+        ending = line[len(body):]
+        key_match = re.match(r"^(\s*)([^\s:#\-][^:]*?)\s*:\s*(.*)$", body)
+        if key_match is None or key_match.group(2).strip().lower() != "tags":
+            output.append(line)
+            index += 1
+            continue
+        rest = key_match.group(3)
+        stripped = rest.strip()
+        if stripped.startswith("["):
+            closing = stripped.find("]")
+            if closing == -1:
+                output.append(line)
+                index += 1
+                continue
+            inner = stripped[1:closing]
+            tail = stripped[closing + 1:]
+            seen: set[str] = set()
+            kept: list[str] = []
+            for item in [part.strip() for part in inner.split(",")]:
+                value = item.strip().strip("'\"").strip()
+                if not value:
+                    continue
+                key = tag_key(value)
+                if key and key in seen:
+                    changes += 1
+                    continue
+                if key:
+                    seen.add(key)
+                kept.append(item)
+            prefix = body[:key_match.start(3)]
+            replacement = "[" + ", ".join(kept) + "]"
+            if tail:
+                replacement += tail if tail.startswith(" ") else " " + tail
+            output.append(prefix + replacement + ending)
+            index += 1
+            continue
+        if stripped:
+            # A scalar `tags: alpha` cannot contain a duplicate.
+            output.append(line)
+            index += 1
+            continue
+        # Empty value: a block list follows. Duplicate item lines are dropped.
+        output.append(line)
+        index += 1
+        key_indent = len(key_match.group(1))
+        seen = set()
+        while index < len(lines):
+            follow = lines[index]
+            follow_body = follow.rstrip("\r\n")
+            item = re.match(r"^(\s*)-\s*(.+?)\s*$", follow_body)
+            if item is None or len(item.group(1)) < key_indent:
+                break
+            value = item.group(2).strip().strip("'\"").strip()
+            key = tag_key(value)
+            if key and key in seen:
+                changes += 1
+                index += 1
+                continue
+            if key:
+                seen.add(key)
+            output.append(follow)
+            index += 1
+    return "".join(output), changes
+
+
+def dedupe_inline_tags_from_line(line: str) -> tuple[str, int]:
+    """Drop repeated `#tag` tokens within one line, keeping the first.
+
+    Inline code, fenced code (handled by the caller), URLs and Markdown link
+    destinations are never touched. One adjacent whitespace run is collapsed
+    on removal, matching `tag-remove`.
+    """
+    blocked = [match.span() for match in INLINE_CODE_RE.finditer(line)]
+    blocked.extend(protected_spans(line))
+    seen: set[str] = set()
+    output: list[str] = []
+    cursor = 0
+    retained = False
+    changes = 0
+    for match in TAG_RE.finditer(line):
+        if overlaps(match.span(), blocked):
+            continue
+        key = tag_key(match.group(1))
+        if not key:
+            continue
+        if key not in seen:
+            seen.add(key)
+            continue
+        chunk = line[cursor:match.start()]
+        output.append(chunk)
+        if (chunk and chunk[-1] in " \t"
+                and (retained or chunk[:-1].strip(" \t"))):
+            output[-1] = chunk[:-1]
+            cursor = match.end()
+        else:
+            cursor = match.end()
+            if cursor < len(line) and line[cursor] in " \t":
+                cursor += 1
+        if any(character not in " \t" for character in chunk):
+            retained = True
+        changes += 1
+    output.append(line[cursor:])
+    return "".join(output), changes
+
+
+def dedupe_inline_tags(text: str) -> tuple[str, int]:
+    """Drop duplicate inline tags from a body, skipping fenced code blocks."""
+    in_code = False
+    output: list[str] = []
+    changes = 0
+    for line in text.splitlines(keepends=True):
+        bare = line.rstrip("\r\n")
+        ending = line[len(bare):]
+        if FENCE_RE.match(bare):
+            in_code = not in_code
+            output.append(line)
+            continue
+        if in_code:
+            output.append(line)
+            continue
+        replaced, count = dedupe_inline_tags_from_line(bare)
+        changes += count
+        output.append(replaced + ending)
+    return "".join(output), changes
+
+
+def dedupe_tags(content: str) -> tuple[str, int]:
+    """Remove duplicate tag entries in frontmatter and on each inline line."""
+    newline = detect_newline(content)
+    frontmatter, body = split_frontmatter(content)
+    changes = 0
+    if frontmatter is not None:
+        frontmatter, frontmatter_changes = dedupe_frontmatter_tags(frontmatter)
+        changes += frontmatter_changes
+        body, body_changes = dedupe_inline_tags(body)
+        changes += body_changes
+        return "---" + newline + frontmatter + "---" + newline + body, changes
+    body, changes = dedupe_inline_tags(body)
+    return body, changes
+
+
+def delete_tag_everywhere(tag) -> dict:
+    """Remove one normalised tag from every live note and resync the index."""
+    raw = str(tag or "").strip().lstrip("#")
+    if not raw:
+        raise StoreError("tag is empty")
+    key = tag_key(raw)
+    if not key:
+        raise StoreError(
+            f"cannot delete {raw!r}: it has no comparable characters "
+            "(tags that normalize to an empty key would all match)")
+    display = normalize_tags([raw])
+    if not display:
+        raise StoreError("tag is empty")
+    tag = display[0]
+    updated = 0
+    snapshotted: list[str] = []
+    with locked():
+        for path in list(NOTES.rglob("*.md")):
+            if not path.is_file():
+                continue
+            try:
+                previous_raw = path.read_bytes()
+                content = previous_raw.decode("utf-8", errors="replace")
+            except OSError:
+                continue
+            updated_content, changes = remove_tags(content, {key})
+            if not changes:
+                continue
+            updated_bytes = updated_content.encode("utf-8")
+            if updated_bytes == previous_raw:
+                continue
+            identifier = path.relative_to(NOTES).as_posix()
+            snapshot_note(identifier, previous_raw, "tag-delete", destructive=True)
+            atomic_write(path, updated_bytes)
+            snapshotted.append(identifier)
+            updated += 1
+        conn = index_connect()
+        try:
+            sync_index(conn, full=True)
+        finally:
+            conn.close()
+        for identifier in snapshotted:
+            prune_versions(identifier)
+    # ids let a UI reload an open buffer without waiting for the file watcher.
+    return {"tag": display[0], "updated": updated, "ids": snapshotted}
+
+
+def plan_tag_remove(identifier: str, path: Path, keys: set[str]) -> dict:
+    """Plan one tag-remove without writing (so a batch is all-or-nothing)."""
+    try:
+        previous_raw = path.read_bytes()
+    except OSError as error:
+        raise StoreError(f"could not read the note: {error}") from error
+    try:
+        content = previous_raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise StoreError("note is not valid UTF-8") from error
+    # No unclosed-fence refusal: anything inside a fence is protected and is
+    # skipped, so removal is always unambiguous (and best-effort).
+    updated_content, _changes = remove_tags(content, keys)
+    return {
+        "id": identifier,
+        "path": path,
+        "previous": previous_raw,
+        "content": updated_content,
+    }
+
+
+def command_tag_remove(args) -> dict:
+    ensure_store()
+    targets = batch_targets(args)
+    requested = normalize_tags(getattr(args, "tags", []) or [])
+    keys = {tag_key(tag) for tag in requested}
+    keys.discard("")
+    with locked():
+        plans = [
+            plan_tag_remove(identifier, path, keys)
+            for identifier, path in targets
+        ]
+        updated = 0
+        draft_deleted = False
+        for index, plan in enumerate(plans):
+            changed, consumed_draft = apply_note_content(
+                plan["id"], plan["path"], plan["previous"], plan["content"], "tag-remove"
+            )
+            if changed:
+                updated += 1
+                prune_versions(plan["id"])
+            if index == 0:
+                draft_deleted = consumed_draft
+        if updated:
+            sync_index_once()
+        first = plans[0]
+        stat = first["path"].stat()
+    return {
+        "id": first["id"],
+        "tags": note_tags(first["content"]),
+        "content": first["content"],
+        "modified": int(stat.st_mtime * 1000),
+        "draftDeleted": draft_deleted,
+        "ids": [plan["id"] for plan in plans],
+        "updated": updated,
+    }
+
+
 def command_tag_rename(args) -> dict:
     ensure_store()
     old = str(args.old or "").strip().lstrip("#")
@@ -2382,7 +3830,9 @@ def command_tag_rename(args) -> dict:
     if not new:
         raise StoreError("new tag is empty")
     new = new[0]
+    new_key = tag_key(new)
     updated = 0
+    merged = False
     snapshotted: list[str] = []
     with locked():
         for path in list(NOTES.rglob("*.md")):
@@ -2393,8 +3843,15 @@ def command_tag_rename(args) -> dict:
                 content = previous_raw.decode("utf-8", errors="replace")
             except OSError:
                 continue
+            # `merged` is true when the destination tag already existed
+            # anywhere, because then the rename merges two tags into one.
+            if any(tag_key(tag) == new_key for tag in note_tags(content)):
+                merged = True
             updated_content, changes = rewrite_tags(content, old, new)
             if changes:
+                # Renaming onto an existing tag can leave the destination tag
+                # twice in one note; keep the first entry everywhere.
+                updated_content, _deduped = dedupe_tags(updated_content)
                 identifier = path.relative_to(NOTES).as_posix()
                 updated_bytes = updated_content.encode("utf-8")
                 if updated_bytes != previous_raw:
@@ -2409,7 +3866,17 @@ def command_tag_rename(args) -> dict:
             conn.close()
         for identifier in snapshotted:
             prune_versions(identifier)
-    return {"tag": new, "from": old, "updated": updated}
+    return {
+        "tag": new,
+        "from": old,
+        "updated": updated,
+        "merged": merged,
+        "ids": snapshotted,
+    }
+
+
+def command_tag_delete(args) -> dict:
+    return delete_tag_everywhere(getattr(args, "tag", ""))
 
 
 def command_backlinks(args) -> dict:
@@ -2438,16 +3905,101 @@ def command_backlinks(args) -> dict:
     }
 
 
-def lookup_titles(conn: sqlite3.Connection) -> tuple[dict[str, str], dict[str, str]]:
-    rows = conn.execute(
-        "SELECT id,title,stem FROM notes WHERE trashed=0 ORDER BY pinned DESC, mtime_ms DESC, id"
-    ).fetchall()
+def command_unresolved(args) -> dict:
+    ensure_store()
+    identifier = None
+    raw_id = getattr(args, "id", None)
+    if raw_id:
+        identifier = safe_relative(raw_id)
+    try:
+        limit = int(getattr(args, "limit", 500))
+    except (TypeError, ValueError):
+        limit = 500
+    limit = max(1, limit)
+    with locked():
+        conn = with_index()
+        try:
+            params: list = []
+            filter_sql = ""
+            if identifier is not None:
+                filter_sql = " AND l.src_id=?"
+                params.append(identifier)
+            params.append(limit)
+            rows = conn.execute(
+                f"""
+                SELECT l.src_id, n.title, l.target, COUNT(*) AS n
+                FROM links l JOIN notes n ON n.key=l.src_key
+                WHERE l.resolved_id IS NULL
+                  AND n.trashed=0
+                  AND n.id NOT LIKE '.quill-%'
+                  {filter_sql}
+                GROUP BY l.src_id, l.target COLLATE NOCASE
+                ORDER BY l.src_id COLLATE NOCASE, l.target COLLATE NOCASE
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        finally:
+            conn.close()
+    unresolved = [
+        {
+            "source": str(source),
+            "sourceTitle": str(title),
+            "target": str(target),
+            "count": int(count),
+        }
+        for source, title, target, count in rows
+    ]
+    return {
+        "unresolved": unresolved,
+        "total": sum(entry["count"] for entry in unresolved),
+        "sources": len({entry["source"] for entry in unresolved}),
+    }
+
+
+TITLE_ROWS_SQL = (
+    "SELECT id,title,stem FROM notes WHERE trashed=0 ORDER BY pinned DESC, mtime_ms DESC, id"
+)
+
+
+def titles_from_rows(rows) -> tuple[dict[str, str], dict[str, str]]:
     by_title: dict[str, str] = {}
     by_stem: dict[str, str] = {}
     for identifier, title, stem in rows:
-        by_title.setdefault(unicodedata.normalize("NFC", str(title)).casefold(), str(identifier))
-        by_stem.setdefault(unicodedata.normalize("NFC", str(stem)).casefold(), str(identifier))
+        by_title.setdefault(link_key(title), str(identifier))
+        by_stem.setdefault(link_key(stem), str(identifier))
     return by_title, by_stem
+
+
+def lookup_titles(conn: sqlite3.Connection) -> tuple[dict[str, str], dict[str, str]]:
+    rows = conn.execute(TITLE_ROWS_SQL).fetchall()
+    return titles_from_rows(rows)
+
+
+def lookup_titles_readonly() -> tuple[dict[str, str], dict[str, str]]:
+    """Read link targets from an existing index without touching the store.
+
+    Previewing unsaved buffer text must not rebuild the index, take the write
+    lock, or sweep the notes directory: this runs on every keystroke. A
+    missing, unreadable, or old-schema index is not an error; links simply
+    render as ``quill://missing`` until the next real sync.
+    """
+    if not INDEX.is_file():
+        return {}, {}
+    uri = f"file:{urllib.parse.quote(str(INDEX), safe='/')}?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=2)
+    except sqlite3.Error:
+        return {}, {}
+    try:
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if version != SCHEMA_VERSION:
+            return {}, {}
+        return lookup_titles(conn)
+    except (sqlite3.Error, TypeError, ValueError):
+        return {}, {}
+    finally:
+        conn.close()
 
 
 def transform_line(line: str, by_title: dict[str, str], by_stem: dict[str, str]) -> str:
@@ -2460,7 +4012,7 @@ def transform_line(line: str, by_title: dict[str, str], by_stem: dict[str, str])
         if not target_part:
             return match.group(0)
         label = alias.strip() or target_part
-        norm = unicodedata.normalize("NFC", target_part).casefold()
+        norm = link_key(target_part)
         resolved = by_title.get(norm) or by_stem.get(norm)
         if resolved:
             url = "quill://note/" + urllib.parse.quote(resolved, safe="/")
@@ -2492,23 +4044,20 @@ def transform_line(line: str, by_title: dict[str, str], by_stem: dict[str, str])
     return output
 
 
-def command_preview(args) -> dict:
-    ensure_store()
-    path = note_path(args.id, trashed=getattr(args, "trashed", False))
-    if not path.is_file():
-        raise StoreError(f"note not found: {args.id}")
-    payload = read_note_bytes(path)
-    if len(payload) > MAX_NOTE_BYTES:
-        return {"markdown": "", "tooLarge": True}
-    content = payload.decode("utf-8", errors="replace")
-    with locked():
-        conn = index_connect()
-        try:
-            sync_index(conn)
-            by_title, by_stem = lookup_titles(conn)
-        finally:
-            conn.close()
+def render_preview(
+    content: str,
+    by_title: dict[str, str],
+    by_stem: dict[str, str],
+    too_large: bool = False,
+) -> dict:
+    """Render note text for the preview pane.
 
+    Shared by the on-disk note path and the editor-buffer path so both rewrite
+    links identically. ``too_large`` short-circuits before any parsing; callers
+    measure the raw bytes because decoding may replace invalid sequences.
+    """
+    if too_large:
+        return {"markdown": "", "tooLarge": True, "lineOffset": 0}
     frontmatter, body = split_frontmatter(content)
     # Preview lines are body-relative; tell the UI how many file lines the
     # stripped frontmatter occupied so image resize edits the right line.
@@ -2539,6 +4088,48 @@ def command_preview(args) -> dict:
         output.append(rendered)
     markdown = "\n".join(output)
     return {"markdown": markdown, "tooLarge": False, "lineOffset": line_offset}
+
+
+def command_preview(args) -> dict:
+    identifier = getattr(args, "id", None)
+    content_file = getattr(args, "content_file", None)
+    from_stdin = bool(getattr(args, "stdin", False))
+    if sum((identifier is not None, content_file is not None, from_stdin)) != 1:
+        raise StoreError("choose exactly one of <id>, --content-file, --stdin")
+    trashed = bool(getattr(args, "trashed", False))
+
+    if identifier is not None:
+        ensure_store()
+        path = note_path(identifier, trashed=trashed)
+        if not path.is_file():
+            raise StoreError(f"note not found: {identifier}")
+        payload = read_note_bytes(path)
+        with locked():
+            conn = index_connect()
+            try:
+                sync_index(conn)
+                by_title, by_stem = lookup_titles(conn)
+            finally:
+                conn.close()
+    else:
+        if trashed:
+            raise StoreError("--trashed requires a note id")
+        if content_file is not None:
+            try:
+                payload = read_note_bytes(Path(content_file).expanduser())
+            except OSError as error:
+                raise StoreError(
+                    f"cannot read content file: {content_file}: {error}"
+                ) from error
+        else:
+            payload = read_stdin(MAX_NOTE_BYTES)
+        # Buffer preview is deliberately sync-free: no index mutation, no
+        # write lock, and no note stat/read.
+        by_title, by_stem = lookup_titles_readonly()
+
+    too_large = len(payload) > MAX_NOTE_BYTES
+    content = "" if too_large else payload.decode("utf-8", errors="replace")
+    return render_preview(content, by_title, by_stem, too_large=too_large)
 
 
 def command_import(args) -> dict:
@@ -2626,7 +4217,7 @@ def command_attachment_save(args) -> dict:
         except OSError as error:
             raise StoreError(f"cannot read file {raw_file}: {error}") from None
     else:
-        payload = sys.stdin.buffer.read(MAX_ATTACHMENT_BYTES + 1)
+        payload = read_stdin(MAX_ATTACHMENT_BYTES)
 
     if not payload:
         raise StoreError("file is empty")
@@ -2760,6 +4351,616 @@ def command_stats(_args) -> dict:
 
 
 # --------------------------------------------------------------------------
+# daemon
+#
+# The daemon is optional: it serves the exact same commands over a Unix socket
+# so the UI pays one process start instead of one per command. The request and
+# response shapes are documented in docs/cli-contract.md.
+
+IN_CLOSE_WRITE = 0x00000008
+IN_MOVED_FROM = 0x00000040
+IN_MOVED_TO = 0x00000080
+IN_CREATE = 0x00000100
+IN_DELETE = 0x00000200
+IN_DELETE_SELF = 0x00000400
+IN_MOVE_SELF = 0x00000800
+IN_Q_OVERFLOW = 0x00004000
+IN_IGNORED = 0x00008000
+IN_ISDIR = 0x40000000
+WATCH_MASK = (
+    IN_CLOSE_WRITE
+    | IN_MOVED_TO
+    | IN_MOVED_FROM
+    | IN_CREATE
+    | IN_DELETE
+    | IN_DELETE_SELF
+    | IN_MOVE_SELF
+)
+INOTIFY_EVENT = struct.Struct("iIII")
+WATCH_DEBOUNCE = 0.4
+WATCH_READ_TIMEOUT = 0.5
+
+
+def daemon_socket_path() -> Path:
+    """Return the daemon socket, never inside the data root.
+
+    $QUILL_SOCKET wins; otherwise $XDG_RUNTIME_DIR/quill-<hash>.sock, falling
+    back to the system temporary directory. The data root is deliberately
+    excluded so the socket is neither watched nor indexed.
+    """
+    override = os.environ.get("QUILL_SOCKET")
+    if override:
+        candidate = Path(os.path.expanduser(override)).resolve()
+    else:
+        digest = hashlib.sha1(str(ROOT).encode("utf-8")).hexdigest()[:12]
+        runtime = os.environ.get("XDG_RUNTIME_DIR")
+        base = Path(os.path.expanduser(runtime)) if runtime else Path(tempfile.gettempdir())
+        candidate = base / f"quill-{digest}.sock"
+    if candidate == ROOT or ROOT in candidate.parents:
+        digest = hashlib.sha1(str(ROOT).encode("utf-8")).hexdigest()[:12]
+        candidate = Path(tempfile.gettempdir()) / f"quill-{digest}.sock"
+    return candidate
+
+
+def _index_note_count() -> int:
+    try:
+        if not INDEX.exists():
+            return -1
+        conn = sqlite3.connect(
+            f"file:{urllib.parse.quote(str(INDEX), safe='/')}?mode=ro",
+            uri=True,
+            timeout=2,
+        )
+        try:
+            return int(conn.execute("SELECT COUNT(*) FROM notes WHERE trashed=0").fetchone()[0])
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError, TypeError):
+        return -1
+
+
+class _Watcher:
+    """Inotify watcher that keeps the index warm between commands."""
+
+    def __init__(self, libc, fd: int, broadcast) -> None:
+        self.libc = libc
+        self.fd = fd
+        self.broadcast = broadcast
+        self.watches: dict[int, Path] = {}
+        self.pending: dict[Path, bool] = {}
+        self.fallback = False
+        self.rebuild = False
+
+    # -- watch registration -------------------------------------------------
+
+    def _add_watch(self, directory: Path) -> bool:
+        try:
+            wd = self.libc.inotify_add_watch(
+                self.fd, str(directory).encode("utf-8"), WATCH_MASK
+            )
+        except OSError:
+            return False
+        if wd < 0:
+            return False
+        self.watches[wd] = directory
+        return True
+
+    def _add_tree(self, root: Path) -> int:
+        added = 0
+        if self._add_watch(root):
+            added += 1
+        try:
+            walker = os.walk(root)
+        except OSError:
+            return added
+        for dirpath, dirnames, _filenames in walker:
+            for name in dirnames:
+                if self._add_watch(Path(dirpath) / name):
+                    added += 1
+        return added
+
+    def attach(self) -> bool:
+        self.watches.clear()
+        if self._add_tree(NOTES) == 0:
+            return False
+        self._add_tree(TRASH)
+        return True
+
+    def _reset(self) -> None:
+        self.watches.clear()
+        self._add_tree(NOTES)
+        self._add_tree(TRASH)
+
+    # -- events -------------------------------------------------------------
+
+    def _consume(self, data: bytes) -> None:
+        offset = 0
+        while offset + INOTIFY_EVENT.size <= len(data):
+            wd, mask, _cookie, name_len = INOTIFY_EVENT.unpack_from(data, offset)
+            offset += INOTIFY_EVENT.size
+            raw_name = data[offset : offset + name_len]
+            offset += name_len
+            name = raw_name.split(b"\x00", 1)[0].decode("utf-8", "replace")
+            self._event(wd, mask, name)
+
+    def _event(self, wd: int, mask: int, name: str) -> None:
+        if mask & IN_Q_OVERFLOW:
+            self.fallback = True
+            self.rebuild = True
+            return
+        if mask & IN_IGNORED:
+            self.watches.pop(wd, None)
+            if mask & (IN_DELETE_SELF | IN_MOVE_SELF):
+                self.fallback = True
+                self.rebuild = True
+            return
+        directory = self.watches.get(wd)
+        if directory is None:
+            self.fallback = True
+            self.rebuild = True
+            return
+        if mask & (IN_DELETE_SELF | IN_MOVE_SELF):
+            # The watched directory itself moved or vanished; wd mappings are
+            # no longer trustworthy.
+            self.fallback = True
+            self.rebuild = True
+            return
+        path = directory / name if name else directory
+        if mask & IN_ISDIR:
+            # A directory appeared, moved or disappeared: files inside it were
+            # not individually reported, so a full sync is the safe fallback.
+            self.fallback = True
+            if mask & (IN_CREATE | IN_MOVED_TO):
+                self._add_tree(path)
+            else:
+                self.rebuild = True
+            return
+        if path.suffix != ".md":
+            return
+        self.pending[path] = TRASH in path.parents
+
+    # -- index maintenance --------------------------------------------------
+
+    def _flush(self) -> None:
+        pending = self.pending
+        fallback = self.fallback
+        self.pending = {}
+        self.fallback = False
+        if self.rebuild:
+            self.rebuild = False
+            self._reset()
+        if not pending and not fallback:
+            return
+
+        touched: list[str] = []
+        removed: list[str] = []
+        full = False
+        with EXEC_LOCK:
+            with locked():
+                conn = index_connect()
+                try:
+                    if fallback:
+                        sync_index(conn, full=False)
+                        full = True
+                    else:
+                        affected: set[str] = set()
+                        for path, trashed in pending.items():
+                            root = TRASH if trashed else NOTES
+                            try:
+                                identifier = path.relative_to(root).as_posix()
+                            except ValueError:
+                                full = True
+                                sync_index(conn, full=False)
+                                touched = []
+                                removed = []
+                                break
+                            key = note_key(identifier, trashed)
+                            if path.is_file():
+                                index_and_resolve(conn, path, trashed)
+                                touched.append(identifier)
+                                continue
+                            # Mirror the deletion block in sync_index: links
+                            # that resolved to this note become unresolved and
+                            # can resolve again after a restore.
+                            previous = conn.execute(
+                                "SELECT id FROM notes WHERE key=?", (key,)
+                            ).fetchone()
+                            if previous is not None:
+                                for (target_norm,) in conn.execute(
+                                    "SELECT DISTINCT target_norm FROM links "
+                                    "WHERE resolved_id=?",
+                                    (str(previous[0]),),
+                                ).fetchall():
+                                    affected.add(str(target_norm))
+                            conn.execute("DELETE FROM notes WHERE key=?", (key,))
+                            conn.execute("DELETE FROM tags WHERE note_key=?", (key,))
+                            conn.execute("DELETE FROM links WHERE src_key=?", (key,))
+                            conn.execute("DELETE FROM notes_fts WHERE id=?", (key,))
+                            removed.append(identifier)
+                        if not full and affected:
+                            resolve_links(conn, target_norms=affected)
+                    conn.commit()
+                finally:
+                    conn.close()
+        if full:
+            self.broadcast({"event": "notes", "ids": [], "removed": [], "full": True})
+        elif touched or removed:
+            self.broadcast({"event": "notes", "ids": touched, "removed": removed})
+
+    def run(self) -> None:
+        global INDEX_TRUSTED
+        last_event = time.monotonic()
+        try:
+            while True:
+                timeout = WATCH_READ_TIMEOUT
+                if self.pending or self.fallback:
+                    remaining = WATCH_DEBOUNCE - (time.monotonic() - last_event)
+                    timeout = max(0.05, min(WATCH_READ_TIMEOUT, remaining))
+                try:
+                    ready, _w, _x = select.select([self.fd], [], [], timeout)
+                except (OSError, ValueError):
+                    return
+                if ready:
+                    while True:
+                        try:
+                            data = os.read(self.fd, 65536)
+                        except BlockingIOError:
+                            break
+                        except OSError:
+                            return
+                        if not data:
+                            break
+                        self._consume(data)
+                    last_event = time.monotonic()
+                if (self.pending or self.fallback) and (
+                    time.monotonic() - last_event >= WATCH_DEBOUNCE
+                ):
+                    self._flush()
+        except Exception:
+            # A broken watcher must never take the server down; fall back to
+            # syncing in with_index() on the next command.
+            pass
+        finally:
+            INDEX_TRUSTED = False
+            with contextlib.suppress(OSError):
+                os.close(self.fd)
+
+
+def start_watcher(broadcast) -> bool:
+    """Start the inotify watcher thread. Returns False on any OS failure."""
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.inotify_init1.argtypes = [ctypes.c_int]
+        libc.inotify_init1.restype = ctypes.c_int
+        libc.inotify_add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+        libc.inotify_add_watch.restype = ctypes.c_int
+        fd = int(libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC))
+    except (OSError, AttributeError, TypeError):
+        return False
+    if fd < 0:
+        return False
+    watcher = _Watcher(libc, fd, broadcast)
+    try:
+        attached = watcher.attach()
+    except OSError:
+        attached = False
+    if not attached:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        return False
+    threading.Thread(target=watcher.run, name="quill-watch", daemon=True).start()
+    return True
+
+
+class _Client:
+    """One daemon connection: a Queue plus a writer thread for ordered output."""
+
+    def __init__(self, conn: socket.socket) -> None:
+        self.conn = conn
+        self.events: queue.Queue = queue.Queue()
+        self.send_lock = threading.Lock()
+        self.writer = threading.Thread(
+            target=self._write_loop, name="quill-send", daemon=True
+        )
+
+    def start(self) -> None:
+        self.writer.start()
+
+    def send(self, payload: dict) -> None:
+        self.events.put(payload)
+
+    def close_after_flush(self) -> None:
+        self.events.put(None)
+        self.writer.join(timeout=2.0)
+
+    def _write_loop(self) -> None:
+        while True:
+            payload = self.events.get()
+            if payload is None:
+                return
+            data = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+            with self.send_lock:
+                try:
+                    self.conn.sendall(data)
+                except OSError:
+                    return
+
+
+def serve(socket_path: Path, watch: bool = True, idle: float = 0.0) -> None:
+    """Serve commands on `socket_path` until shutdown or idle exit."""
+    global INDEX_TRUSTED
+
+    # The watcher indexes files, so under E2E this must never point at the
+    # user's library — a QML harness that forgot to set the data root would
+    # otherwise quietly migrate and rewrite the real index.
+    if (
+        os.environ.get("QUILL_E2E") == "1"
+        and os.environ.get("QUILL_E2E_ALLOW_REAL") != "1"
+        and ROOT == real_data_root()
+    ):
+        raise StoreError(
+            "QUILL_E2E=1 refuses to serve the real Quill data root; "
+            "point QUILL_DATA_DIR at a clone"
+        )
+
+    ensure_store()
+    socket_path = Path(socket_path)
+    if socket_path.exists():
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.settimeout(1.0)
+            probe.connect(str(socket_path))
+        except OSError:
+            with contextlib.suppress(OSError):
+                socket_path.unlink()
+        else:
+            raise StoreError(f"quill daemon already running on {socket_path}")
+        finally:
+            probe.close()
+
+    socket_path.parent.mkdir(parents=True, exist_ok=True)
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    stop = threading.Event()
+    clients: list[_Client] = []
+    clients_lock = threading.Lock()
+    threads: set[threading.Thread] = set()
+    last_empty = [time.monotonic()]
+
+    def broadcast(event: dict) -> None:
+        with clients_lock:
+            targets = list(clients)
+        for client in targets:
+            client.send(event)
+
+    def handle(payload):
+        if not isinstance(payload, dict):
+            return {"ok": False, "error": "request must be a JSON object"}
+        reply: dict = {}
+        if "id" in payload:
+            reply["id"] = payload["id"]
+        op = payload.get("op")
+        if op is not None:
+            if op == "ping":
+                reply["ok"] = True
+                reply["result"] = {
+                    "pid": os.getpid(),
+                    "dataRoot": str(ROOT),
+                    "notes": _index_note_count(),
+                    "watcher": bool(INDEX_TRUSTED),
+                    "version": SCHEMA_VERSION,
+                }
+                return reply
+            if op == "shutdown":
+                reply["ok"] = True
+                reply["result"] = {"stopped": True}
+                stop.set()
+                return reply
+            reply["ok"] = False
+            reply["error"] = f"unknown op: {op}"
+            return reply
+        raw_args = payload.get("args")
+        if not isinstance(raw_args, list) or not all(
+            isinstance(value, str) for value in raw_args
+        ):
+            reply["ok"] = False
+            reply["error"] = "args must be a list of strings"
+            return reply
+        if raw_args and raw_args[0] == "__serve":
+            reply["ok"] = False
+            reply["error"] = "cannot serve __serve from an existing daemon"
+            return reply
+        raw_stdin = payload.get("stdin")
+        if raw_stdin is None:
+            stdin_payload = b""
+        elif isinstance(raw_stdin, str):
+            stdin_payload = raw_stdin.encode("utf-8")
+        else:
+            reply["ok"] = False
+            reply["error"] = "stdin must be a string"
+            return reply
+        try:
+            code, out, err = run_command(raw_args, stdin_payload)
+        except SystemExit as error:
+            reply["ok"] = False
+            reply["error"] = f"invalid arguments (exit {error.code})"
+            return reply
+        except BaseException as error:  # never let a traceback reach the wire
+            reply["ok"] = False
+            reply["error"] = f"{type(error).__name__}: {error}"
+            return reply
+        if code == 0:
+            try:
+                reply["result"] = json.loads(out)
+            except json.JSONDecodeError:
+                reply["ok"] = False
+                reply["error"] = "command produced invalid JSON"
+            else:
+                reply["ok"] = True
+            return reply
+        message = err.strip()
+        try:
+            parsed = json.loads(err)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict) and isinstance(parsed.get("error"), str):
+            message = parsed["error"]
+        reply["ok"] = False
+        reply["error"] = message
+        return reply
+
+    def client_thread(client: _Client) -> None:
+        try:
+            client.start()
+            buffer = b""
+            while not stop.is_set():
+                try:
+                    chunk = client.conn.recv(65536)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                buffer += chunk
+                while b"\n" in buffer:
+                    line, _sep, buffer = buffer.partition(b"\n")
+                    if len(line) > MAX_REQUEST_BYTES:
+                        client.send({"ok": False, "error": "request too large"})
+                        continue
+                    try:
+                        payload = json.loads(line.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                        client.send({"ok": False, "error": f"invalid request: {error}"})
+                        continue
+                    client.send(handle(payload))
+                    if stop.is_set():
+                        break
+                if stop.is_set():
+                    break
+                if len(buffer) > MAX_REQUEST_BYTES:
+                    # No newline in sight: the stream cannot be resynchronised.
+                    client.send({"ok": False, "error": "request too large"})
+                    break
+        finally:
+            client.close_after_flush()
+            with contextlib.suppress(OSError):
+                client.conn.close()
+            with clients_lock:
+                if client in clients:
+                    clients.remove(client)
+                if not clients:
+                    last_empty[0] = time.monotonic()
+            threads.discard(threading.current_thread())
+
+    try:
+        server.bind(str(socket_path))
+        os.chmod(socket_path, 0o600)
+        server.listen(64)
+        server.settimeout(0.25)
+        if watch and start_watcher(broadcast):
+            with EXEC_LOCK:
+                with locked():
+                    conn = index_connect()
+                    try:
+                        sync_index(conn)
+                    finally:
+                        conn.close()
+            INDEX_TRUSTED = True
+        while not stop.is_set():
+            try:
+                conn, _address = server.accept()
+            except socket.timeout:
+                if idle > 0:
+                    with clients_lock:
+                        busy = bool(clients)
+                    if not busy and time.monotonic() - last_empty[0] >= idle:
+                        break
+                continue
+            except OSError:
+                break
+            conn.settimeout(0.25)
+            client = _Client(conn)
+            with clients_lock:
+                clients.append(client)
+            thread = threading.Thread(
+                target=client_thread, args=(client,), name="quill-client", daemon=True
+            )
+            with clients_lock:
+                threads.add(thread)
+            thread.start()
+    finally:
+        stop.set()
+        server.close()
+        with contextlib.suppress(OSError):
+            socket_path.unlink()
+        with clients_lock:
+            pending = list(threads)
+        for thread in pending:
+            thread.join(timeout=2.0)
+        INDEX_TRUSTED = False
+
+
+def command_serve(args) -> dict:
+    raw_socket = getattr(args, "socket", None)
+    path = (
+        Path(os.path.expanduser(str(raw_socket))).resolve()
+        if raw_socket
+        else daemon_socket_path()
+    )
+    serve(
+        path,
+        watch=not bool(getattr(args, "no_watch", False)),
+        idle=float(getattr(args, "idle", 0.0) or 0.0),
+    )
+    return {"stopped": True, "socket": str(path)}
+
+
+def run_command(
+    argv: list[str], stdin_payload: bytes | None = None
+) -> tuple[int, str, str]:
+    """Run one CLI invocation and return (exit_code, stdout_text, stderr_text).
+
+    The output is byte-for-byte what main() writes for the same argv: one JSON
+    line on stdout on success, one JSON error line on stderr on failure.
+    """
+    global SERVE_STDIN
+
+    # `__serve` owns the process for as long as the daemon runs, so it must
+    # not hold EXEC_LOCK for that lifetime: each served request takes it
+    # individually (with_index/sync also serialise against the watcher).
+    serving = bool(argv) and argv[0] == "__serve"
+    guard = contextlib.nullcontext() if serving else EXEC_LOCK
+    with guard:
+        previous = SERVE_STDIN
+        SERVE_STDIN = stdin_payload
+        try:
+            args = build_parser().parse_args(normalize_search_argv(argv))
+            enforce_e2e(args)
+            result = args.func(args)
+            return 0, json.dumps(result, ensure_ascii=False) + "\n", ""
+        except StoreError as error:
+            return 1, "", json.dumps({"error": str(error)}, ensure_ascii=False) + "\n"
+        except FileNotFoundError as error:
+            return 1, "", json.dumps({"error": str(error)}, ensure_ascii=False) + "\n"
+        except PermissionError as error:
+            return 1, "", json.dumps({"error": str(error)}, ensure_ascii=False) + "\n"
+        except sqlite3.Error as error:
+            return 1, "", json.dumps(
+                {"error": f"index error: {error}"}, ensure_ascii=False
+            ) + "\n"
+        except ValueError as error:
+            return 1, "", json.dumps({"error": str(error)}, ensure_ascii=False) + "\n"
+        except OSError as error:
+            return 1, "", json.dumps({"error": str(error)}, ensure_ascii=False) + "\n"
+        except Exception as error:  # keep the shell contract: JSON on stderr
+            return 1, "", json.dumps(
+                {"error": f"{type(error).__name__}: {error}"}, ensure_ascii=False
+            ) + "\n"
+        finally:
+            SERVE_STDIN = previous
+
+
+# --------------------------------------------------------------------------
 # entry point
 
 
@@ -2775,7 +4976,9 @@ MUTATING_COMMANDS = {
     "empty-trash",
     "pin",
     "tag-add",
+    "tag-remove",
     "tag-rename",
+    "tag-delete",
     "import-omanano",
     "index",
     "restore-version",
@@ -2794,6 +4997,10 @@ def command_is_mutating(args) -> bool:
         return str(getattr(args, "draft_action", "") or "") == "discard"
     if command == "attachment":
         return str(getattr(args, "attachment_command", "") or "") in {"save", "gc"}
+    if command == "searches":
+        return str(getattr(args, "searches_action", "") or "") in {"add", "remove"}
+    if command == "templates":
+        return str(getattr(args, "templates_action", "") or "") in {"save", "delete"}
     return command in MUTATING_COMMANDS
 
 
@@ -2813,6 +5020,50 @@ def enforce_e2e(args) -> None:
             "QUILL_E2E=1 refuses to modify the real Quill data root; "
             "point QUILL_DATA_DIR at a clone or set QUILL_E2E_ALLOW_REAL=1 deliberately"
         )
+
+
+def normalize_search_argv(argv: list[str]) -> list[str]:
+    """Let ``search`` accept a query that starts with ``-`` without ``--``.
+
+    argparse treats a leading dash as an option, but negation is part of the
+    search grammar. Known search options are kept before the query, then ``--``
+    separates the single positional query.
+    """
+    if not argv or argv[0] != "search":
+        return argv
+    options: list[str] = []
+    positionals: list[str] = []
+    index = 1
+    while index < len(argv):
+        argument = argv[index]
+        if argument == "--":
+            positionals.extend(argv[index + 1:])
+            break
+        if argument in {"-h", "--help"}:
+            options.append(argument)
+            index += 1
+            continue
+        if argument == "--limit":
+            options.extend(argv[index:index + 2])
+            index += 2
+            continue
+        if argument.startswith("--limit="):
+            options.append(argument)
+            index += 1
+            continue
+        positionals.append(argument)
+        index += 1
+    if any(argument.startswith("-") for argument in positionals):
+        return ["search"] + options + ["--"] + positionals
+    return ["search"] + options + positionals
+
+
+def add_bulk_id(parser: argparse.ArgumentParser) -> None:
+    """Add the repeatable ``--id`` used by every bulk-capable command."""
+    parser.add_argument(
+        "--id", dest="more_ids", action="append", default=[], metavar="ID",
+        help="additional note id (repeatable)",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2846,8 +5097,8 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--folder", default="")
     create.add_argument("--title", default="")
     create.add_argument("--content-stdin", action="store_true")
-    create.add_argument("--template", choices=list(TEMPLATES), default=None,
-                        help="start from a built-in template (ignores --title)")
+    create.add_argument("--template", default=None,
+                        help="start from a stored template id (ignores --title)")
     create.set_defaults(func=command_create)
 
     duplicate = sub.add_parser("duplicate")
@@ -2857,10 +5108,15 @@ def build_parser() -> argparse.ArgumentParser:
     rename = sub.add_parser("rename")
     rename.add_argument("id")
     rename.add_argument("--title", required=True)
+    rename.add_argument("--links", choices=("update", "skip"), default="update",
+                        help="rewrite inbound [[wiki links]] (default: update)")
+    rename.add_argument("--dry-run", action="store_true",
+                        help="report link rewrites without writing anything")
     rename.set_defaults(func=command_rename)
 
     move = sub.add_parser("move")
     move.add_argument("id")
+    add_bulk_id(move)
     move.add_argument("--folder", default="")
     move.set_defaults(func=command_move)
 
@@ -2872,6 +5128,12 @@ def build_parser() -> argparse.ArgumentParser:
     ):
         item = sub.add_parser(name)
         item.add_argument("id")
+        add_bulk_id(item)
+        if name == "pin":
+            item.add_argument(
+                "--state", choices=("on", "off", "toggle"), default="toggle",
+                help="force pinned on/off, or toggle the current state (default)",
+            )
         item.set_defaults(func=handler)
 
     sub.add_parser("empty-trash").set_defaults(func=command_empty_trash)
@@ -2904,25 +5166,78 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--limit", type=int, default=50)
     search.set_defaults(func=command_search)
 
+    titles = sub.add_parser("titles")
+    titles.add_argument("--limit", type=int, default=5000)
+    titles.set_defaults(func=command_titles)
+
+    searches = sub.add_parser("searches")
+    searches_sub = searches.add_subparsers(dest="searches_action", required=True)
+    searches_sub.add_parser("list").set_defaults(func=command_searches)
+    searches_add = searches_sub.add_parser("add")
+    searches_add.add_argument("query")
+    searches_add.add_argument("--label", default=None)
+    searches_add.set_defaults(func=command_searches)
+    searches_remove = searches_sub.add_parser("remove")
+    searches_remove.add_argument("query")
+    searches_remove.set_defaults(func=command_searches)
+
     sub.add_parser("tags").set_defaults(func=command_tags)
+
+    templates = sub.add_parser("templates")
+    templates_sub = templates.add_subparsers(dest="templates_action", required=True)
+    templates_sub.add_parser("list").set_defaults(func=command_templates)
+    templates_show = templates_sub.add_parser("show")
+    templates_show.add_argument("template_id")
+    templates_show.set_defaults(func=command_templates)
+    templates_save = templates_sub.add_parser("save")
+    templates_save.add_argument("template_id")
+    templates_save.add_argument("--name", default=None)
+    templates_save.add_argument("--description", default=None)
+    templates_save.add_argument("--icon", default=None)
+    templates_source = templates_save.add_mutually_exclusive_group()
+    templates_source.add_argument("--content-file", help="read the body from this file")
+    templates_source.add_argument("--stdin", dest="content_stdin", action="store_true",
+                                  help="read the body from stdin")
+    templates_save.set_defaults(func=command_templates)
+    templates_delete = templates_sub.add_parser("delete")
+    templates_delete.add_argument("template_id")
+    templates_delete.set_defaults(func=command_templates)
 
     tag_rename = sub.add_parser("tag-rename")
     tag_rename.add_argument("old")
     tag_rename.add_argument("new")
     tag_rename.set_defaults(func=command_tag_rename)
 
+    tag_delete = sub.add_parser("tag-delete")
+    tag_delete.add_argument("tag")
+    tag_delete.set_defaults(func=command_tag_delete)
+
     tag_add = sub.add_parser("tag-add")
     tag_add.add_argument("id")
+    add_bulk_id(tag_add)
     tag_add.add_argument("tags", nargs="+")
     tag_add.set_defaults(func=command_tag_add)
+
+    tag_remove = sub.add_parser("tag-remove")
+    tag_remove.add_argument("id")
+    add_bulk_id(tag_remove)
+    tag_remove.add_argument("tags", nargs="+")
+    tag_remove.set_defaults(func=command_tag_remove)
 
     backlinks = sub.add_parser("backlinks")
     backlinks.add_argument("id")
     backlinks.set_defaults(func=command_backlinks)
 
+    unresolved = sub.add_parser("unresolved")
+    unresolved.add_argument("--id", default=None)
+    unresolved.add_argument("--limit", type=int, default=500)
+    unresolved.set_defaults(func=command_unresolved)
+
     preview = sub.add_parser("preview")
-    preview.add_argument("id")
+    preview.add_argument("id", nargs="?")
     preview.add_argument("--trashed", action="store_true")
+    preview.add_argument("--content-file", default=None)
+    preview.add_argument("--stdin", action="store_true")
     preview.set_defaults(func=command_preview)
 
     sub.add_parser("import-omanano").set_defaults(func=command_import)
@@ -2945,38 +5260,24 @@ def build_parser() -> argparse.ArgumentParser:
     attachment_gc.set_defaults(func=command_attachment_gc)
 
     sub.add_parser("stats").set_defaults(func=command_stats)
+
+    serve_parser = sub.add_parser("__serve")
+    serve_parser.add_argument("--socket", default=None, help="socket path override")
+    serve_parser.add_argument("--no-watch", action="store_true", help="disable the inotify watcher")
+    serve_parser.add_argument("--idle", type=float, default=0.0, help="exit after N idle seconds (0 = never)")
+    serve_parser.set_defaults(func=command_serve)
     return parser
 
 
 def main() -> int:
-    try:
-        args = build_parser().parse_args()
-        enforce_e2e(args)
-        result = args.func(args)
-        sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
+    code, out, err = run_command(sys.argv[1:])
+    if out:
+        sys.stdout.write(out)
         sys.stdout.flush()
-        return 0
-    except StoreError as error:
-        sys.stderr.write(json.dumps({"error": str(error)}, ensure_ascii=False) + "\n")
-        return 1
-    except FileNotFoundError as error:
-        sys.stderr.write(json.dumps({"error": str(error)}, ensure_ascii=False) + "\n")
-        return 1
-    except PermissionError as error:
-        sys.stderr.write(json.dumps({"error": str(error)}, ensure_ascii=False) + "\n")
-        return 1
-    except sqlite3.Error as error:
-        sys.stderr.write(json.dumps({"error": f"index error: {error}"}, ensure_ascii=False) + "\n")
-        return 1
-    except ValueError as error:
-        sys.stderr.write(json.dumps({"error": str(error)}, ensure_ascii=False) + "\n")
-        return 1
-    except OSError as error:
-        sys.stderr.write(json.dumps({"error": str(error)}, ensure_ascii=False) + "\n")
-        return 1
-    except Exception as error:  # keep the shell contract: JSON on stderr
-        sys.stderr.write(json.dumps({"error": f"{type(error).__name__}: {error}"}, ensure_ascii=False) + "\n")
-        return 1
+    if err:
+        sys.stderr.write(err)
+        sys.stderr.flush()
+    return code
 
 
 if __name__ == "__main__":

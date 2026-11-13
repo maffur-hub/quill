@@ -8,6 +8,9 @@ import "TableEngine.js" as TableEngine
 import "MathSyntax.js" as MathSyntax
 import "MathText.js" as MathText
 import "MarkdownFormat.js" as MarkdownFormat
+import "PreviewBlocks.js" as PreviewBlocks
+import "CodeHighlight.js" as CodeHighlight
+import "MarkdownExtras.js" as MarkdownExtras
 
 // Rendered Markdown preview. Qt's GitHub-dialect Markdown renderer handles
 // the text; Quill rewrites wiki links and inline tags into quill:// links in
@@ -16,8 +19,11 @@ import "MarkdownFormat.js" as MarkdownFormat
 // Qt's Text.MarkdownText does not draw images or real tables, so the preview
 // is split into blocks: contiguous text lines go to a read-only TextEdit so
 // they can be selected and copied, image-only lines become Image blocks, and
-// GFM tables become interactive table blocks. Headings, wiki links, tags and
-// link activation still go through Qt's Markdown renderer.
+// GFM tables become interactive table blocks, and fenced code, definition
+// lists and the footnote section each get a block of their own so they render
+// without Qt's MarkdownText (which has no highlighting, <dl> or footnotes).
+// Headings, wiki links, tags and link activation still go through Qt's
+// Markdown renderer.
 //
 // Display maths ($$…$$ / \[…\]) becomes its own centred Image block.
 // A text block that contains inline maths, Quill formatting or links switches
@@ -80,7 +86,45 @@ Item {
     return false
   }
 
-  readonly property var blocks: buildBlocks(markdown)
+  readonly property var blockDeps: ({
+    image: ImageSizing,
+    table: TableEngine,
+    math: MathSyntax,
+    format: MarkdownFormat,
+    extras: MarkdownExtras
+  })
+  readonly property var blocks: PreviewBlocks.build(markdown, root.blockDeps)
+
+  // Footnote lines are parsed once per markdown change: the block builder
+  // hides the definitions, the inline converter needs the reference numbers,
+  // and both must agree on which lines are definitions. Parsing failures fall
+  // back to "no footnotes" rather than blanking the whole preview.
+  readonly property var noteLines: String(markdown || "").split("\n")
+  readonly property var footnoteState: {
+    try {
+      if (typeof MarkdownExtras.parseFootnotes !== "function") {
+        return { definitions: [], skip: [] }
+      }
+      var parsed = MarkdownExtras.parseFootnotes(root.noteLines)
+      return parsed || { definitions: [], skip: [] }
+    } catch (error) {
+      return { definitions: [], skip: [] }
+    }
+  }
+  readonly property var footnoteNumbers: {
+    try {
+      if (typeof MarkdownExtras.footnoteNumbers !== "function") return ({})
+      var counted = MarkdownExtras.footnoteNumbers(root.noteLines,
+        root.footnoteState.definitions, root.footnoteState.skip)
+      return counted && counted.numbers ? counted.numbers : ({})
+    } catch (error) {
+      return ({})
+    }
+  }
+
+  // The footnotes block tracks its own y so a #fn- link can scroll the pane
+  // to it; -1 means the note has no footnotes section.
+  property real footnotesY: -1
 
   // Live widths keyed by preview line while dragging or during the wheel
   // debounce. Cleared when a fresh markdown arrives from an autosave.
@@ -137,136 +181,91 @@ Item {
   // TextEdit paints anchors with its own default blue, so link-bearing blocks
   // go through the HTML converter and get the theme accent inline.
   function hasMarkdownLink(value) {
-    var text = String(value === undefined || value === null ? "" : value)
-    return /\[[^\]]*\]\([^)]*\)/.test(text) || /<a\s[^>]*href=/i.test(text)
+    return PreviewBlocks.hasMarkdownLink(value)
   }
 
   function previewHtml(value) {
+    // The options are what make RichText blocks agree with the block builder:
+    // fenced code inside a quote gets the same highlighter, and [^label] gets
+    // the number assigned from first reference in the note.
     var html = MathText.toHtml(String(value === undefined || value === null ? "" : value),
-      root.mathResolver, MathSyntax)
+      root.mathResolver, MathSyntax, {
+        highlight: CodeHighlight,
+        palette: root.codePalette,
+        footnotes: { numbers: root.footnoteNumbers }
+      })
     return html.replace(/<a href="/g, '<a style="color:' + String(Commons.Color.accent) + '" href="')
   }
 
-  // Split markdown into text / image / table / maths / task blocks. Display
-  // maths is found first so a $$ line is never mistaken for an image or a
-  // table. Tables are found by the shared engine, so pipe rows never leak into
-  // a MarkdownText block. Task lines are grouped while consecutive and are
-  // ignored inside fenced code blocks.
-  function buildBlocks(value) {
-    var lines = String(value === undefined || value === null ? "" : value).split("\n")
-    var fenced = markFences(lines)
-    var tables = TableEngine.findTables(lines)
-    var tableAt = {}
-    for (var t = 0; t < tables.length; t++) tableAt[tables[t].startLine] = tables[t]
-    var maths = MathSyntax.findDisplayBlocks(lines)
-    var mathAt = {}
-    for (var m = 0; m < maths.length; m++) mathAt[maths[m].startLine] = maths[m]
-
-    var result = []
-    var buffer = []
-    var tasks = []
-
-    function flushText() {
-      if (buffer.length === 0) return
-      var joined = buffer.join("\n")
-      buffer = []
-      if (joined.trim() === "") return
-      result.push({ kind: "text", text: joined })
+  // Qt RichText is unreliable with QML colour objects and with #aarrggbb:
+  // a theme colour can arrive with an alpha channel that the highlighter
+  // copies verbatim into an inline style. Flattening to #rrggbb keeps the
+  // palette opaque and lets the frame's own background show through.
+  function hexColour(colour) {
+    function channel(value) {
+      var amount = Number(value)
+      if (!isFinite(amount)) amount = 0
+      var byte = Math.round(Math.max(0, Math.min(1, amount)) * 255)
+      var hex = byte.toString(16)
+      return hex.length === 1 ? "0" + hex : hex
     }
-
-    function flushTasks() {
-      if (tasks.length === 0) return
-      result.push({ kind: "tasks", items: tasks })
-      tasks = []
-    }
-
-    var i = 0
-    while (i < lines.length) {
-      var math = mathAt[i]
-      if (math) {
-        flushText()
-        flushTasks()
-        result.push({
-          kind: "math",
-          tex: math.tex,
-          startLine: math.startLine,
-          endLine: math.endLine
-        })
-        i = math.endLine + 1
-        continue
-      }
-      var table = tableAt[i]
-      if (table) {
-        flushText()
-        flushTasks()
-        result.push({
-          kind: "table",
-          table: table,
-          startLine: table.startLine,
-          endLine: table.endLine
-        })
-        i = table.endLine + 1
-        continue
-      }
-      // Fenced lines stay literal: an image-looking line inside ``` is code,
-      // not an image block. Tables and display maths already skip fences via
-      // their finders.
-      var image = fenced[i] ? null : ImageSizing.splitLine(lines[i])
-      if (image) {
-        flushText()
-        flushTasks()
-        result.push({
-          kind: "image",
-          source: image.source,
-          alt: image.alt,
-          size: image,
-          line: i
-        })
-        i += 1
-        continue
-      }
-      var task = fenced[i] ? null : MarkdownFormat.parseTaskLine(lines[i])
-      if (task) {
-        flushText()
-        tasks.push({
-          checked: task.checked,
-          content: task.content,
-          indent: task.indent,
-          line: i
-        })
-        i += 1
-        continue
-      }
-      flushTasks()
-      buffer.push(lines[i])
-      i += 1
-    }
-    flushText()
-    flushTasks()
-    return result
+    return "#" + channel(colour.r) + channel(colour.g) + channel(colour.b)
   }
 
-  // Mark every line that belongs to a fenced code block, including the
-  // opening and closing fences. Tilde and backtick fences only close against a
-  // fence of the same character and at least the same length.
-  function markFences(lines) {
-    var mask = []
-    var fence = ""
-    for (var i = 0; i < lines.length; i++) {
-      var trimmed = String(lines[i] === undefined ? "" : lines[i]).replace(/^[ \t]+/, "")
-      var match = /^(`{3,}|~{3,})/.exec(trimmed)
-      if (fence === "") {
-        mask[i] = !!match
-        if (match) fence = match[1]
-        continue
-      }
-      mask[i] = true
-      if (match && match[1].charAt(0) === fence.charAt(0)
-          && match[1].length >= fence.length) {
-        fence = ""
-      }
+  // Code colours are derived from the theme rather than hard-coded, so a
+  // light or dark theme both keep contrast. Blending toward the background
+  // dims a full accent/foreground down the way comments and punctuation
+  // should read, without needing a second theme colour for every class.
+  function blendColour(colour, amount) {
+    var mix = Math.max(0, Math.min(1, Number(amount)))
+    if (!isFinite(mix)) mix = 0
+    var background = Commons.Color.background
+    return root.hexColour(Qt.rgba(
+      colour.r + (background.r - colour.r) * mix,
+      colour.g + (background.g - colour.g) * mix,
+      colour.b + (background.b - colour.b) * mix,
+      1))
+  }
+
+  readonly property var codePalette: ({
+    comment: root.blendColour(Commons.Color.foreground, 0.55),
+    keyword: root.hexColour(Commons.Color.accent),
+    string: root.hexColour(Commons.Color.urgent),
+    number: root.hexColour(Commons.Color.foreground),
+    literal: root.hexColour(Commons.Color.foreground),
+    function: root.hexColour(Commons.Color.foreground),
+    type: root.blendColour(Commons.Color.accent, 0.35),
+    tag: root.hexColour(Commons.Color.accent),
+    attribute: root.blendColour(Commons.Color.foreground, 0.2),
+    punctuation: root.blendColour(Commons.Color.foreground, 0.45),
+    // Qt RichText gives <kbd> no default look, so MathText draws a key cap.
+    // Deriving both colours from the theme keeps the chip legible on dark and
+    // light backgrounds; 0.86 leaves a faint but visible fill.
+    kbdBackground: root.blendColour(Commons.Color.foreground, 0.86),
+    kbdText: root.hexColour(Commons.Color.foreground)
+  })
+
+  // Footnote references are anchors inside a RichText block, which only knows
+  // the (block-relative) content position, so the pane scrolls to the block's
+  // y instead. Clamped so the section can end flush with the bottom edge.
+  function scrollToFootnotes() {
+    if (root.footnotesY < 0) return
+    var maxY = Math.max(0, flick.contentHeight - flick.height)
+    flick.contentY = Math.max(0, Math.min(maxY, root.footnotesY))
+  }
+
+  // Every selectable block routes link clicks here. A click can leave a word
+  // selected without emitting selectedTextChanged, so the source is cleared
+  // first; footnote anchors are internal jumps, everything else is a library
+  // link and must never reach the library as a bare "#fn-" URL.
+  function handleLink(link, source) {
+    if (source && typeof source.deselect === "function") source.deselect()
+    root.trackSelection(source, "")
+    if (String(link).indexOf("#fn-") === 0) {
+      root.scrollToFootnotes()
+      return
     }
-    return mask
+    root.linkActivated(link)
   }
 
   readonly property real tableRowHeight: Style.space(28)
@@ -387,6 +386,7 @@ Item {
     // render must never be copyable, and its highlight should disappear too.
     root.clearPreviewSelection()
     root.taskOverrides = ({})
+    root.footnotesY = -1
     if (root.dragging) return
     root.overrides = ({})
     root.pendingLine = -1
@@ -408,12 +408,43 @@ Item {
     return { ok: true, path: String(result.path || "") }
   }
 
+  // MathService scans text and maths blocks, but definition-list terms and
+  // footnote definitions are prose too. Flatten those into text-shaped entries
+  // once per block rebuild so prefetch (and its theme reset) sees every
+  // formula without teaching MathService about new block kinds.
+  function mathPrefetchBlocks() {
+    var output = []
+    for (var i = 0; i < blocks.length; i++) {
+      var block = blocks[i]
+      if (!block) continue
+      if (block.kind === "deflist" && block.block && block.block.groups) {
+        var groups = block.block.groups
+        for (var g = 0; g < groups.length; g++) {
+          var text = [String(groups[g].term || "")]
+          var definitions = groups[g].definitions || []
+          for (var d = 0; d < definitions.length; d++) {
+            text.push(String(definitions[d] || ""))
+          }
+          output.push({ kind: "text", text: text.join("\n") })
+        }
+      } else if (block.kind === "footnotes") {
+        var items = block.items || []
+        for (var n = 0; n < items.length; n++) {
+          output.push({ kind: "text", text: String(items[n].text || "") })
+        }
+      } else {
+        output.push(block)
+      }
+    }
+    return output
+  }
+
   MathService {
     id: mathService
   }
 
-  onBlocksChanged: mathService.prefetch(blocks)
-  Component.onCompleted: mathService.prefetch(blocks)
+  onBlocksChanged: mathService.prefetch(root.mathPrefetchBlocks())
+  Component.onCompleted: mathService.prefetch(root.mathPrefetchBlocks())
 
   Flickable {
     id: flick
@@ -443,13 +474,28 @@ Item {
           height: blockItem.isTable ? tableFrame.height
             : blockItem.isImage ? imageFrame.height
             : blockItem.isMath ? mathFrame.height
-            : blockItem.isTasks ? tasksColumn.implicitHeight : textBlock.implicitHeight
+            : blockItem.isTasks ? tasksColumn.implicitHeight
+            : blockItem.isCode ? codeFrame.height
+            : blockItem.isDeflist ? deflistColumn.implicitHeight
+            : blockItem.isFootnotes ? footnotesColumn.implicitHeight
+            : textBlock.implicitHeight
 
           readonly property bool isImage: modelData.kind === "image"
           readonly property bool isTable: modelData.kind === "table"
           readonly property bool isMath: modelData.kind === "math"
           readonly property bool isTasks: modelData.kind === "tasks"
+          readonly property bool isCode: modelData.kind === "code"
+          readonly property bool isDeflist: modelData.kind === "deflist"
+          readonly property bool isFootnotes: modelData.kind === "footnotes"
           readonly property bool isText: !isImage && !isTable && !isMath && !isTasks
+            && !isCode && !isDeflist && !isFootnotes
+
+          // The footnote section is the scroll target for #fn- links. Its y is
+          // in flick content coordinates, which is what contentY expects. The
+          // initial y is laid out by the Column without emitting yChanged, so
+          // completion also records it; later reflows still arrive here.
+          onYChanged: if (blockItem.isFootnotes) root.footnotesY = blockItem.y
+          Component.onCompleted: if (blockItem.isFootnotes) root.footnotesY = blockItem.y
           readonly property bool interactive: root.editable && isImage
           readonly property var size: isImage ? modelData.size : null
           readonly property bool hasSize: !!(blockItem.size && blockItem.size.hasSize)
@@ -497,10 +543,12 @@ Item {
 
           // Text blocks without maths keep MarkdownText; a block with inline
           // maths is rendered as RichText so QML can baseline its SVGs.
+          // Footnote references need RichText too, or [^note] prints literally.
           readonly property bool richText: isText
             && (MathSyntax.hasInlineMath(String(modelData.text || ""))
               || MathText.hasFormatting(String(modelData.text || ""))
-              || root.hasMarkdownLink(String(modelData.text || "")))
+              || root.hasMarkdownLink(String(modelData.text || ""))
+              || MarkdownExtras.hasFootnoteRefs(String(modelData.text || "")))
 
           readonly property var mathResult: {
             // revision is the dependency: results arriving redraw the block.
@@ -548,13 +596,7 @@ Item {
             selectionColor: Util.alpha(Commons.Color.accent, 0.42)
             selectedTextColor: Commons.Color.foreground
             onSelectedTextChanged: root.trackSelection(textBlock, textBlock.selectedText)
-            onLinkActivated: function(link) {
-              // A link click can leave a word selected without emitting
-              // selectedTextChanged; never let that become a stale copy source.
-              textBlock.deselect()
-              root.trackSelection(textBlock, "")
-              root.linkActivated(link)
-            }
+            onLinkActivated: function(link) { root.handleLink(link, textBlock) }
           }
 
           // ------------------------------------------------------- tasks
@@ -638,11 +680,7 @@ Item {
                   selectionColor: Util.alpha(Commons.Color.accent, 0.42)
                   selectedTextColor: Commons.Color.foreground
                   onSelectedTextChanged: root.trackSelection(taskLabel, taskLabel.selectedText)
-                  onLinkActivated: function(link) {
-                    taskLabel.deselect()
-                    root.trackSelection(taskLabel, "")
-                    root.linkActivated(link)
-                  }
+                  onLinkActivated: function(link) { root.handleLink(link, taskLabel) }
                 }
 
                 MouseArea {
@@ -665,6 +703,51 @@ Item {
                   }
                 }
               }
+            }
+          }
+
+          // ------------------------------------------------------- code
+          // Fenced code is never Markdown: it keeps its whitespace and gets
+          // the theme-derived highlighter colours, so it needs its own frame
+          // with a dim surface instead of a prose block.
+          Rectangle {
+            id: codeFrame
+            objectName: "previewCode"
+            visible: blockItem.isCode
+            width: blockItem.isCode ? blockItem.width : 0
+            height: blockItem.isCode ? codeBlock.implicitHeight + 2 : 0
+            radius: Style.cornerRadius
+            color: Util.alpha(Commons.Color.foreground, 0.035)
+            border.width: 1
+            border.color: Util.alpha(Commons.Color.foreground, 0.10)
+            clip: true
+
+            TextEdit {
+              id: codeBlock
+              objectName: "previewCodeText"
+              x: 1
+              y: 1
+              width: Math.max(0, codeFrame.width - 2)
+              text: blockItem.isCode
+                ? "<pre style=\"margin:0\">" + CodeHighlight.toHtml(
+                    String(modelData.code || ""), String(modelData.language || ""),
+                    root.codePalette) + "</pre>"
+                : ""
+              textFormat: TextEdit.RichText
+              wrapMode: TextEdit.Wrap
+              color: Commons.Color.foreground
+              font.family: Style.font.family
+              font.pixelSize: Style.font.bodySmall
+              textMargin: Style.space(8)
+              readOnly: true
+              selectByMouse: true
+              activeFocusOnPress: true
+              persistentSelection: false
+              cursorVisible: false
+              selectionColor: Util.alpha(Commons.Color.accent, 0.42)
+              selectedTextColor: Commons.Color.foreground
+              onSelectedTextChanged: root.trackSelection(codeBlock, codeBlock.selectedText)
+              onLinkActivated: function(link) { root.handleLink(link, codeBlock) }
             }
           }
 
@@ -1190,6 +1273,141 @@ Item {
                 font.family: Style.font.family
                 font.pixelSize: Style.font.caption
               }
+            }
+          }
+
+          // ------------------------------------------------------- deflist
+          // Qt's RichText engine flattens <dl>/<dt>/<dd> into one line, so
+          // Pandoc-style pairs are laid out here: a bold term and indented
+          // definitions, both selectable and link-aware.
+          Column {
+            id: deflistColumn
+            objectName: "previewDeflist"
+            visible: blockItem.isDeflist
+            width: blockItem.isDeflist ? blockItem.width : 0
+            spacing: Style.space(6)
+
+            Repeater {
+              model: blockItem.isDeflist ? modelData.block.groups : []
+
+              delegate: Item {
+                id: deflistGroup
+                width: deflistColumn.width
+                height: deflistGroupColumn.implicitHeight
+
+                // A restrained rule ties a term to its definitions without
+                // competing with the text; the 16px indent carries the
+                // hierarchy on its own if a theme draws it too softly.
+                Rectangle {
+                  x: Style.space(6)
+                  y: 0
+                  width: 1
+                  height: deflistGroup.height
+                  color: Util.alpha(Commons.Color.foreground, 0.16)
+                }
+
+                Column {
+                  id: deflistGroupColumn
+                  x: Style.space(12)
+                  width: Math.max(0, deflistGroup.width - Style.space(12))
+                  spacing: Style.space(2)
+
+                  TextEdit {
+                    id: deflistTerm
+                    objectName: "previewDeflistTerm"
+                    width: deflistGroupColumn.width
+                    text: root.previewHtml(String(modelData.term || ""))
+                    textFormat: TextEdit.RichText
+                    wrapMode: TextEdit.Wrap
+                    color: Commons.Color.foreground
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.body
+                    font.bold: true
+                    textMargin: 0
+                    readOnly: true
+                    selectByMouse: true
+                    activeFocusOnPress: true
+                    persistentSelection: false
+                    cursorVisible: false
+                    selectionColor: Util.alpha(Commons.Color.accent, 0.42)
+                    selectedTextColor: Commons.Color.foreground
+                    onSelectedTextChanged: root.trackSelection(deflistTerm, deflistTerm.selectedText)
+                    onLinkActivated: function(link) { root.handleLink(link, deflistTerm) }
+                  }
+
+                  Repeater {
+                    model: modelData.definitions
+
+                    delegate: TextEdit {
+                      id: deflistText
+                      objectName: "previewDeflistText"
+                      x: Style.space(16)
+                      width: Math.max(0, deflistGroupColumn.width - Style.space(16))
+                      text: root.previewHtml(String(modelData || ""))
+                      textFormat: TextEdit.RichText
+                      wrapMode: TextEdit.Wrap
+                      color: Util.alpha(Commons.Color.foreground, 0.86)
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.body
+                      textMargin: 0
+                      readOnly: true
+                      selectByMouse: true
+                      activeFocusOnPress: true
+                      persistentSelection: false
+                      cursorVisible: false
+                      selectionColor: Util.alpha(Commons.Color.accent, 0.42)
+                      selectedTextColor: Commons.Color.foreground
+                      onSelectedTextChanged: root.trackSelection(deflistText, deflistText.selectedText)
+                      onLinkActivated: function(link) { root.handleLink(link, deflistText) }
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+          // ---------------------------------------------------- footnotes
+          // The section is one block at the end of the note, matching the
+          // source order the block builder keeps. Qt RichText's <hr> spacing
+          // is unreliable, so the boundary is a drawn hairline and the
+          // converter emits entries only.
+          Column {
+            id: footnotesColumn
+            objectName: "previewFootnotes"
+            visible: blockItem.isFootnotes
+            width: blockItem.isFootnotes ? blockItem.width : 0
+            spacing: Style.space(6)
+
+            Rectangle {
+              width: footnotesColumn.width
+              height: 1
+              color: Util.alpha(Commons.Color.foreground, 0.12)
+            }
+
+            TextEdit {
+              id: footnoteText
+              objectName: "previewFootnoteText"
+              width: footnotesColumn.width
+              text: blockItem.isFootnotes
+                ? MarkdownExtras.footnoteSectionHtml(modelData.items, function(value) {
+                    return root.previewHtml(String(value || ""))
+                  })
+                : ""
+              textFormat: TextEdit.RichText
+              wrapMode: TextEdit.Wrap
+              color: Util.alpha(Commons.Color.foreground, 0.72)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.bodySmall
+              textMargin: 0
+              readOnly: true
+              selectByMouse: true
+              activeFocusOnPress: true
+              persistentSelection: false
+              cursorVisible: false
+              selectionColor: Util.alpha(Commons.Color.accent, 0.42)
+              selectedTextColor: Commons.Color.foreground
+              onSelectedTextChanged: root.trackSelection(footnoteText, footnoteText.selectedText)
+              onLinkActivated: function(link) { root.handleLink(link, footnoteText) }
             }
           }
         }

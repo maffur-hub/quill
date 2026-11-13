@@ -77,7 +77,57 @@ function cleanUrl(value) {
   return url.trim()
 }
 
-var ALLOWED_TAG_RE = /<(\/?)(u|span|sup|sub)((?:\s+[^>]*)?)>/gi
+// Raw HTML that survives into RichText. Tags map to themselves except for
+// the pairs Qt renders differently: <del> is struck like <s>, <ins> is
+// underlined like <u>, <mark> borrows the same highlight as ==text==, and
+// <kbd> becomes a key-cap span because Qt gives the tag no default look.
+// Attributes are only accepted on <span> (colour/background/size); every
+// other allowed tag must be bare, which keeps event handlers out.
+var ALLOWED_TAG_RE = /<(\/?)(u|span|sup|sub|kbd|mark|b|i|s|code|var|samp|cite|dfn|del|ins|br)((?:\s+[^>]*)?)\s*\/?>/gi
+
+var SIMPLE_TAGS = {
+  u: true, sup: true, sub: true, kbd: true, mark: true, b: true, i: true,
+  s: true, code: true, var: true, samp: true, cite: true, dfn: true,
+  del: true, ins: true
+}
+
+var MARK_HTML = '<span style="background-color:#f5e663; color:#1f1f1f;">'
+
+// A <kbd> with no styling is indistinguishable from body text in Qt, so it
+// always becomes a generated span. The QML side supplies theme-aware values;
+// anything that is not a plain #rgb/#rrggbb colour falls back to this pair as
+// a unit, so a half-valid palette cannot produce unreadable contrast.
+var KBD_BACKGROUND = "#2a2d31"
+var KBD_TEXT = "#e6e6e6"
+
+function kbdColours(palette) {
+  var background = palette ? safeHex(palette.kbdBackground) : null
+  var text = palette ? safeHex(palette.kbdText) : null
+  if (background === null || text === null) {
+    return { background: KBD_BACKGROUND, text: KBD_TEXT }
+  }
+  return { background: background, text: text }
+}
+
+function openTag(name, palette) {
+  if (name === "mark") return MARK_HTML
+  if (name === "del") return "<s>"
+  if (name === "ins") return "<u>"
+  if (name === "kbd") {
+    var colours = kbdColours(palette)
+    return '<span style="background-color:' + colours.background + "; color:"
+      + colours.text + '">'
+  }
+  return "<" + name + ">"
+}
+
+function closeTag(name) {
+  if (name === "mark") return "</span>"
+  if (name === "kbd") return "</span>"
+  if (name === "del") return "</s>"
+  if (name === "ins") return "</u>"
+  return "</" + name + ">"
+}
 
 function safeHex(value) {
   var raw = textOf(value).trim()
@@ -182,9 +232,16 @@ function hasFormatting(value) {
   var text = textOf(value)
   if (/<\/?u>/i.test(text)) return true
   if (/<\/?(sup|sub)>/i.test(text)) return true
+  if (/<\/?(?:kbd|mark|b|i|s|code|var|samp|cite|dfn|del|ins|br)(?:\s[^>]*)?\/?>/i.test(text)) return true
   if (/==[^=\n]+==/.test(text)) return true
   if (/<span\s+style="[^"]*">/i.test(text)) return true
   if (/^\s{0,3}[-*+]\s+\[[ xX]\]\s+/m.test(text)) return true
+  // Footnote references need RichText as well: a MarkdownText block would
+  // print [^label] literally instead of linking it to the notes section.
+  if (/\[\^[^\]\s]+\]/.test(text)) return true
+  // Fenced code reaches this block only inside a blockquote (top-level fences
+  // become code blocks); route it here so the highlighter can colour it.
+  if (/^(?: {0,3}> ?)*[ \t]{0,3}(`{3,}|~{3,})/m.test(text)) return true
   // Qt's Text.MarkdownText paints single-underscore emphasis as underline,
   // unlike the editor underlay and every other Markdown renderer. Route those
   // blocks through this converter so _text_ is italic everywhere.
@@ -194,6 +251,25 @@ function hasFormatting(value) {
 
 function isFence(line) {
   return FENCE_RE.test(line)
+}
+
+// The info string names the language: ```js, ``` js title="x", ```{.python}
+// and ```js{1,3} all yield a grammar key the highlighter understands.
+function fenceLanguage(line) {
+  var source = textOf(line)
+  var match = FENCE_RE.exec(source)
+  if (!match) return ""
+  var info = source.slice(match.index + match[0].length).trim()
+  if (info === "") return ""
+  var first = info.charAt(0)
+  if (first === "{" || first === "[") {
+    var close = info.indexOf(first === "{" ? "}" : "]")
+    if (close > 0) info = info.slice(1, close)
+  }
+  var token = info.split(/[ \t]+/)[0]
+  token = token.replace(/[{\[][^}\]]*[}\]]$/, "")
+  token = token.replace(/^[.\[]/, "").replace(/[{}\],]+$/, "")
+  return token.toLowerCase()
 }
 
 function isBlank(line) {
@@ -250,7 +326,7 @@ function displayMath(tex, resolve) {
 
 // Inline conversion. Escapes raw text exactly once; generated tags and maths
 // images are inserted through placeholders so emphasis cannot corrupt them.
-function renderInline(value, resolve, syntax) {
+function renderInline(value, resolve, syntax, options) {
   var text = textOf(value)
   if (text === "") return ""
   var tokens = syntax ? syntax.scan(text) : [{ type: "text", text: text }]
@@ -287,25 +363,35 @@ function renderInline(value, resolve, syntax) {
       var closing = match[1] === "/"
       var name = match[2].toLowerCase()
       var attributes = match[3] || ""
-      if (!closing && (name === "u" || name === "sup" || name === "sub")
-        && attributes.trim() === "") {
-        stack.push({ name: name, start: match.index, end: match.index + match[0].length,
-          html: "<" + name + ">", valid: false })
+      // A self-closing slash (<br />) is not an attribute.
+      var bare = attributes.replace(/\/\s*$/, "").trim() === ""
+      if (closing) {
+        if (!bare) continue
+        if (stack.length > 0 && stack[stack.length - 1].name === name) {
+          var closed = stack.pop()
+          closed.valid = true
+          entries.push({ start: closed.start, end: closed.end, html: closed.html })
+          entries.push({ start: match.index, end: match.index + match[0].length,
+            html: closeTag(name) })
+        }
         continue
       }
-      if (!closing && name === "span") {
+      if (name === "br") {
+        // A void tag: no pair, no attributes, always the RichText <br>.
+        if (bare) entries.push({ start: match.index, end: match.index + match[0].length,
+          html: "<br>" })
+        continue
+      }
+      if (name === "span") {
         var style = safeSpanStyle(attributes)
         if (style === null) continue
         stack.push({ name: "span", start: match.index, end: match.index + match[0].length,
           html: '<span style="' + style + '">', valid: false })
         continue
       }
-      if (closing && stack.length > 0 && stack[stack.length - 1].name === name) {
-        var opened = stack.pop()
-        opened.valid = true
-        entries.push({ start: opened.start, end: opened.end, html: opened.html })
-        entries.push({ start: match.index, end: match.index + match[0].length,
-          html: "</" + name + ">" })
+      if (SIMPLE_TAGS[name] && bare) {
+        stack.push({ name: name, start: match.index, end: match.index + match[0].length,
+          html: openTag(name, options ? options.palette : null), valid: false })
       }
     }
     if (entries.length === 0) return text
@@ -350,9 +436,23 @@ function renderInline(value, resolve, syntax) {
     return slot(literal, literal)
   })
 
-  // Whitelist inline HTML. Only well-formed <u>...</u> and
-  // <span style="...">...</span> pairs survive (colour, background highlight
-  // and font size); every other tag stays literal text and is escaped below.
+  // Footnote references become links through slots, so the label's number
+  // comes from the block builder's first-reference numbering. A label with no
+  // definition is not a reference and stays literal; inline code has already
+  // been turned into a slot above, so refs inside backticks are untouched.
+  var numbers = options && options.footnotes ? options.footnotes.numbers : null
+  if (numbers) {
+    buffer = buffer.replace(/\[\^([^\]\s]+)\](?!:)/g, function(match, label) {
+      if (!Object.prototype.hasOwnProperty.call(numbers, label)) return match
+      var safe = escapeHtml(label)
+      return slot("<a href=\"#fn-" + safe + "\" name=\"fnref-" + safe
+        + "\"><sup>" + String(numbers[label]) + "</sup></a>", "")
+    })
+  }
+
+  // Whitelist inline HTML. Only well-formed pairs of the allowlisted tags
+  // survive; <span> additionally has to carry a safe colour/background/size
+  // style. Every other tag stays literal text and is escaped below.
   buffer = protectWhitelistTags(buffer)
 
   html = escapeHtml(buffer)
@@ -392,7 +492,7 @@ function renderInline(value, resolve, syntax) {
   return html
 }
 
-function renderBlocks(lines, resolve, syntax, depth) {
+function renderBlocks(lines, resolve, syntax, depth, options) {
   var output = []
   var i = 0
   var displays = syntax ? syntax.findDisplayBlocks(lines) : []
@@ -414,6 +514,7 @@ function renderBlocks(lines, resolve, syntax, depth) {
     }
 
     if (isFence(line)) {
+      var language = fenceLanguage(line)
       var fence = line.match(FENCE_RE)[1]
       var character = fence.charAt(0)
       var closing = new RegExp("^\\s{0,3}" + (character === "`" ? "`" : "~")
@@ -425,7 +526,12 @@ function renderBlocks(lines, resolve, syntax, depth) {
         code.push(lines[i])
         i += 1
       }
-      output.push("<pre>" + escapeHtml(code.join("\n")) + "</pre>")
+      var body = code.join("\n")
+      var highlight = options ? options.highlight : null
+      var rendered = highlight && typeof highlight.toHtml === "function"
+        ? textOf(highlight.toHtml(body, language, options ? options.palette : null))
+        : escapeHtml(body)
+      output.push("<pre style=\"margin-top:7px; margin-bottom:0\">" + rendered + "</pre>")
       continue
     }
 
@@ -433,7 +539,7 @@ function renderBlocks(lines, resolve, syntax, depth) {
     if (heading) {
       var level = heading[1].length
       output.push("<h" + level + ">"
-        + renderInline(heading[2], resolve, syntax)
+        + renderInline(heading[2], resolve, syntax, options)
         + "</h" + level + ">")
       i += 1
       continue
@@ -451,7 +557,7 @@ function renderBlocks(lines, resolve, syntax, depth) {
         quoted.push(lines[i].match(QUOTE_RE)[1])
         i += 1
       }
-      var inner = depth < 6 ? renderBlocks(quoted, resolve, syntax, depth + 1) : ""
+      var inner = depth < 6 ? renderBlocks(quoted, resolve, syntax, depth + 1, options) : ""
       output.push("<blockquote>" + inner + "</blockquote>")
       continue
     }
@@ -466,9 +572,9 @@ function renderBlocks(lines, resolve, syntax, depth) {
         var task = current[2].match(/^\[([ xX])\]\s?(.*)$/)
         if (task) {
           items.push("<li>" + (task[1].toLowerCase() === "x" ? "☑" : "☐") + " "
-            + renderInline(task[2], resolve, syntax) + "</li>")
+            + renderInline(task[2], resolve, syntax, options) + "</li>")
         } else {
-          items.push("<li>" + renderInline(current[2], resolve, syntax) + "</li>")
+          items.push("<li>" + renderInline(current[2], resolve, syntax, options) + "</li>")
         }
         i += 1
       }
@@ -486,7 +592,7 @@ function renderBlocks(lines, resolve, syntax, depth) {
       i += 1
       continue
     }
-    output.push("<p>" + renderInline(paragraph.join("\n"), resolve, syntax) + "</p>")
+    output.push("<p>" + renderInline(paragraph.join("\n"), resolve, syntax, options) + "</p>")
   }
 
   return withBlockSpacing(output)
@@ -494,11 +600,12 @@ function renderBlocks(lines, resolve, syntax, depth) {
 
 // resolve(tex, display) returns { ok: true, path: "/abs/file.svg" } or null.
 // While maths is pending the raw TeX is kept visible as escaped text.
-function toHtml(markdown, resolve) {
+// options (4th argument) carries { highlight, palette, footnotes: {numbers} }.
+function toHtml(markdown, resolve, syntaxArg, options) {
   var syntax = syntaxModule
   if (!syntax && resolve && resolve.syntax) syntax = resolve.syntax
-  if (!syntax && arguments.length > 2) syntax = arguments[2]
+  if (!syntax && arguments.length > 2) syntax = syntaxArg
   var source = textOf(markdown)
   if (source.trim() === "") return ""
-  return renderBlocks(source.split("\n"), resolve, syntax, 0)
+  return renderBlocks(source.split("\n"), resolve, syntax, 0, options)
 }

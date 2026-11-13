@@ -1,0 +1,405 @@
+#!/usr/bin/env node
+"use strict"
+
+// quill-export-pdf - render one Quill note as a standalone PDF.
+//
+//   quill-export-pdf --input <md> --output <pdf> --title <title>
+//                    [--note-dir <dir>] [--color <css-color>] [--font-px <n>]
+//                    [--page-size <css-page-size>] [--page-margin <css-length>]
+//                    [--chromium <path>] [--keep-html]
+//
+// The note is rendered by the sibling quill-export-html (self-contained HTML
+// with embedded CSS, images and SVG maths), a print stylesheet is injected, and
+// a headless Chromium-based browser prints the result. No runtime is needed
+// beyond Node and Chromium, both already used by the plugin.
+//
+// The browser is discovered from --chromium, then $QUILL_CHROMIUM, then the
+// usual executable names on PATH. The HTML and the browser profile live in a
+// temporary directory that is always removed, except when --keep-html succeeds
+// and reports the kept path.
+//
+// Success writes the PDF atomically and prints one JSON object:
+//   {"ok":true,"bytes":1234,"engine":"chromium","pageSize":"A4","htmlBytes":999}
+// Failure prints a message to stderr and exits 1 without touching the output
+// path and without leaving temporary files behind.
+
+const fs = require("fs")
+const path = require("path")
+const os = require("os")
+const { spawnSync } = require("child_process")
+
+const DEFAULT_TITLE = "Untitled"
+const DEFAULT_PAGE_SIZE = "A4"
+const DEFAULT_PAGE_MARGIN = "18mm"
+const BROWSER_NAMES = [
+  "chromium",
+  "chromium-browser",
+  "google-chrome-stable",
+  "google-chrome",
+  "brave",
+  "brave-browser",
+  "microsoft-edge-stable",
+  "microsoft-edge"
+]
+const PDF_MAGIC = "%PDF-"
+const MIN_PDF_BYTES = 512
+const MAX_OUTPUT_BYTES = 8 * 1024 * 1024
+const PRINT_TIMEOUT_MS = 120000
+
+// Chromium is chatty on stderr; keep stdout reserved for our single JSON object.
+for (const method of ["log", "info", "warn", "debug"]) {
+  console[method] = (...args) => process.stderr.write(args.join(" ") + "\n")
+}
+
+// ------------------------------------------------------------------ helpers
+
+function fail(message) {
+  const error = new Error(message)
+  error.isUsageError = true
+  throw error
+}
+
+function parseArguments(argv) {
+  const values = {}
+  for (let i = 0; i < argv.length; i++) {
+    const argument = argv[i]
+    if (!argument.startsWith("--")) fail("unexpected argument: " + argument)
+    let key = argument.slice(2)
+    let value
+    const equals = key.indexOf("=")
+    if (equals >= 0) {
+      value = key.slice(equals + 1)
+      key = key.slice(0, equals)
+    } else if (key === "keep-html") {
+      value = true
+    } else {
+      value = argv[++i]
+    }
+    if (value === undefined) fail("missing value for --" + key)
+    values[key] = value
+  }
+  return values
+}
+
+function stringOption(value) {
+  return String(value === undefined || value === null || value === true ? "" : value)
+}
+
+// Both values end up inside an @page rule, so they are restricted to the CSS
+// forms the dialog offers. Anything else could close the rule and inject CSS.
+function normalisePageSize(value) {
+  const size = stringOption(value).trim()
+  if (size === "") return DEFAULT_PAGE_SIZE
+  if (!/^[A-Za-z0-9 .\/-]{1,32}$/.test(size)) fail("invalid --page-size: " + size)
+  return size
+}
+
+function normalisePageMargin(value) {
+  const margin = stringOption(value).trim()
+  if (margin === "") return DEFAULT_PAGE_MARGIN
+  if (!/^[0-9.]+(mm|cm|in|pt|px|em|rem)$/.test(margin)) fail("invalid --page-margin: " + margin)
+  return margin
+}
+
+function isExecutable(file) {
+  try {
+    if (!fs.statSync(file).isFile()) return false
+    fs.accessSync(file, fs.constants.X_OK)
+    return true
+  } catch (error) {
+    return false
+  }
+}
+
+function browserOnPath() {
+  const directories = String(process.env.PATH || "").split(path.delimiter)
+  for (const directory of directories) {
+    if (directory === "") continue
+    for (const name of BROWSER_NAMES) {
+      const candidate = path.join(directory, name)
+      if (isExecutable(candidate)) return candidate
+    }
+  }
+  return ""
+}
+
+// An explicitly requested browser wins even if it is broken: silently printing
+// with some other install would hide a misconfigured QUILL_CHROMIUM.
+function findBrowser(requested) {
+  const explicit = stringOption(requested).trim()
+  if (explicit !== "") {
+    if (!isExecutable(explicit)) fail("browser is not executable: " + explicit)
+    return explicit
+  }
+  const configured = String(process.env.QUILL_CHROMIUM || "").trim()
+  if (configured !== "") {
+    if (!isExecutable(configured)) fail("QUILL_CHROMIUM is not executable: " + configured)
+    return configured
+  }
+  const found = browserOnPath()
+  if (found === "") {
+    fail("no Chromium-based browser found for PDF export; install chromium or set QUILL_CHROMIUM")
+  }
+  return found
+}
+
+function lastNonEmptyLine(text) {
+  const lines = String(text || "").split("\n")
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim()
+    if (line !== "") return line
+  }
+  return ""
+}
+
+// -------------------------------------------------------------- html renderer
+
+function renderHtml(input, htmlPath, title, options) {
+  const script = path.join(__dirname, "quill-export-html")
+  const args = [script, "--input", input, "--output", htmlPath, "--title", title]
+  for (const [flag, key] of [
+    ["--note-dir", "note-dir"],
+    ["--color", "color"],
+    ["--font-px", "font-px"]
+  ]) {
+    const value = stringOption(options[key])
+    if (value !== "") args.push(flag, value)
+  }
+
+  const result = spawnSync(process.execPath, args, {
+    encoding: "utf8",
+    timeout: PRINT_TIMEOUT_MS,
+    killSignal: "SIGKILL",
+    maxBuffer: MAX_OUTPUT_BYTES
+  })
+  if (result.error) fail("cannot run the HTML renderer: " + result.error.message)
+
+  let summary = null
+  if (result.status === 0) {
+    const stdout = lastNonEmptyLine(result.stdout)
+    if (stdout !== "") {
+      try {
+        summary = JSON.parse(stdout)
+      } catch (error) {
+        summary = null
+      }
+    }
+  }
+  if (result.status !== 0 || !summary || summary.ok !== true) {
+    // The renderer already prefixes its own messages; report just one prefix.
+    const detail = lastNonEmptyLine(result.stderr)
+      .replace(/^quill-export-html:\s*/, "")
+    fail(detail !== "" ? detail : "the HTML renderer failed (exit " + result.status + ")")
+  }
+  return summary
+}
+
+function printStylesheet(pageSize, pageMargin) {
+  return "@page { size: " + pageSize + "; margin: " + pageMargin + "; }\n"
+    + "@media print {\n"
+    + "  html, body { background: #fff; }\n"
+    + "  pre { white-space: pre-wrap; overflow: visible; word-break: break-word; }\n"
+    + "  pre, blockquote, .math-display, img, svg { break-inside: avoid; }\n"
+    + "  h1, h2, h3, h4, h5, h6 { break-after: avoid; }\n"
+    + "  table { display: table; overflow: visible; }\n"
+    + "  a { color: inherit; }\n"
+    + "}\n"
+}
+
+function injectPrintCss(html, pageSize, pageMargin) {
+  const head = /<\/head\s*>/i.exec(html)
+  if (!head) fail("the HTML renderer produced no <head>")
+  return html.slice(0, head.index)
+    + "<style>\n" + printStylesheet(pageSize, pageMargin) + "</style>\n"
+    + html.slice(head.index)
+}
+
+// -------------------------------------------------------------------- browser
+
+function fileUrl(file) {
+  return "file://" + encodeURI(file).replace(/[?#]/g, function(character) {
+    return "%" + character.charCodeAt(0).toString(16).toUpperCase()
+  })
+}
+
+function runBrowser(browser, htmlPath, pdfPath, profile) {
+  const args = [
+    "--headless",
+    "--disable-gpu",
+    "--no-pdf-header-footer",
+    "--disable-extensions",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--user-data-dir=" + profile,
+    "--print-to-pdf=" + pdfPath,
+    fileUrl(htmlPath)
+  ]
+  return spawnSync(browser, args, {
+    timeout: PRINT_TIMEOUT_MS,
+    killSignal: "SIGKILL",
+    stdio: ["ignore", "pipe", "pipe"],
+    maxBuffer: MAX_OUTPUT_BYTES
+  })
+}
+
+function browserDetail(result) {
+  if (result.error) {
+    if (result.error.code === "ETIMEDOUT") {
+      return "the browser did not finish within " + Math.round(PRINT_TIMEOUT_MS / 1000) + " seconds"
+    }
+    return "cannot run the browser: " + result.error.message
+  }
+  const detail = lastNonEmptyLine(String(result.stderr || ""))
+    .replace(/^quill-export-pdf:\s*/, "")
+  if (detail !== "") return detail
+  if (result.signal) return "the browser was killed by " + result.signal
+  return "the browser exited with status " + result.status
+}
+
+function validatePdf(file) {
+  let stat
+  try {
+    stat = fs.statSync(file)
+  } catch (error) {
+    return "the browser wrote no PDF"
+  }
+  if (!stat.isFile()) return "the browser wrote no PDF"
+  if (stat.size < MIN_PDF_BYTES) {
+    return "the browser wrote an incomplete PDF (" + stat.size + " bytes)"
+  }
+  let handle
+  try {
+    handle = fs.openSync(file, "r")
+    const header = Buffer.alloc(PDF_MAGIC.length)
+    const read = fs.readSync(handle, header, 0, PDF_MAGIC.length, 0)
+    if (read < PDF_MAGIC.length || header.toString("latin1") !== PDF_MAGIC) {
+      return "the browser wrote a file that is not a PDF"
+    }
+  } catch (error) {
+    return "cannot read the printed PDF"
+  } finally {
+    if (handle !== undefined) {
+      try { fs.closeSync(handle) } catch (error) { /* already closed */ }
+    }
+  }
+  return ""
+}
+
+// rename(2) is atomic only within one filesystem; the browser's temporary
+// directory may live on another one, so fall back to a staged copy.
+function moveFile(from, to) {
+  try {
+    fs.renameSync(from, to)
+  } catch (error) {
+    if (!error || error.code !== "EXDEV") throw error
+    fs.copyFileSync(from, to)
+    try { fs.unlinkSync(from) } catch (cleanupError) { /* already gone */ }
+  }
+}
+
+// ----------------------------------------------------------------------- main
+
+function main() {
+  let options
+  try {
+    options = parseArguments(process.argv.slice(2))
+  } catch (error) {
+    process.stderr.write("quill-export-pdf: " + error.message + "\n")
+    process.exitCode = 1
+    return
+  }
+
+  const keepHtml = options["keep-html"] === true
+  let temporary = ""
+  let staging = ""
+  let succeeded = false
+
+  try {
+    const input = stringOption(options.input)
+    const output = stringOption(options.output)
+    const title = stringOption(options.title) === "" ? DEFAULT_TITLE : stringOption(options.title)
+
+    if (input === "") fail("--input is required")
+    if (output === "") fail("--output is required")
+
+    let inputStat
+    try {
+      inputStat = fs.statSync(input)
+      fs.accessSync(input, fs.constants.R_OK)
+    } catch (error) {
+      fail("cannot read input: " + input)
+    }
+    if (!inputStat.isFile()) fail("input is not a file: " + input)
+
+    const resolvedOutput = path.resolve(output)
+    const outputDirectory = path.dirname(resolvedOutput)
+    let directoryStat
+    try {
+      directoryStat = fs.statSync(outputDirectory)
+    } catch (error) {
+      fail("output directory does not exist: " + outputDirectory)
+    }
+    if (!directoryStat.isDirectory()) fail("output directory is not a directory: " + outputDirectory)
+    try {
+      const outputStat = fs.statSync(resolvedOutput)
+      if (outputStat.isDirectory()) fail("output path is a directory: " + output)
+    } catch (error) {
+      if (error.isUsageError) throw error
+      // A missing output file is the normal case.
+    }
+
+    const pageSize = normalisePageSize(options["page-size"])
+    const pageMargin = normalisePageMargin(options["page-margin"])
+    const browser = findBrowser(options.chromium)
+
+    temporary = fs.mkdtempSync(path.join(os.tmpdir(), "quill-pdf-"))
+    const htmlPath = path.join(temporary, "note.html")
+    const pdfPath = path.join(temporary, "out.pdf")
+    const profile = path.join(temporary, "profile")
+
+    renderHtml(input, htmlPath, title, options)
+
+    const html = fs.readFileSync(htmlPath, "utf8")
+    const printable = injectPrintCss(html, pageSize, pageMargin)
+    fs.writeFileSync(htmlPath, printable, "utf8")
+
+    const result = runBrowser(browser, htmlPath, pdfPath, profile)
+    const invalid = validatePdf(pdfPath)
+    if (invalid !== "") fail(invalid + ": " + browserDetail(result))
+
+    const bytes = fs.statSync(pdfPath).size
+    // Stage next to the destination, then rename over it: a crash or a browser
+    // failure can never leave a truncated PDF at the chosen path.
+    staging = path.join(outputDirectory,
+      "." + path.basename(resolvedOutput) + ".pdf-tmp-" + process.pid)
+    moveFile(pdfPath, staging)
+    fs.renameSync(staging, resolvedOutput)
+    staging = ""
+    succeeded = true
+
+    const payload = {
+      ok: true,
+      bytes: bytes,
+      engine: path.basename(browser),
+      pageSize: pageSize,
+      htmlBytes: Buffer.byteLength(printable, "utf8")
+    }
+    if (keepHtml) payload.htmlPath = htmlPath
+    process.stdout.write(JSON.stringify(payload) + "\n")
+  } catch (error) {
+    const message = error && error.message ? error.message : String(error)
+    process.stderr.write("quill-export-pdf: " + message + "\n")
+    process.exitCode = 1
+  } finally {
+    if (staging !== "") {
+      try { fs.unlinkSync(staging) } catch (cleanupError) { /* already gone */ }
+    }
+    // A kept HTML file is only useful when the run succeeded and its path was
+    // reported; failed runs always clean up after themselves.
+    if (temporary !== "" && !(keepHtml && succeeded)) {
+      try { fs.rmSync(temporary, { recursive: true, force: true }) } catch (cleanupError) { /* best effort */ }
+    }
+  }
+}
+
+main()

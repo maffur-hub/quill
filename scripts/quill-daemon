@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+"""Bridge between a caller's stdio and a long-lived quill-store daemon.
+
+``scripts/quill-store`` stays the source of truth. This script loads it as a
+module (import-safe: only ``main()`` is guarded) so socket paths and protocol
+constants can never drift.
+
+Modes:
+    quill-daemon                 long-lived: ensure a server, then bridge stdio
+    quill-daemon --status        ping the daemon; exit 0 when running, 1 when not
+    quill-daemon --stop          ask the daemon to stop; exit 0 either way
+
+stdout carries only newline-delimited JSON: one line per response or event.
+Diagnostics go to stderr. The caller's environment (QUILL_DATA_DIR, QUILL_E2E)
+is inherited, so the bridge serves the same data root the caller would use.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import socket
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+STORE = ROOT / "scripts" / "quill-store"
+START_TIMEOUT = 8.0
+POLL_INTERVAL = 0.05
+LOG_LIMIT = 1024 * 1024
+CLOSE_GRACE = 1.0
+
+
+def load_store():
+    loader = importlib.machinery.SourceFileLoader("quill_store", str(STORE))
+    spec = importlib.util.spec_from_file_location("quill_store", str(STORE), loader=loader)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {STORE}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def socket_path(store, raw: str | None) -> Path:
+    if raw:
+        return Path(os.path.expanduser(raw)).resolve()
+    return store.daemon_socket_path()
+
+
+def connect(path: Path, timeout: float = 1.0) -> socket.socket:
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(timeout)
+    try:
+        client.connect(str(path))
+    except BaseException:
+        client.close()
+        raise
+    client.settimeout(None)
+    return client
+
+
+def read_json_line(client: socket.socket, state: dict) -> dict:
+    """Read one JSON line, keeping any bytes that arrived after the newline.
+
+    One packet can carry a reply and a broadcast back to back, so the tail must
+    survive into the next call instead of being dropped.
+    """
+    buffer = state.get("buffer", b"")
+    while b"\n" not in buffer:
+        chunk = client.recv(65536)
+        if not chunk:
+            raise RuntimeError("daemon closed the connection")
+        buffer += chunk
+    line, _sep, buffer = buffer.partition(b"\n")
+    state["buffer"] = buffer
+    value = json.loads(line.decode("utf-8"))
+    if not isinstance(value, dict):
+        raise RuntimeError("daemon replied with a non-object")
+    return value
+
+
+def call(client: socket.socket, payload: dict, state: dict | None = None) -> dict:
+    """Send one request and return the first reply that is not a broadcast."""
+    if state is None:
+        state = {}
+    client.sendall((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
+    while True:
+        reply = read_json_line(client, state)
+        if "event" in reply and "ok" not in reply:
+            continue
+        return reply
+
+
+def ensure_server(store, path: Path, watch: bool) -> None:
+    """Return once a daemon answers on `path`, spawning one if necessary."""
+    try:
+        probe = connect(path, timeout=0.5)
+    except OSError:
+        pass
+    else:
+        probe.close()
+        return
+
+    log_path = store.ROOT / ".daemon.log"
+    with contextlib.suppress(OSError):
+        if log_path.exists() and log_path.stat().st_size > LOG_LIMIT:
+            log_path.unlink()
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log = log_path.open("ab")
+    except OSError as error:
+        print(f"quill-daemon: cannot open {log_path}: {error}", file=sys.stderr)
+        log = None
+
+    command = [
+        sys.executable,
+        str(STORE),
+        "__serve",
+        "--socket",
+        str(path),
+        "--idle",
+        "120",
+    ]
+    if not watch:
+        command.append("--no-watch")
+    try:
+        subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=log if log is not None else subprocess.DEVNULL,
+            stderr=subprocess.STDOUT if log is not None else subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+            env=os.environ.copy(),
+        )
+    except OSError as error:
+        raise RuntimeError(f"cannot start the quill daemon: {error}") from error
+    finally:
+        if log is not None:
+            log.close()
+
+    deadline = time.monotonic() + START_TIMEOUT
+    last_error: OSError | None = None
+    while time.monotonic() < deadline:
+        try:
+            probe = connect(path, timeout=0.5)
+        except OSError as error:
+            last_error = error
+            time.sleep(POLL_INTERVAL)
+            continue
+        probe.close()
+        return
+    raise RuntimeError(
+        f"quill daemon did not start on {path} within {START_TIMEOUT:.0f}s"
+        + (f": {last_error}" if last_error else "")
+    )
+
+
+def bridge(store, path: Path, watch: bool) -> int:
+    ensure_server(store, path, watch)
+    client = connect(path)
+
+    def pump() -> None:
+        try:
+            reader = client.makefile("rb")
+            for line in reader:
+                sys.stdout.buffer.write(line)
+                sys.stdout.buffer.flush()
+        except (OSError, ValueError):
+            pass
+        finally:
+            # Match the caller-facing contract: EOF from the daemon means the
+            # bridge is gone, so the UI's onExited handler must fire.
+            os._exit(0)
+
+    threading.Thread(target=pump, name="quill-daemon-reader", daemon=True).start()
+
+    for raw in sys.stdin.buffer:
+        line = raw.rstrip(b"\n")
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            print(f"quill-daemon: invalid request: {error}", file=sys.stderr)
+            continue
+        if not isinstance(payload, dict) or not isinstance(payload.get("args"), list):
+            print("quill-daemon: request must be an object with an args list", file=sys.stderr)
+            continue
+        if not line.endswith(b"\n"):
+            line += b"\n"
+        try:
+            client.sendall(line)
+        except OSError as error:
+            print(f"quill-daemon: cannot reach the daemon: {error}", file=sys.stderr)
+            return 1
+
+    time.sleep(CLOSE_GRACE)
+    with contextlib.suppress(OSError):
+        client.shutdown(socket.SHUT_WR)
+    with contextlib.suppress(OSError):
+        client.close()
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Bridge to a quill-store daemon")
+    parser.add_argument("--status", action="store_true", help="ping the daemon")
+    parser.add_argument("--stop", action="store_true", help="ask the daemon to stop")
+    parser.add_argument("--socket", default=None, help="socket path override")
+    parser.add_argument("--no-watch", action="store_true", help="start without the watcher")
+    args = parser.parse_args()
+
+    store = load_store()
+    path = socket_path(store, args.socket)
+
+    if args.status:
+        try:
+            client = connect(path, timeout=1.0)
+        except OSError:
+            print(json.dumps({"running": False, "socket": str(path)}))
+            return 1
+        try:
+            reply = call(client, {"op": "ping"})
+        except (OSError, RuntimeError, json.JSONDecodeError) as error:
+            print(json.dumps({"running": False, "socket": str(path), "error": str(error)}))
+            return 1
+        finally:
+            with contextlib.suppress(OSError):
+                client.close()
+        result = reply.get("result") if reply.get("ok") else {}
+        if not isinstance(result, dict):
+            result = {}
+        print(json.dumps({"running": True, "socket": str(path), **result}, ensure_ascii=False))
+        return 0
+
+    if args.stop:
+        try:
+            client = connect(path, timeout=1.0)
+        except OSError:
+            print(json.dumps({"stopped": False, "socket": str(path)}))
+            return 0
+        try:
+            reply = call(client, {"op": "shutdown"})
+        except (OSError, RuntimeError, json.JSONDecodeError):
+            print(json.dumps({"stopped": False, "socket": str(path)}))
+            return 0
+        finally:
+            with contextlib.suppress(OSError):
+                client.close()
+        result = reply.get("result") if reply.get("ok") else None
+        if not isinstance(result, dict):
+            result = {"stopped": False}
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+
+    try:
+        return bridge(store, path, watch=not args.no_watch)
+    except (OSError, RuntimeError) as error:
+        print(f"quill-daemon: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,5 @@
+package main
+
+func total(values []int) int {
+    return len(values)
+}

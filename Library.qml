@@ -9,6 +9,7 @@ import "ImageSizing.js" as ImageSizing
 import "MarkdownFormat.js" as MarkdownFormat
 import "TableEngine.js" as TableEngine
 import "TagSuggest.js" as TagSuggest
+import "TagTree.js" as TagTree
 import "WritableGuard.js" as WritableGuard
 
 // Quill's library: three panes, a Markdown editor with live highlighting,
@@ -44,11 +45,38 @@ Item {
   // changes, not on editor keystrokes.
   property var noteTitleList: noteTitles()
 
+  // Quick-switcher title cache. `titles` is much lighter than `list`: just id,
+  // title, folder, modified and pinned for every live note. A cached index is
+  // reused for a minute; opening the switcher refreshes it in the background
+  // so a just-created note appears without a visible wait.
+  property var titleIndex: []
+  property bool titlesLoading: false
+  property double titlesLoadedAt: 0
+  // Sidebar saved searches, mirrored from `quill-store searches`. Only a
+  // mutation refreshes the list; opening the library never rewrites it.
+  property var savedSearches: []
+  // Note templates live on disk under <data>/templates, so this is only the
+  // menu's cache: adding a file through `templates save` makes it appear
+  // without editing QML.
+  property var templates: []
+  property var templateMenuItems: []
+
   property string category: "all"
   property string searchText: ""
   property var searchResults: []
   property bool searching: false
+  // `selectedId` is the active note: the one the editor shows. `selectedIds`
+  // is the multi-selection in selection order; its first entry is always the
+  // active note when the active note is part of the selection. `anchor` is the
+  // row Shift ranges grow from.
   property string selectedId: ""
+  property var selectedIds: []
+  property string selectionAnchor: ""
+  // The selection snapshot from before the first Shift extension. Keeping it
+  // separate is what lets a later Shift shrink the range again instead of
+  // unioning every row it ever touched.
+  property var selectionRangeBase: []
+  property bool selectionRangeActive: false
 
   property bool loadingList: true
   property bool loadingNote: false
@@ -82,16 +110,46 @@ Item {
   property bool modeChosen: false
   property var backlinks: []
   property bool backlinksOpen: false
+  // Broken note links in the selected note (`[[Missing note]]`). Grouped by
+  // target for display; the model keeps per-source counts.
+  property var unresolvedLinks: []
+  property bool unresolvedOpen: false
+  readonly property var unresolvedTargets: unresolvedTargetRows()
+  readonly property bool unresolvedShown: unresolvedLinks.length > 0 || unresolvedOpen
   property string previewMarkdown: ""
   // Preview lines start after the frontmatter block; add this to map a
   // preview line back to the note file line.
   property int previewLineOffset: 0
   property bool previewLoading: false
+  // Live buffer preview. A pause in typing writes the editor text to a temp
+  // file and asks the store to render that, so the pane keeps up without
+  // waiting for the 600 ms autosave. The saved-copy path below still runs
+  // after loads, saves and external changes.
+  property int previewSeq: 0
+  // The note and exact buffer text the pane currently shows. Both must match
+  // before a debounce is allowed to write and render again.
+  property string previewRenderedId: ""
+  property string previewRenderedText: ""
+  // The temp file the live preview owns, kept so it can be removed when the
+  // selection moves or the library goes away.
+  property string previewTempFile: ""
 
   property bool deleteArmed: false
   property string deleteArmId: ""
   property bool folderDeleteArmed: false
   property string folderDeletePath: ""
+  // The Undo affordance after a trash. A newer trash replaces the pending
+  // batch; the timer expiring simply drops it. Ids are trash-relative, exactly
+  // what `restore` takes.
+  property var undoTrashIds: []
+  property string undoLabel: ""
+  property int undoRemaining: 0
+  // Bulk tag prompt state. `bulkTagIds` is captured when the modal opens so a
+  // selection change behind it can never retarget the write.
+  property var bulkTagIds: []
+  property int bulkTagCount: 0
+  property string bulkTagMode: "add"
+  property string bulkTagError: ""
   property string pendingSelectId: ""
   property bool pendingFocusEditor: false
   property bool pendingCaretToEnd: false
@@ -99,10 +157,18 @@ Item {
   property var pendingNoteAction: null
   property string renameTargetId: ""
   property string renameNoteText: ""
+  // A rename whose dry run found links to rewrite. Holds {id, title, count}.
+  property var pendingRename: null
+  // Old title shown in the link-update prompt, captured before the rename.
+  property string renameLinksSourceTitle: ""
+  // Bumped whenever a rename starts so a stale dry-run response can never
+  // open the prompt for a note the user has already moved on from.
+  property int renameSeq: 0
   // The note the open tag-suggestion popup was built from. Apply must target
   // this id even if the selection moved underneath it.
   property string tagSuggestNoteId: ""
   property string deleteNoteTargetId: ""
+  property var pendingDeleteIds: []
   property string deleteNoteTargetTitle: ""
   property int saveSeq: 0
   // Last content written per note id. A save whose bytes equal this is a
@@ -134,15 +200,19 @@ Item {
   property string exportPendingTemp: ""
   property string exportPendingTitle: ""
   property string exportPendingNoteDir: ""
+  property string exportPendingFormat: ""
   property string exportCheckDest: ""
   property string exportCheckText: ""
   property string exportCheckFormat: ""
   readonly property string exportScriptPath: Quickshell.env("QUILL_EXPORT_SCRIPT")
     || String(Qt.resolvedUrl("scripts/quill-export-html")).replace(/^file:\/\//, "")
+  readonly property string exportPdfScriptPath: Quickshell.env("QUILL_EXPORT_PDF_SCRIPT")
+    || String(Qt.resolvedUrl("scripts/quill-export-pdf")).replace(/^file:\/\//, "")
   readonly property var exportPopupRef: exportPopup
 
   readonly property var visibleNotes: filteredNotes()
   readonly property var selectedNote: findAny(selectedId)
+  readonly property int selectedCount: selectionIds().length
   readonly property var folderOptions: buildFolderOptions()
   readonly property string categoryLabel: labelForCategory()
   readonly property int wordCount: countWords(editor.text)
@@ -171,6 +241,22 @@ Item {
   property bool busy: false
   property var activeJob: null
 
+  // A long-lived `quill-daemon` bridge turns each backend call into one JSON
+  // line instead of a fresh Python process. If it cannot start, every job
+  // falls back to spawning `storePath` exactly as before.
+  readonly property string daemonPath: {
+    if (root.storePath === "") return ""
+    var cut = root.storePath.lastIndexOf("/")
+    if (cut <= 0) return "quill-daemon"
+    return root.storePath.slice(0, cut) + "/quill-daemon"
+  }
+  property bool daemonReady: false
+  property bool daemonStarting: false
+  property bool daemonDisabled: false
+  property int daemonFailures: 0
+  property int daemonSeq: 0
+  property var pendingJob: null
+
   function enqueue(job) {
     if (!root.writesAllowed && WritableGuard.isMutatingArgs(job.args || [])) {
       var message = WritableGuard.refusalMessage()
@@ -185,6 +271,27 @@ Item {
 
   function pump() {
     if (root.busy || root.jobs.length === 0) return
+    if (root.daemonDisabled || root.daemonPath === "" || root.dataRoot === "") {
+      // An empty dataRoot would make the bridge fall back to the user's real
+      // library, so a harness that never set the property stays on the
+      // per-call path where it inherits QUILL_DATA_DIR from the environment.
+      root.pumpSpawned(); return
+    }
+    var job = root.jobs.shift()
+    root.activeJob = job
+    root.busy = true
+    job.daemonId = ++root.daemonSeq
+    if (root.daemonReady) {
+      root.daemonRequest(job)
+    } else {
+      root.pendingJob = job
+      root.startDaemon()
+    }
+  }
+
+  // The original per-call path: one backend process per job. Still the only
+  // path when the bridge is missing or has failed too often.
+  function pumpSpawned() {
     var job = root.jobs.shift()
     root.activeJob = job
     root.busy = true
@@ -193,6 +300,93 @@ Item {
     var command = [root.storePath].concat(job.args || [])
     process.command = command
     process.running = true
+  }
+
+  function daemonRequest(job) {
+    var payload = { "id": job.daemonId, "args": job.args || [], "stdin": job.stdin || "" }
+    try {
+      daemon.write(JSON.stringify(payload) + "\n")
+    } catch (error) {
+      // A failed write means the pipe is gone. Stop the bridge and let its
+      // exit path requeue this job; a bridge that was already stopped has no
+      // exit left to give, so restore the job here.
+      if (daemon.running) daemon.running = false
+      else root.handleDaemonExit(-1)
+    }
+  }
+
+  function startDaemon() {
+    if (root.daemonReady || root.daemonStarting) return
+    root.daemonStarting = true
+    daemon.environment = { "QUILL_DATA_DIR": root.dataRoot }
+    daemon.command = [root.daemonPath]
+    daemon.running = true
+  }
+
+  function handleDaemonLine(raw) {
+    var line = String(raw || "").trim()
+    if (line === "") return
+    var payload = null
+    try {
+      payload = JSON.parse(line)
+    } catch (error) {
+      return
+    }
+    if (!payload) return
+    // Any line proves the bridge is alive. Reset the failure count here rather
+    // than on start, so a daemon that starts and dies immediately cannot loop
+    // forever: three such sessions still disable the bridge.
+    root.daemonFailures = 0
+    if (payload.event) { root.handleDaemonEvent(payload); return }
+    var job = root.activeJob
+    // Stale or unknown ids belong to a job that already moved on. Ignore them
+    // rather than clearing the job that is running now.
+    if (!job || job.daemonId === undefined || Number(job.daemonId) !== Number(payload.id)) return
+    root.activeJob = null
+    root.busy = false
+    if (payload.ok) {
+      if (job.onSuccess) job.onSuccess(payload.result || {})
+    } else {
+      var message = root.parseError(payload.error)
+      if (!job.silent) root.statusText = message
+      if (job.onError) job.onError(message)
+    }
+    root.pump()
+  }
+
+  function handleDaemonExit(exitCode) {
+    root.daemonReady = false
+    root.daemonStarting = false
+    root.daemonFailures = root.daemonFailures + 1
+    if (root.daemonFailures > 2) {
+      root.daemonDisabled = true
+      root.pendingJob = null
+    }
+    var job = root.activeJob
+    if (job) {
+      root.activeJob = null
+      root.busy = false
+      root.pendingJob = null
+      // Rerun the exact same job, in order, through whichever path is left.
+      root.jobs.unshift(job)
+    }
+    root.pump()
+  }
+
+  function handleDaemonEvent(payload) {
+    var ids = Array.isArray(payload.ids) ? payload.ids : []
+    var removed = Array.isArray(payload.removed) ? payload.removed : []
+    var touched = ids.concat(removed)
+    if (touched.length === 0) return
+    // The open note is already covered by noteWatch/FileView; an event that
+    // only mentions it needs no index refresh.
+    var onlySelected = true
+    for (var i = 0; i < touched.length; i++) {
+      if (String(touched[i]) !== root.selectedId) { onlySelected = false; break }
+    }
+    if (onlySelected) return
+    if (!root.active || root.dirty || root.loadingNote || root.saveState === "Saving…") return
+    daemonEventTimer.restart()
   }
 
   function parseError(raw) {
@@ -269,6 +463,231 @@ Item {
     Qt.callLater(function() { root.ensureSelection() })
   }
 
+  // ------------------------------------------------------- quick switcher
+  // A title index is cheaper than a full list and already ordered pinned
+  // first, newest next. It is only a cache: selection still goes through the
+  // normal note list and store read.
+  function loadTitles(force) {
+    if (root.titlesLoading) return
+    if (!force && root.titlesLoadedAt > 0 && Date.now() - root.titlesLoadedAt < 60000) return
+    root.titlesLoading = true
+    enqueue({
+      // Match the `list` cap: picking a title beyond it would leave the note
+      // list unable to select the note the switcher chose.
+      args: ["titles", "--limit", "2000"],
+      silent: true,
+      onSuccess: function(result) {
+        root.titleIndex = Array.isArray(result.notes) ? result.notes : []
+        root.titlesLoadedAt = Date.now()
+        root.titlesLoading = false
+      },
+      onError: function(message) {
+        root.titlesLoading = false
+        root.statusText = message
+      }
+    })
+  }
+
+  function openQuickSwitcher() {
+    // Open at once with whatever is cached; a cold cache shows the switcher's
+    // loading state while the first title list arrives.
+    if (root.titleIndex.length === 0) root.loadTitles(true)
+    else if (Date.now() - root.titlesLoadedAt > 60000) root.loadTitles(false)
+    quickSwitcher.open()
+  }
+
+  function openNoteFromSwitcher(id, detached) {
+    var noteId = String(id || "")
+    if (noteId === "") return
+    flushSave()
+    // The note may sit outside the current filter or in Trash. Reset the view
+    // first so the normal selection machinery can find and show it.
+    if (category !== "all") {
+      selectCategory("all")
+    } else if (searchText !== "") {
+      searchText = ""
+      searchResults = []
+      searching = false
+      lastQuery = ""
+      if (noteList) noteList.clearSearch()
+    }
+    if (detached) {
+      detachNoteById(noteId)
+      return
+    }
+    pendingSelectId = noteId
+    selectNote(noteId)
+  }
+
+  // ------------------------------------------------------- saved searches
+  function loadSavedSearches() {
+    enqueue({
+      args: ["searches", "list"],
+      silent: true,
+      onSuccess: function(result) {
+        root.savedSearches = Array.isArray(result.searches) ? result.searches : []
+      },
+      // A store without saved searches should not interrupt the library; the
+      // sidebar simply stays empty.
+      onError: function() {}
+    })
+  }
+
+  // ------------------------------------------------------ tag management
+  // Rename and delete are global: the backend rewrites every live note and
+  // snapshots each one. The dialog only names the action, and its count comes
+  // from the same `tags` listing the sidebar draws.
+  function tagNoteCount(tag) {
+    var key = String(tag || "").toLowerCase()
+    for (var i = 0; i < root.tags.length; i++) {
+      if (String(root.tags[i].tag || "").toLowerCase() === key) {
+        return Number(root.tags[i].count || 0)
+      }
+    }
+    return 0
+  }
+
+  function openTagManager(tag, action) {
+    var name = String(tag || "")
+    if (name === "" || !tagManager) return
+    if (!root.writesAllowed) {
+      root.statusText = WritableGuard.refusalMessage()
+      return
+    }
+    var count = root.tagNoteCount(name)
+    if (String(action) === "delete") tagManager.openDelete(name, count)
+    else tagManager.openRename(name, count)
+  }
+
+  function applyTagAction(action, tag, next) {
+    var name = String(tag || "")
+    if (name === "") return
+    if (String(action) === "delete") {
+      flushSave()
+      enqueue({
+        args: ["tag-delete", name],
+        silent: true,
+        onSuccess: function(result) {
+          var updated = Number(result.updated || 0)
+          root.statusText = "Deleted #" + name + " from " + updated
+            + (updated === 1 ? " note" : " notes")
+          if (root.category === "tag:" + name) root.category = "all"
+          root.refreshAll(root.statusText)
+        },
+        onError: function(message) { root.statusText = message }
+      })
+      return
+    }
+    var target = String(next || "").replace(/^#+/, "").trim()
+    if (target === "" || target === name) return
+    flushSave()
+    enqueue({
+      args: ["tag-rename", name, target],
+      silent: true,
+      onSuccess: function(result) {
+        var updated = Number(result.updated || 0)
+        var applied = String(result.tag || target)
+        var verb = result.merged ? "Merged #" + name + " into #" + applied
+          : "Renamed #" + name + " to #" + applied
+        root.statusText = verb + " in " + updated + (updated === 1 ? " note" : " notes")
+        if (root.category === "tag:" + name) root.category = "tag:" + applied
+        // The watcher refreshes the open buffer; a rename can also move the
+        // selected note out of the subtree that was being shown.
+        root.refreshAll(root.statusText)
+      },
+      onError: function(message) { root.statusText = message }
+    })
+  }
+
+  // ---------------------------------------------------------- templates
+  function loadTemplates() {
+    enqueue({
+      args: ["templates", "list"],
+      silent: true,
+      onSuccess: function(result) {
+        root.templates = Array.isArray(result.templates) ? result.templates : []
+        root.rebuildTemplateMenu()
+      },
+      // An older store may not know `templates`; the menu then keeps only the
+      // blank-note entry instead of interrupting the library.
+      onError: function() {}
+    })
+  }
+
+  function rebuildTemplateMenu() {
+    if (!newNoteTemplateMenu) return
+    for (var i = 0; i < templateMenuItems.length; i++) {
+      newNoteTemplateMenu.removeItem(templateMenuItems[i])
+    }
+    templateMenuItems = []
+    for (var t = 0; t < root.templates.length; t++) {
+      var entry = root.templates[t]
+      var label = String(entry.name || entry.id || "")
+      if (label === "") continue
+      var icon = String(entry.icon || "")
+      var item = templateMenuItemComponent.createObject(null, {
+        "text": icon === "" ? label : icon + "  " + label,
+        "templateId": String(entry.id || ""),
+        "templateDescription": String(entry.description || "")
+      })
+      if (!item) continue
+      // Insert before the trailing "Manage templates…" entry so the menu keeps
+      // its fixed head and foot regardless of how many files exist.
+      newNoteTemplateMenu.insertItem(2 + templateMenuItems.length, item)
+      templateMenuItems.push(item)
+    }
+  }
+
+  function openTemplateManager() {
+    if (templateManager) templateManager.open()
+  }
+
+  function saveCurrentSearch() {
+    var query = String(root.searchText || "").trim()
+    if (query === "") return
+    enqueue({
+      args: ["searches", "add", query],
+      silent: true,
+      onSuccess: function(result) {
+        root.savedSearches = Array.isArray(result.searches) ? result.searches : root.savedSearches
+        root.statusText = "Search saved"
+        root.loadSavedSearches()
+      },
+      onError: function(message) { root.statusText = message }
+    })
+  }
+
+  function removeSavedSearch(query) {
+    var value = String(query || "")
+    if (value === "") return
+    enqueue({
+      args: ["searches", "remove", value],
+      silent: true,
+      onSuccess: function(result) {
+        root.savedSearches = Array.isArray(result.searches) ? result.searches : root.savedSearches
+        // Removing the active search deliberately leaves searchText and its
+        // results alone: the user can keep reading what they were looking at.
+        root.loadSavedSearches()
+      },
+      onError: function(message) { root.statusText = message }
+    })
+  }
+
+  function runSavedSearch(query) {
+    var value = String(query || "")
+    if (value === "") return
+    flushSave()
+    searchText = value
+    searching = true
+    // Bypass the debounce, and clear the same-query guard so re-running a
+    // saved search always refreshes the result list.
+    lastQuery = ""
+    runSearch()
+    // Mirroring the query into the field restarts the debounce timer; this
+    // search already ran, so cancel that duplicate pass.
+    searchTimer.stop()
+  }
+
   // ------------------------------------------------------------- categories
   function labelForCategory() {
     if (category === "all") return "All notes"
@@ -280,6 +699,10 @@ Item {
       return folder === "" ? "Inbox" : folder
     }
     if (category.indexOf("tag:") === 0) return "#" + category.slice(4)
+    if (category.indexOf("tagtree:") === 0) {
+      var prefix = category.slice(8)
+      return prefix === "" ? "#" : "#" + prefix + "/…"
+    }
     return "Notes"
   }
 
@@ -300,6 +723,14 @@ Item {
         var noteTags = note.tags || []
         for (var t = 0; t < noteTags.length; t++) {
           if (String(noteTags[t]).toLowerCase() === wanted) { include = true; break }
+        }
+      } else if (category.indexOf("tagtree:") === 0) {
+        // A parent tag selects its whole subtree; matching is case-insensitive
+        // so `#Project/App` groups under `#project` in the tree.
+        var prefix = category.slice(8).toLowerCase()
+        var tags = note.tags || []
+        for (var u = 0; u < tags.length; u++) {
+          if (TagTree.prefixMatches(String(tags[u]).toLowerCase(), prefix)) { include = true; break }
         }
       }
       if (include) output.push(note)
@@ -343,6 +774,173 @@ Item {
     return null
   }
 
+  // Pending selections are only valid in the current view. A trashed or
+  // filtered-out id must never be selected again by a late refresh.
+  function hasVisibleId(id) {
+    var key = String(id || "")
+    if (key === "") return false
+    var list = filteredNotes()
+    for (var i = 0; i < list.length; i++) {
+      if (String(list[i].id) === key) return true
+    }
+    return false
+  }
+
+  // ------------------------------------------------------------ selection
+  // A selection is always kept in sync with `filteredNotes()`: ids that leave
+  // the current view (trashed, moved, filtered out) are pruned by
+  // ensureSelection() rather than lingering as invisible state.
+  function isMultiSelected(id) {
+    var key = String(id || "")
+    if (key === "") return false
+    for (var i = 0; i < selectedIds.length; i++) {
+      if (String(selectedIds[i]) === key) return true
+    }
+    return false
+  }
+
+  function selectionIds() {
+    if (selectedIds.length > 0) return selectedIds.slice()
+    return selectedId !== "" ? [selectedId] : []
+  }
+
+  function resetSelection(id) {
+    var key = String(id || "")
+    var next = key === "" ? [] : [key]
+    var unchanged = next.length === selectedIds.length
+      && (next.length === 0 || String(selectedIds[0]) === key)
+    if (!unchanged) selectedIds = next
+    selectionAnchor = key
+    selectionRangeBase = []
+    selectionRangeActive = false
+  }
+
+  function clearSelection() {
+    if (selectedIds.length > 0) selectedIds = []
+    selectionAnchor = ""
+    selectionRangeBase = []
+    selectionRangeActive = false
+  }
+
+  // A plain click, keyboard move or switcher choice asks for exactly one
+  // selected note; the active row follows it.
+  function collapseSelection() {
+    root.resetSelection(root.selectedId)
+  }
+
+  function toggleSelection(id) {
+    var key = String(id || "")
+    if (key === "") return
+    var next = selectedIds.slice()
+    var index = next.indexOf(key)
+    if (index >= 0) {
+      next.splice(index, 1)
+      root.selectedIds = next
+      root.selectionRangeBase = []
+      root.selectionRangeActive = false
+      if (key === root.selectionAnchor) {
+        root.selectionAnchor = next.length > 0 ? String(next[0]) : ""
+      }
+      if (next.length === 0) {
+        // Removing the last selected row leaves the editor where it is; the
+        // active note is still the single implicit selection.
+        root.selectionAnchor = ""
+        return
+      }
+      // The active note follows the remaining selection instead of pointing
+      // at a row the user just removed.
+      if (key === root.selectedId) {
+        var follow = String(next[next.length - 1])
+        var followIndex = next.indexOf(follow)
+        if (followIndex > 0) {
+          var reordered = next.slice()
+          reordered.splice(followIndex, 1)
+          reordered.unshift(follow)
+          root.selectedIds = reordered
+        }
+        root.activateNote(follow)
+      }
+      return
+    }
+    // Prepend rather than append: bulk commands treat ids[0] as the primary
+    // note, so the active note must stay first.
+    next.unshift(key)
+    root.selectedIds = next
+    root.selectionAnchor = key
+    root.selectionRangeBase = []
+    root.selectionRangeActive = false
+    root.activateNote(key)
+  }
+
+  function extendSelectionTo(id) {
+    var key = String(id || "")
+    if (key === "") return
+    var list = root.filteredNotes()
+    var anchor = root.selectionAnchor !== "" ? root.selectionAnchor : root.selectedId
+    var from = -1
+    var to = -1
+    for (var i = 0; i < list.length; i++) {
+      var noteId = String(list[i].id)
+      if (noteId === anchor) from = i
+      if (noteId === key) to = i
+    }
+    if (to < 0) return
+    if (from < 0) {
+      // The anchor fell out of this view (for example after a search); start
+      // a fresh range from the row the user just Shift-clicked.
+      root.resetSelection(key)
+      root.activateNote(key)
+      return
+    }
+    if (!root.selectionRangeActive) {
+      root.selectionRangeBase = root.selectedIds.slice()
+      root.selectionRangeActive = true
+    }
+    var base = root.selectionRangeBase
+    var included = {}
+    var output = []
+    for (var b = 0; b < base.length; b++) {
+      var baseId = String(base[b])
+      if (baseId === "" || included[baseId]) continue
+      included[baseId] = true
+      output.push(baseId)
+    }
+    var start = Math.min(from, to)
+    var end = Math.max(from, to)
+    for (var r = start; r <= end; r++) {
+      var rangeId = String(list[r].id)
+      if (included[rangeId]) continue
+      included[rangeId] = true
+      output.push(rangeId)
+    }
+    // The endpoint becomes the active note and the primary id for a bulk
+    // command; keep it first while preserving everybody else's order.
+    var endpoint = output.indexOf(key)
+    if (endpoint > 0) {
+      output.splice(endpoint, 1)
+      output.unshift(key)
+    }
+    root.selectedIds = output
+    root.activateNote(key)
+  }
+
+  function selectAllVisible() {
+    var list = root.filteredNotes()
+    if (list.length === 0) return
+    var ids = []
+    for (var i = 0; i < list.length; i++) ids.push(String(list[i].id))
+    var activeIndex = ids.indexOf(String(root.selectedId))
+    if (activeIndex > 0) {
+      ids.splice(activeIndex, 1)
+      ids.unshift(String(root.selectedId))
+    }
+    root.selectionAnchor = activeIndex >= 0 ? String(root.selectedId) : ids[0]
+    root.selectionRangeBase = []
+    root.selectionRangeActive = false
+    root.selectedIds = ids
+    if (root.selectedId === "" || activeIndex < 0) root.activateNote(ids[0])
+  }
+
   function selectCategory(nextCategory) {
     if (category === nextCategory) return
     flushSave()
@@ -351,6 +949,7 @@ Item {
     searchResults = []
     searching = false
     deleteArmed = false
+    root.clearSelection()
     if (noteList) noteList.clearSearch()
     if (category === "trash") refreshTrash()
     Qt.callLater(function() { root.ensureSelection() })
@@ -361,24 +960,47 @@ Item {
       // A freshly created/moved note may not be in the list snapshot that is
       // already in flight. Wait for the refresh that contains it instead of
       // falling back to another note and stealing its load flags.
-      if (!findAny(pendingSelectId)) {
+      if (!root.hasVisibleId(pendingSelectId)) {
         if (!pendingSelectTimer.running) pendingSelectTimer.restart()
         return
       }
       pendingSelectTimer.stop()
       var wanted = pendingSelectId
       pendingSelectId = ""
-      selectNote(wanted)
+      // A bulk move/restore puts several ids in selectedIds before the
+      // refreshed list arrives; do not collapse that selection here.
+      if (root.selectedIds.length > 1 && root.isMultiSelected(wanted)) root.activateNote(wanted)
+      else root.selectNote(wanted)
       return
     }
     var list = filteredNotes()
+    // Never keep a selection entry for a row that is no longer in this view.
+    // In particular a trashed id can never be resurrected by stale selection
+    // state after a refresh.
+    var visible = {}
+    for (var v = 0; v < list.length; v++) visible[String(list[v].id)] = true
+    var kept = []
+    for (var s = 0; s < selectedIds.length; s++) {
+      if (visible[String(selectedIds[s])]) kept.push(String(selectedIds[s]))
+    }
+    if (kept.length !== selectedIds.length) {
+      selectedIds = kept
+      if (root.selectionAnchor !== "" && kept.indexOf(root.selectionAnchor) < 0) {
+        root.selectionAnchor = kept.length > 0
+          ? String(kept[0]) : String(root.selectedId || "")
+      }
+      root.selectionRangeBase = []
+      root.selectionRangeActive = false
+    }
     for (var i = 0; i < list.length; i++) {
       if (String(list[i].id) === selectedId) return
     }
     selectNote(list.length > 0 ? String(list[0].id) : "")
   }
 
-  function selectNote(id) {
+  // Change the active note without touching the multi-selection. Callers that
+  // mean "just this one" use selectNote() below.
+  function activateNote(id) {
     var next = String(id || "")
     deleteArmed = false
     pendingDetach = false
@@ -400,6 +1022,9 @@ Item {
     diskChangeText = ""
     pendingEditorOpen = false
     inFlightSaveText = ""
+    // Remove the outgoing note's buffer preview before the selection moves,
+    // so any render still in flight can never land on the new note.
+    root.clearPreviewTemp()
     selectedId = next
     scheduleChatContext()
     if (!next) {
@@ -409,9 +1034,16 @@ Item {
     loadNote()
   }
 
+  function selectNote(id) {
+    root.resetSelection(id)
+    root.activateNote(id)
+  }
+
   function clearEditor() {
     if (tableOpen) closeTable(false)
     draftTimer.stop()
+    previewDebounce.stop()
+    root.clearPreviewTemp()
     draftPending = false
     draftText = ""
     draftModified = 0
@@ -434,6 +1066,8 @@ Item {
     previewLineOffset = 0
     backlinks = []
     backlinksOpen = false
+    unresolvedLinks = []
+    unresolvedOpen = false
     saveState = "Ready"
   }
 
@@ -459,6 +1093,10 @@ Item {
     root.pendingFocusEditor = false
     loadingNote = true
     tooLarge = false
+    // A reload (for example after a version restore) must not keep the old
+    // buffer's preview or let its in-flight render land.
+    previewDebounce.stop()
+    root.invalidatePreview()
     // Drop the previous note's preview so its line numbers can never target a
     // line in the newly loaded note while the fresh preview is in flight.
     previewMarkdown = ""
@@ -506,6 +1144,7 @@ Item {
         if (root.loaded) {
           root.requestPreview()
           root.requestBacklinks()
+          root.requestUnresolved()
           if (focusAfterLoad) {
             Qt.callLater(function() {
               editor.forceActiveFocus()
@@ -777,6 +1416,7 @@ Item {
       }
       requestPreview()
       requestBacklinks()
+      requestUnresolved()
       root.scheduleChatContext()
     }
     refreshTimer.restart()
@@ -825,18 +1465,55 @@ Item {
     launchDetachedWindow()
   }
 
-  function launchDetachedWindow() {
-    var note = selectedNote
-    if (!note) { pendingDetach = false; return }
+  function launchDetachedNote(id, title) {
     pendingDetach = false
     detachedProcess.command = [
       pluginDir + "/scripts/quill-window",
-      String(note.id),
-      String(note.title || "Note"),
+      String(id),
+      String(title || "Note"),
       dataRoot
     ]
     detachedProcess.running = true
-    statusText = "Opened “" + String(note.title || "note") + "” in a detached window"
+    statusText = "Opened “" + String(title || "note") + "” in a detached window"
+  }
+
+  function launchDetachedWindow() {
+    var note = selectedNote
+    if (!note) { pendingDetach = false; return }
+    launchDetachedNote(note.id, note.title || "Note")
+  }
+
+  // Open an id from the quick switcher without assuming it is selected yet.
+  // The title comes from the note list when loaded, otherwise from the title
+  // index the switcher already has.
+  function detachNoteById(id) {
+    var noteId = String(id || "")
+    if (noteId === "") return
+    if (!pluginDir) {
+      statusText = "Could not locate the Quill plugin"
+      return
+    }
+    var title = ""
+    var note = findAny(noteId)
+    if (note && note.title) title = String(note.title)
+    if (title === "") {
+      for (var i = 0; i < titleIndex.length; i++) {
+        if (String(titleIndex[i].id) === noteId) {
+          title = String(titleIndex[i].title || "")
+          break
+        }
+      }
+    }
+    if (title === "") title = "Note"
+    // A dirty current note must reach disk before the window reads it; the
+    // existing save-then-launch path runs launchDetachedWindow on success.
+    if (noteId === selectedId && dirty) {
+      pendingDetach = true
+      // openNoteFromSwitcher already flushed; don't queue the same bytes twice.
+      if (inFlightSaveText === "") flushSave()
+      return
+    }
+    launchDetachedNote(noteId, title)
   }
 
   // ------------------------------------------------------- external editor
@@ -958,6 +1635,7 @@ Item {
     draftWriter.drop(root.draftPath(id))
     root.requestPreview()
     root.requestBacklinks()
+    root.requestUnresolved()
     root.scheduleChatContext()
     refreshTimer.restart()
     root.notifyJoplinSync()
@@ -1132,6 +1810,16 @@ Item {
     saveState = "Unsaved"
     saveTimer.restart()
     draftTimer.restart()
+    // Any render already in flight now shows older bytes; invalidate it and
+    // ask for a fresh one once typing pauses. Autosave and draft debouncing
+    // keep their own timers.
+    previewSeq += 1
+    if (writesAllowed) {
+      previewDebounce.restart()
+    } else {
+      // No live path can pick the flag back up on a read-only note.
+      previewLoading = false
+    }
   }
 
   function countWords(value) {
@@ -1142,21 +1830,190 @@ Item {
   }
 
   // -------------------------------------------------------------- preview
+  // A stable temp path per note: the renderer reads a copy of the buffer, so
+  // it must never live inside the notes root. The id is sanitised because it
+  // can contain folder separators, and only this file name is derived from it.
+  function previewTempPath() {
+    var id = String(root.selectedId || "")
+    var safe = id.replace(/[^A-Za-z0-9._-]/g, "-")
+    if (safe === "") safe = "note"
+    var dir = String(Quickshell.env("TMPDIR") || "/tmp")
+    return dir.replace(/\/+$/, "") + "/quill-preview-" + safe + ".md"
+  }
+
+  // Forget which buffer text the pane shows and orphan any render already in
+  // flight. Used when the text changes without a keystroke or the note goes
+  // away; the stale response drops itself when previewSeq no longer matches.
+  function invalidatePreview() {
+    previewSeq += 1
+    previewRenderedId = ""
+    previewRenderedText = ""
+    // Reset the flag too: the response this invalidation orphans will not
+    // clear it, and the next owner (a load or a read-only state) owns it now.
+    previewLoading = false
+  }
+
+  function clearPreviewTemp() {
+    var path = root.previewTempFile
+    previewTempFile = ""
+    previewWriter.pendingId = ""
+    previewWriter.pendingText = ""
+    previewWriter.writtenPath = ""
+    previewWriter.writtenText = ""
+    root.invalidatePreview()
+    // A write may still be running; its onSaved notices the id mismatch,
+    // removes the path it just wrote and drops the writer's cache afterwards.
+    if (path !== "") Quickshell.execDetached(["rm", "-f", path])
+    if (!previewWriter.busy) root.dropPreviewCache()
+  }
+
+  // FileView skips a write whose bytes match what it already holds, which
+  // would leave the writer marked busy with no onSaved to finish it. Blanking
+  // the path drops that cache; it is only done outside a save signal.
+  function dropPreviewCache() {
+    if (previewWriter.busy) return
+    previewWriter.path = ""
+  }
+
+  function startPreviewWrite(text) {
+    var path = root.previewTempPath()
+    previewTempFile = path
+    if (path === previewWriter.writtenPath && text === previewWriter.writtenText) {
+      // The file already holds this buffer; re-writing it would be skipped.
+      root.renderPreviewFile(path, root.selectedId, text)
+      return
+    }
+    previewWriter.busy = true
+    previewWriter.path = path
+    previewWriter.targetId = root.selectedId
+    previewWriter.targetText = text
+    // An empty buffer would be skipped by the same cache check, and a lone
+    // newline renders identically (same lineOffset, no visible markdown).
+    previewWriter.setText(text === "" ? "\n" : text)
+  }
+
+  // One write at a time: a newer buffer supersedes a queued one instead of
+  // racing the file the renderer is about to read.
+  function pumpPreviewWrite() {
+    if (previewWriter.busy) return
+    var text = String(previewWriter.pendingText || "")
+    var id = previewWriter.pendingId
+    previewWriter.pendingText = ""
+    previewWriter.pendingId = ""
+    if (id === "" || id !== root.selectedId) return
+    if (!root.writesAllowed || !root.loaded || root.tooLarge || root.loadingNote) return
+    if (text !== String(editor.text)) return
+    if (id === root.previewRenderedId && text === root.previewRenderedText) return
+    root.startPreviewWrite(text)
+  }
+
+  // Debounce entry point. Only notes that can actually be written get the live
+  // path; read-only and oversized notes keep the saved-copy preview.
+  function requestBufferPreview() {
+    if (!root.writesAllowed || !root.loaded || root.tooLarge || root.loadingNote) return
+    if (!root.selectedNote || root.selectedNote.trashed) return
+    var text = String(editor.text)
+    if (root.selectedId === root.previewRenderedId && text === root.previewRenderedText) return
+    if (previewWriter.busy) {
+      previewWriter.pendingId = root.selectedId
+      previewWriter.pendingText = text
+      return
+    }
+    root.startPreviewWrite(text)
+  }
+
+  // Enqueue the render for a temp file that holds `text`. Shared by the write
+  // completion and the already-written path so the staleness guards match.
+  function renderPreviewFile(path, id, text) {
+    if (id !== root.selectedId) return
+    if (id === root.previewRenderedId && text === root.previewRenderedText) return
+    var seq = previewSeq
+    previewLoading = true
+    enqueue({
+      args: ["preview", "--content-file", path],
+      silent: true,
+      onSuccess: function(result) {
+        if (seq !== root.previewSeq || id !== root.selectedId) return
+        root.previewMarkdown = String(result.markdown || "")
+        root.previewLineOffset = Number(result.lineOffset || 0)
+        root.previewRenderedId = id
+        root.previewRenderedText = text
+        root.previewLoading = false
+      },
+      onError: function(message) {
+        if (seq !== root.previewSeq || id !== root.selectedId) return
+        // Keep the last good render: a failed buffer render is retried by the
+        // next edit instead of blanking the pane mid-sentence.
+        root.previewLoading = false
+        root.statusText = message
+      }
+    })
+  }
+
+  function previewFileSaved() {
+    var path = previewWriter.path
+    var id = previewWriter.targetId
+    var text = String(previewWriter.targetText || "")
+    previewWriter.busy = false
+    if (id !== root.selectedId) {
+      // The selection moved while this write was in flight.
+      Quickshell.execDetached(["rm", "-f", path])
+      Qt.callLater(function() { root.dropPreviewCache() })
+      Qt.callLater(function() { root.pumpPreviewWrite() })
+      return
+    }
+    previewWriter.writtenPath = path
+    previewWriter.writtenText = text
+    if (text !== String(editor.text)) {
+      // A newer keystroke landed while the file was being written; its own
+      // debounce owns the next render.
+      Qt.callLater(function() { root.pumpPreviewWrite() })
+      return
+    }
+    root.renderPreviewFile(path, id, text)
+    // Path changes and the next write must not happen inside FileView's saved
+    // signal, or setPath would wait on (and re-emit) the finished operation.
+    Qt.callLater(function() { root.pumpPreviewWrite() })
+  }
+
+  function previewFileFailed(message) {
+    previewWriter.busy = false
+    previewWriter.writtenPath = ""
+    previewWriter.writtenText = ""
+    previewWriter.pendingId = ""
+    previewWriter.pendingText = ""
+    // The cache holds the failed bytes; drop it so a retry is not a no-op.
+    Qt.callLater(function() { root.dropPreviewCache() })
+    root.statusText = String(message || "Could not prepare the live preview")
+  }
+
+  // Saved-copy preview: resolves wiki links against the index, so loads,
+  // saves and external reloads keep using it. Text the live buffer already
+  // renders is skipped rather than fetched twice.
   function requestPreview() {
     if (!selectedId || !loaded) { previewMarkdown = ""; previewLineOffset = 0; return }
     var requestedId = selectedId
+    // A newer edit is already on its way to the live preview; rendering the
+    // bytes that were just saved would only move the pane backwards.
+    if (root.dirty && root.writesAllowed) return
+    if (previewRenderedId === requestedId
+        && previewRenderedText === savedTextById[requestedId]) return
+    previewSeq += 1
+    previewRenderedId = ""
+    previewRenderedText = ""
+    var seq = previewSeq
     previewLoading = true
     enqueue({
       args: ["preview", requestedId],
       silent: true,
       onSuccess: function(result) {
-        if (requestedId !== root.selectedId) return
+        if (seq !== root.previewSeq || requestedId !== root.selectedId) return
         root.previewMarkdown = String(result.markdown || "")
         root.previewLineOffset = Number(result.lineOffset || 0)
         root.previewLoading = false
       },
       onError: function(message) {
-        if (requestedId !== root.selectedId) return
+        if (seq !== root.previewSeq || requestedId !== root.selectedId) return
         root.previewLoading = false
         root.previewMarkdown = ""
         root.previewLineOffset = 0
@@ -1384,6 +2241,44 @@ Item {
     })
   }
 
+  // Broken `[[note]]` links in the open note. The store scans every source,
+  // so an empty result after creating a note is the authoritative "resolved".
+  function requestUnresolved() {
+    if (!selectedId) { unresolvedLinks = []; return }
+    var requestedId = selectedId
+    enqueue({
+      args: ["unresolved", "--id", requestedId],
+      silent: true,
+      onSuccess: function(result) {
+        if (requestedId !== root.selectedId) return
+        root.unresolvedLinks = Array.isArray(result.unresolved) ? result.unresolved : []
+        if (root.unresolvedLinks.length === 0) root.unresolvedOpen = false
+      }
+    })
+  }
+
+  // The backend reports one row per (source, target). The pane only needs one
+  // row per target, so merge case-insensitively and sum the occurrence counts.
+  function unresolvedTargetRows() {
+    var rows = []
+    var index = {}
+    var list = Array.isArray(root.unresolvedLinks) ? root.unresolvedLinks : []
+    for (var i = 0; i < list.length; i++) {
+      var row = list[i]
+      if (!row) continue
+      var target = String(row.target === undefined || row.target === null ? "" : row.target).trim()
+      if (target === "") continue
+      var key = target.toLowerCase()
+      if (index[key] === undefined) {
+        index[key] = rows.length
+        rows.push({ target: target, count: Number(row.count || 0) })
+      } else {
+        rows[index[key]].count += Number(row.count || 0)
+      }
+    }
+    return rows
+  }
+
   // Local Markdown links are stored as absolute paths (`[spec](/home/me/spec.pdf)`).
   // Qt.openUrlExternally needs a URL, not a bare path, so local paths get a
   // file:// prefix (already-percent-encoded hrefs stay encoded). Anything with
@@ -1426,8 +2321,9 @@ Item {
     root.pendingSelectId = String(result.id || "")
     root.pendingFocusEditor = !!focusEditor
     root.pendingCaretToEnd = true
+    root.clearSelection()
     if (folder) root.category = "folder:" + folder
-    else if (root.category === "trash" || root.category === "pinned" || root.category === "recent" || root.category.indexOf("tag:") === 0) root.category = "all"
+    else if (root.category === "trash" || root.category === "pinned" || root.category === "recent" || root.category.indexOf("tag:") === 0 || root.category.indexOf("tagtree:") === 0) root.category = "all"
     root.searchText = ""
     root.searchResults = []
     root.searching = false
@@ -1529,6 +2425,13 @@ Item {
     noteList.focusSearch()
   }
 
+  // Focus search and show the filter grammar without replacing what is
+  // already typed. runSearch() passes the query through unchanged.
+  function focusAdvancedSearch() {
+    focusSearch()
+    statusText = 'Filters: tag: folder: before: after: "phrase" -exclude'
+  }
+
   function openViewMenu() {
     viewMenuOpen = true
   }
@@ -1583,7 +2486,8 @@ Item {
 
   function defaultExportPath(title, format) {
     var home = Quickshell.env("HOME") || ""
-    return home + "/" + safeExportName(title) + (format === "html" ? ".html" : ".md")
+    var ext = format === "html" ? ".html" : (format === "pdf" ? ".pdf" : ".md")
+    return home + "/" + safeExportName(title) + ext
   }
 
   function openExport() {
@@ -1615,11 +2519,13 @@ Item {
 
   function setExportFormat(format) {
     if (root.exporting) return
-    var next = format === "html" ? "html" : "markdown"
+    var next = format === "html" || format === "pdf" ? format : "markdown"
     if (root.exportFormat === next) return
+    var ext = next === "html" ? ".html" : (next === "pdf" ? ".pdf" : ".md")
     var path = String(root.exportPath || "")
-    if (next === "html" && /\.md$/i.test(path)) path = path.slice(0, -3) + ".html"
-    else if (next === "markdown" && /\.html?$/i.test(path)) path = path.replace(/\.html?$/i, ".md")
+    // Only rewrite a known export extension; a bare name or some other suffix
+    // is left exactly as the user typed it.
+    if (/\.(md|html?|pdf)$/i.test(path)) path = path.replace(/\.(md|html?|pdf)$/i, ext)
     root.exportFormat = next
     root.exportPath = path
     root.exportError = ""
@@ -1690,7 +2596,8 @@ Item {
       root.statusText = root.exportError
       return
     }
-    if (format === "html") root.exportHtml(dest, text)
+    if (format === "pdf") root.exportPdf(dest, text)
+    else if (format === "html") root.exportHtml(dest, text)
     else root.exportMarkdown(dest, text)
   }
 
@@ -1708,6 +2615,16 @@ Item {
   }
 
   function exportHtml(dest, text) {
+    root.exportRich(dest, text, "html")
+  }
+
+  function exportPdf(dest, text) {
+    root.exportRich(dest, text, "pdf")
+  }
+
+  // Shared body for the script-backed exports: both HTML and PDF render the
+  // same temporary Markdown source, and the pending format picks the script.
+  function exportRich(dest, text, format) {
     var temp = root.dataRoot + "/.quill-export-" + Date.now() + ".md"
     var view = exportFileComponent.createObject(root, { path: temp })
     if (!view) {
@@ -1719,6 +2636,7 @@ Item {
     view.targetText = text
     view.targetMode = "html-source"
     view.tempPath = temp
+    root.exportPendingFormat = format
     root.exportPendingTitle = root.selectedNote ? String(root.selectedNote.title || "Untitled") : "Untitled"
     root.exportPendingNoteDir = root.exportNoteDir()
     view.setText(text)
@@ -1751,13 +2669,17 @@ Item {
   function runHtmlExporter(dest, temp) {
     root.exportPendingDest = dest
     root.exportPendingTemp = temp
-    exportChmodProcess.command = ["chmod", "+x", root.exportScriptPath]
+    var script = root.exportPendingFormat === "pdf" ? root.exportPdfScriptPath : root.exportScriptPath
+    exportChmodProcess.command = ["chmod", "+x", script]
     exportChmodProcess.running = true
   }
 
+  // Runs whichever rich exporter is selected (HTML or PDF); the command line is
+  // identical, so the pending format alone decides which script starts.
   function startHtmlProcess() {
+    var script = root.exportPendingFormat === "pdf" ? root.exportPdfScriptPath : root.exportScriptPath
     exportProcess.command = [
-      root.exportScriptPath,
+      script,
       "--input", root.exportPendingTemp,
       "--output", root.exportPendingDest,
       "--title", root.exportPendingTitle,
@@ -1792,10 +2714,12 @@ Item {
   function handleHtmlExportExit(exitCode) {
     var dest = root.exportPendingDest
     var temp = root.exportPendingTemp
+    var format = root.exportPendingFormat
     var out = String(exportProcess.outputText || "")
     var err = String(exportProcess.errorText || "")
     root.exportPendingDest = ""
     root.exportPendingTemp = ""
+    root.exportPendingFormat = ""
     root.cleanupExportTemp(temp)
     var payload = null
     try { payload = JSON.parse(out.trim()) } catch (error) { payload = null }
@@ -1808,7 +2732,7 @@ Item {
       var lines = err.trim().split("\n")
       message = lines.length > 0 ? String(lines[lines.length - 1]).trim() : ""
     }
-    if (message === "") message = "HTML export failed"
+    if (message === "") message = format === "pdf" ? "PDF export failed" : "HTML export failed"
     root.finishExport(false, message.slice(0, 300))
   }
 
@@ -1843,89 +2767,459 @@ Item {
     chatContextTimer.restart()
   }
 
-  function togglePin() {
-    if (!selectedNote || selectedNote.trashed) return
-    var id = selectedId
-    enqueue({
-      args: ["pin", id],
+  // ------------------------------------------------------- bulk actions
+  // The backend takes the first id positionally and every extra id as a
+  // repeatable --id. Keeping one helper means all bulk commands phrase their
+  // arguments exactly the same way.
+  function bulkArgs(command, ids, extra) {
+    var list = cleanIds(ids)
+    var args = [command, list[0]]
+    for (var i = 1; i < list.length; i++) args.push("--id", list[i])
+    return args.concat(extra || [])
+  }
+
+  function cleanIds(ids) {
+    var source = Array.isArray(ids) ? ids : []
+    var seen = {}
+    var output = []
+    for (var i = 0; i < source.length; i++) {
+      var id = String(source[i] === undefined || source[i] === null ? "" : source[i])
+      if (id === "" || seen[id]) continue
+      seen[id] = true
+      output.push(id)
+    }
+    return output
+  }
+
+  // The ids a menu/keyboard action applies to. A right-click inside a
+  // multi-selection acts on the whole selection; anywhere else it is single.
+  function actionIdsFor(id) {
+    var key = String(id || "")
+    if (root.selectedIds.length > 1 && root.isMultiSelected(key)) {
+      return root.selectedIds.slice()
+    }
+    return key === "" ? [] : [key]
+  }
+
+  // Bulk results describe the positional note with unqualified keys, so move
+  // the open note to the front when it belongs to the batch. Tag writes use
+  // that content to keep the editor in sync.
+  function primaryFirst(ids) {
+    var list = cleanIds(ids)
+    var active = String(root.selectedId)
+    var index = list.indexOf(active)
+    if (index > 0) {
+      list.splice(index, 1)
+      list.unshift(active)
+    }
+    return list
+  }
+
+  function armUndoTrash(ids) {
+    var list = cleanIds(ids)
+    if (list.length === 0) { root.clearUndoTrash(); return }
+    root.undoTrashIds = list
+    root.undoLabel = list.length === 1
+      ? "Moved 1 note to Trash" : "Moved " + list.length + " notes to Trash"
+    root.undoRemaining = 12
+    undoTimer.restart()
+    undoTickTimer.restart()
+  }
+
+  function clearUndoTrash() {
+    undoTimer.stop()
+    undoTickTimer.stop()
+    if (root.undoTrashIds.length > 0) root.undoTrashIds = []
+    root.undoLabel = ""
+    root.undoRemaining = 0
+  }
+
+  function undoTrash() {
+    var list = root.cleanIds(root.undoTrashIds)
+    var count = list.length
+    // Clear first: a second click while the restore runs must not queue it
+    // twice, and a failure must not leave a stale Undo behind.
+    root.clearUndoTrash()
+    if (count === 0) return
+    root.enqueue({
+      args: root.bulkArgs("restore", list),
       silent: true,
       onSuccess: function(result) {
-        root.statusText = result.pinned ? "Pinned" : "Unpinned"
-        root.refreshAll()
+        var restored = Number(result.count || count)
+        root.statusText = restored === 1
+          ? "Restored 1 note" : "Restored " + restored + " notes"
+        root.refreshAll(root.statusText)
+        root.refreshTrash()
       },
       onError: function(message) { root.statusText = message }
     })
   }
 
-  function armDelete(deleteForever) {
-    deleteArmed = true
-    deleteArmId = selectedId
-    armTimer.restart()
-    statusText = deleteForever
-      ? "Press Ctrl+Delete again to delete forever"
-      : "Press Ctrl+Delete again to move to Trash"
+  function pinNotes(ids) {
+    var requested = root.cleanIds(ids)
+    var list = []
+    for (var n = 0; n < requested.length; n++) {
+      var candidate = root.findAny(requested[n])
+      if (candidate && !candidate.trashed) list.push(requested[n])
+    }
+    if (list.length === 0) return
+    var everyPinned = true
+    for (var i = 0; i < list.length; i++) {
+      var note = root.findAny(list[i])
+      if (!note || !note.pinned) { everyPinned = false; break }
+    }
+    var state = everyPinned ? "off" : "on"
+    root.enqueue({
+      args: root.bulkArgs("pin", list, ["--state", state]),
+      silent: true,
+      onSuccess: function(result) {
+        var count = Number(result.count || list.length)
+        root.statusText = result.pinned
+          ? (count === 1 ? "Pinned" : "Pinned " + count + " notes")
+          : (count === 1 ? "Unpinned" : "Unpinned " + count + " notes")
+        root.refreshAll(root.statusText)
+      },
+      onError: function(message) { root.statusText = message }
+    })
   }
 
-  function trashSelected() {
-    if (!selectedNote) return
-    if (selectedNote.trashed) { deleteForeverSelected(); return }
-    if (!deleteArmed || deleteArmId !== selectedId) { armDelete(false); return }
-    var id = selectedId
-    deleteArmed = false
-    // Flush the open table into the buffer before the save check: the grid's
-    // edits are only committed to editor.text by closeTable().
-    if (tableOpen) closeTable(false)
-    // Write a pending edit before the backend moves the file; the command only
-    // runs in the save's success continuation.
-    root.afterSave(id, function() {
-      enqueue({
-        args: ["trash", id],
+  // The visible note a deletion leaves behind: the first surviving row after
+  // the last removed one, or the first survivor when the tail was removed.
+  function nextVisibleAfter(removed) {
+    var gone = {}
+    for (var g = 0; g < removed.length; g++) gone[String(removed[g])] = true
+    var list = root.filteredNotes()
+    var lastIndex = -1
+    for (var i = 0; i < list.length; i++) {
+      if (gone[String(list[i].id)]) lastIndex = i
+    }
+    for (var after = lastIndex + 1; after < list.length; after++) {
+      var nextId = String(list[after].id)
+      if (!gone[nextId]) return nextId
+    }
+    for (var from = 0; from < list.length; from++) {
+      var fallback = String(list[from].id)
+      if (!gone[fallback]) return fallback
+    }
+    return ""
+  }
+
+  function trashNotes(ids) {
+    var list = root.cleanIds(ids)
+    if (list.length === 0) return
+    var activeId = String(root.selectedId)
+    // If the active buffer is in the batch, its pending edits must land before
+    // the backend moves the file. Other rows are untouched by the flush.
+    var run = function() {
+      if (root.tableOpen && list.indexOf(activeId) >= 0) root.closeTable(false)
+      var nextId = root.nextVisibleAfter(list)
+      root.enqueue({
+        args: root.bulkArgs("trash", list),
         silent: true,
         onSuccess: function(result) {
-          if (root.selectedId === id) root.selectedId = ""
-          root.pendingSelectId = ""
-          root.statusText = "Moved to Trash"
-          root.refreshAll()
+          var removed = Array.isArray(result.ids) ? result.ids.map(String) : list
+          // The whole batch is gone; the editor moves to the next survivor.
+          if (removed.indexOf(String(root.selectedId)) >= 0) {
+            root.selectedId = ""
+            root.clearEditor()
+          }
+          root.selectedIds = []
+          root.selectionAnchor = ""
+          root.selectionRangeBase = []
+          root.selectionRangeActive = false
+          root.pendingSelectId = nextId
+          root.armUndoTrash(removed)
+          root.refreshAll(root.undoLabel)
           root.refreshTrash()
         },
         onError: function(message) { root.statusText = message }
       })
+    }
+    if (list.indexOf(activeId) >= 0) root.afterSave(activeId, run)
+    else run()
+  }
+
+  function restoreNotes(ids) {
+    var list = root.cleanIds(ids)
+    if (list.length === 0) return
+    root.enqueue({
+      args: root.bulkArgs("restore", list),
+      silent: true,
+      onSuccess: function(result) {
+        var restored = Array.isArray(result.ids) ? result.ids.map(String) : list
+        var count = Number(result.count || restored.length)
+        root.selectedIds = []
+        root.selectionAnchor = ""
+        root.selectionRangeBase = []
+        root.selectionRangeActive = false
+        root.pendingSelectId = String(result.id || restored[0] || "")
+        root.category = "all"
+        root.statusText = count === 1
+          ? "Restored 1 note" : "Restored " + count + " notes"
+        root.refreshAll(root.statusText)
+        root.refreshTrash()
+      },
+      onError: function(message) { root.statusText = message }
     })
+  }
+
+  function deleteForeverNotes(ids) {
+    var list = root.cleanIds(ids)
+    if (list.length === 0) return
+    root.enqueue({
+      args: root.bulkArgs("delete", list),
+      silent: true,
+      onSuccess: function(result) {
+        var removed = Array.isArray(result.ids) ? result.ids.map(String) : list
+        var count = Number(result.count || removed.length)
+        var activeRemoved = removed.indexOf(String(root.selectedId)) >= 0
+        var kept = []
+        for (var i = 0; i < root.selectedIds.length; i++) {
+          var id = String(root.selectedIds[i])
+          if (removed.indexOf(id) < 0) kept.push(id)
+        }
+        root.selectedIds = kept
+        if (activeRemoved) {
+          root.selectedId = ""
+          root.clearEditor()
+          root.pendingSelectId = ""
+        }
+        if (kept.length === 0 || root.selectionAnchor === "" || removed.indexOf(root.selectionAnchor) >= 0) {
+          root.selectionAnchor = kept.length > 0 ? String(kept[0]) : ""
+          root.selectionRangeBase = []
+          root.selectionRangeActive = false
+        }
+        root.statusText = count === 1
+          ? "Deleted forever" : "Deleted " + count + " notes forever"
+        root.refreshTrash()
+        root.refreshAll(root.statusText)
+      },
+      onError: function(message) { root.statusText = message }
+    })
+  }
+
+  function moveNotes(ids, folder) {
+    var list = root.cleanIds(ids)
+    if (list.length === 0) return
+    var targetFolder = String(folder || "")
+    // Rows already at the destination need no write; an all-no-op drop still
+    // gets a clear status instead of a silent nothing.
+    var moving = []
+    for (var i = 0; i < list.length; i++) {
+      var note = root.findAny(list[i])
+      // Skip only a row we know is already at the destination. A missing or
+      // stale id is left in the batch so the backend's all-or-nothing
+      // validation reports it instead of a silent partial move.
+      if (note && !note.trashed && String(note.folder || "") === targetFolder) continue
+      moving.push(list[i])
+    }
+    if (moving.length === 0) {
+      root.statusText = "Already in " + (targetFolder === "" ? "Inbox" : targetFolder)
+      return
+    }
+    var activeId = String(root.selectedId)
+    var run = function() {
+      if (root.tableOpen && moving.indexOf(activeId) >= 0) root.closeTable(false)
+      root.enqueue({
+        args: root.bulkArgs("move", moving, ["--folder", targetFolder]),
+        silent: true,
+        onSuccess: function(result) {
+          var moved = Array.isArray(result.ids) ? result.ids.map(String) : moving
+          var count = Number(result.count || moved.length)
+          var label = targetFolder === "" ? "Inbox" : targetFolder
+          var primary = String(result.id || moved[0] || "")
+          // Follow the batch into its new home so the rows stay visible, then
+          // keep them selected for the next bulk action.
+          root.category = targetFolder === "" ? "all" : "folder:" + targetFolder
+          root.searchText = ""
+          root.searchResults = []
+          root.searching = false
+          if (noteList) noteList.clearSearch()
+          root.selectedIds = moved
+          root.selectionAnchor = primary
+          root.selectionRangeBase = []
+          root.selectionRangeActive = false
+          root.pendingSelectId = primary
+          root.statusText = count === 1
+            ? "Moved 1 note to " + label
+            : "Moved " + count + " notes to " + label
+          root.refreshAll(root.statusText)
+        },
+        onError: function(message) { root.statusText = message }
+      })
+    }
+    if (moving.indexOf(activeId) >= 0) root.afterSave(activeId, run)
+    else run()
+  }
+
+  function parseBulkTags(value) {
+    var parts = String(value || "").split(/[\s,]+/)
+    var seen = {}
+    var output = []
+    for (var i = 0; i < parts.length; i++) {
+      var tag = TagSuggest.normalizeTag(parts[i])
+      if (!tag || seen[tag]) continue
+      seen[tag] = true
+      output.push(tag)
+    }
+    return output
+  }
+
+  function openBulkTagPrompt(mode) {
+    var requested = root.selectionIds()
+    var ids = []
+    for (var i = 0; i < requested.length; i++) {
+      var note = root.findAny(requested[i])
+      if (note && !note.trashed) ids.push(requested[i])
+    }
+    if (requested.length > 0 && ids.length === 0) {
+      root.statusText = "Restore this note before adding tags"
+      return
+    }
+    if (ids.length === 0) {
+      root.statusText = "Select a note first"
+      return
+    }
+    root.bulkTagIds = ids
+    root.bulkTagCount = ids.length
+    root.bulkTagMode = String(mode || "add") === "remove" ? "remove" : "add"
+    root.bulkTagError = ""
+    bulkTagPopup.open()
+  }
+
+  function confirmBulkTags(mode) {
+    if (!root.writesAllowed) {
+      root.bulkTagError = WritableGuard.refusalMessage()
+      root.statusText = root.bulkTagError
+      return
+    }
+    var tags = root.parseBulkTags(bulkTagField.text)
+    if (tags.length === 0) {
+      root.bulkTagError = "Type at least one tag"
+      root.statusText = root.bulkTagError
+      return
+    }
+    var ids = root.cleanIds(root.bulkTagIds)
+    if (ids.length === 0) {
+      root.bulkTagError = "Select a note first"
+      return
+    }
+    root.bulkTagError = ""
+    bulkTagPopup.close()
+    if (String(mode) === "remove") root.removeTagsFromNotes(ids, tags)
+    else root.addTagsToNotes(ids, tags)
+  }
+
+  function addTagsToNotes(ids, tags) {
+    root.writeTagsForNotes("tag-add", ids, tags)
+  }
+
+  function removeTagsFromNotes(ids, tags) {
+    root.writeTagsForNotes("tag-remove", ids, tags)
+  }
+
+  function writeTagsForNotes(command, ids, tags) {
+    var clean = root.cleanIds(tags)
+    var ordered = root.primaryFirst(ids)
+    if (ordered.length === 0 || clean.length === 0) return
+    var activeId = String(root.selectedId)
+    var applyVersion = root.editVersion
+    var run = function() {
+      root.enqueue({
+        args: root.bulkArgs(command, ordered, clean),
+        silent: true,
+        onSuccess: function(result) {
+          var updated = Number(result.updated || ordered.length)
+          if (String(result.id || ordered[0]) === activeId
+              && String(root.selectedId) === activeId
+              && result.content !== undefined) {
+            // Same discipline as applySuggestedTags(): replace the buffer only
+            // when it has not gained newer edits since the command started.
+            var versionChanged = root.editVersion !== applyVersion
+            var alreadyApplied = !root.dirty
+              && String(editor.text) === String(result.content)
+            if (!versionChanged || alreadyApplied) {
+              root.applyExternalContent(result.content, result.modified,
+                command === "tag-add" ? "Tags added" : "Tags removed")
+            }
+          }
+          root.statusText = command === "tag-add"
+            ? (updated === 1 ? "Tags added" : "Tags added to " + updated + " notes")
+            : (updated === 1 ? "Tags removed" : "Tags removed from " + updated + " notes")
+          root.refreshAll(root.statusText)
+        },
+        onError: function(message) {
+          root.bulkTagError = message
+          root.statusText = message
+        }
+      })
+    }
+    if (ordered.indexOf(activeId) >= 0) root.afterSave(activeId, run)
+    else run()
+  }
+
+  function togglePin() {
+    root.pinNotes(root.selectionIds())
+  }
+
+  // The arm key includes the whole selection so changing it between the two
+  // presses disarms the delete instead of applying it to a surprise batch.
+  function selectionArmKey() {
+    if (root.selectedIds.length > 1) {
+      return "@selection:" + root.selectedIds.join("|")
+    }
+    return String(root.selectedId)
+  }
+
+  function armDelete(deleteForever, count) {
+    var total = Number(count || 1)
+    deleteArmed = true
+    deleteArmId = root.selectionArmKey()
+    armTimer.restart()
+    if (deleteForever) {
+      statusText = total > 1
+        ? "Press Ctrl+Delete again to delete " + total + " notes forever"
+        : "Press Ctrl+Delete again to delete forever"
+    } else {
+      statusText = total > 1
+        ? "Press Ctrl+Delete again to move " + total + " notes to Trash"
+        : "Press Ctrl+Delete again to move to Trash"
+    }
+  }
+
+  function trashSelected() {
+    var ids = root.selectionIds()
+    if (ids.length === 0) return
+    if (root.selectedNote && root.selectedNote.trashed) {
+      root.deleteForeverSelected()
+      return
+    }
+    if (!deleteArmed || deleteArmId !== root.selectionArmKey()) {
+      root.armDelete(false, ids.length)
+      return
+    }
+    deleteArmed = false
+    root.trashNotes(ids)
   }
 
   function restoreSelected() {
-    if (!selectedNote || !selectedNote.trashed) return
-    var id = selectedId
-    enqueue({
-      args: ["restore", id],
-      silent: true,
-      onSuccess: function(result) {
-        root.pendingSelectId = String(result.id || "")
-        root.category = "all"
-        root.statusText = "Restored"
-        root.refreshAll()
-        root.refreshTrash()
-      },
-      onError: function(message) { root.statusText = message }
-    })
+    root.restoreNotes(root.selectionIds())
   }
 
   function deleteForeverSelected() {
-    if (!selectedNote || !selectedNote.trashed) return
-    if (!deleteArmed || deleteArmId !== selectedId) { armDelete(true); return }
-    var id = selectedId
+    var ids = root.selectionIds()
+    var trashed = []
+    for (var i = 0; i < ids.length; i++) {
+      var note = root.findAny(ids[i])
+      if (note && note.trashed) trashed.push(ids[i])
+    }
+    if (trashed.length === 0) return
+    if (!deleteArmed || deleteArmId !== root.selectionArmKey()) {
+      root.armDelete(true, trashed.length)
+      return
+    }
     deleteArmed = false
-    enqueue({
-      args: ["delete", id],
-      silent: true,
-      onSuccess: function() {
-        if (root.selectedId === id) root.selectedId = ""
-        root.statusText = "Deleted forever"
-        root.refreshTrash()
-        root.refreshAll()
-      },
-      onError: function(message) { root.statusText = message }
-    })
+    root.deleteForeverNotes(trashed)
   }
 
   function emptyTrash() {
@@ -1951,46 +3245,21 @@ Item {
   }
 
   function moveSelectedTo(folder) {
-    if (!selectedNote || selectedNote.trashed) return
-    var id = selectedId
-    var targetFolder = String(folder || "")
-    if (String(selectedNote.folder || "") === targetFolder) return
-    // Commit grid edits so afterSave sees a dirty buffer and flushes them.
-    if (tableOpen) closeTable(false)
-    // Flush the open buffer first: moving the file before the queued save
-    // lands would write the old text (or fail against the moved path).
-    root.afterSave(id, function() {
-      enqueue({
-        args: ["move", id, "--folder", targetFolder],
-        silent: true,
-        onSuccess: function(result) {
-          root.pendingSelectId = String(result.id || id)
-          root.category = targetFolder === "" ? "all" : "folder:" + targetFolder
-          root.statusText = "Moved"
-          root.refreshAll()
-        },
-        onError: function(message) { root.statusText = message }
-      })
-    })
+    root.moveNotes(root.selectionIds(), folder)
   }
 
   function setPinnedNote(id) {
-    var note = findAny(id)
-    if (!note || note.trashed) return
-    enqueue({
-      args: ["pin", id],
-      silent: true,
-      onSuccess: function(result) {
-        root.statusText = result.pinned ? "Pinned" : "Unpinned"
-        root.refreshAll()
-      },
-      onError: function(message) { root.statusText = message }
-    })
+    root.pinNotes(root.actionIdsFor(id))
   }
 
   function beginRenameNote(id) {
     var note = findAny(id)
     if (!note || note.trashed) return
+    // A second rename supersedes any in-flight dry run and its prompt.
+    root.renameSeq += 1
+    root.pendingRename = null
+    root.renameLinksSourceTitle = ""
+    if (renameLinksPopup) renameLinksPopup.close()
     root.renameTargetId = String(id)
     root.renameNoteText = String(note.title || "Untitled")
     renameNotePopup.open()
@@ -2000,19 +3269,103 @@ Item {
     var id = root.renameTargetId
     var title = String(root.renameNoteText || "").replace(/\s+/g, " ").trim()
     if (id === "" || title === "") return
+    var note = root.findAny(id)
+    var sourceTitle = String(note && note.title ? note.title : "Untitled")
     root.renameTargetId = ""
+    root.renameNoteText = ""
+    root.renameSeq += 1
+    var seq = root.renameSeq
+    root.pendingRename = null
+    root.renameLinksSourceTitle = ""
     renameNotePopup.close()
     root.afterSave(id, function() {
-      enqueue({
-        args: ["rename", id, "--title", title],
+      // The save above can resolve after the user started another rename.
+      if (seq !== root.renameSeq) return
+      root.enqueue({
+        args: ["rename", id, "--title", title, "--dry-run"],
         silent: true,
         onSuccess: function(result) {
-          root.statusText = "Renamed"
-          root.refreshAll()
-          root.reloadRenamedNote(id)
+          if (seq !== root.renameSeq) return
+          var count = Number(result.linksUpdated || 0)
+          if (count > 0) {
+            root.renameLinksSourceTitle = sourceTitle
+            root.pendingRename = { id: id, title: title, count: count }
+            renameLinksPopup.open()
+          } else {
+            // Nothing points at the old title, so the dry run already told us
+            // everything the real rename would: skip the extra scan.
+            root.performRename(id, title, "skip")
+          }
         },
-        onError: function(message) { root.statusText = message }
+        onError: function(message) {
+          if (seq !== root.renameSeq) return
+          root.statusText = message
+        }
       })
+    })
+  }
+
+  function renameLinksMessageText() {
+    var pending = root.pendingRename
+    if (!pending) return ""
+    var count = Number(pending.count || 0)
+    return "Update " + count + " " + (count === 1 ? "link" : "links")
+      + " to “" + String(root.renameLinksSourceTitle || "this note") + "”?"
+  }
+
+  function performRename(id, title, mode) {
+    root.pendingRename = null
+    root.renameLinksSourceTitle = ""
+    if (renameLinksPopup) renameLinksPopup.close()
+    root.enqueue({
+      args: ["rename", id, "--title", title, "--links", mode],
+      silent: true,
+      onSuccess: function(result) {
+        var updated = Number(result.linksUpdated || 0)
+        root.statusText = updated > 0
+          ? "Renamed · " + updated + (updated === 1 ? " link updated" : " links updated")
+          : "Renamed"
+        root.refreshAll()
+        root.reloadRenamedNote(id)
+        root.reloadRewrittenNote(id, result.sources)
+      },
+      onError: function(message) { root.statusText = message }
+    })
+  }
+
+  // The rename rewrote every note that linked to the old title on disk. If one
+  // of those is open, reload it like any clean external change so the editor
+  // never reports our own write as a conflict.
+  function reloadRewrittenNote(renamedId, sources) {
+    var selected = root.selectedId
+    if (selected === "" || selected === renamedId) return
+    var list = Array.isArray(sources) ? sources : []
+    var rewritten = false
+    for (var i = 0; i < list.length; i++) {
+      var row = list[i]
+      if (row && String(row.id || "") === selected) { rewritten = true; break }
+    }
+    if (!rewritten) return
+    if (!(root.loaded && !root.dirty && root.saveState !== "Saving…"
+        && !root.loadingNote && !root.tooLarge)) {
+      root.statusText = "Links to the renamed note were updated on disk — Reload to see them"
+      return
+    }
+    var requestedId = selected
+    root.enqueue({
+      args: ["read", requestedId],
+      silent: true,
+      onSuccess: function(result) {
+        if (requestedId !== root.selectedId) return
+        // The read sits behind the refresh list job; keep newer typing.
+        if (!root.loaded || root.dirty || root.saveState === "Saving…"
+            || root.loadingNote || root.tooLarge) {
+          root.statusText = "Links to the renamed note were updated on disk — Reload to see them"
+          return
+        }
+        root.applyExternalContent(result.content, result.modified, "Links updated")
+      },
+      onError: function(message) { root.statusText = message }
     })
   }
 
@@ -2066,100 +3419,72 @@ Item {
     })
   }
 
-  function moveNoteTo(id, folder) {
-    var note = findAny(id)
-    if (!note || note.trashed) return
-    var targetFolder = String(folder || "")
-    if (String(note.folder || "") === targetFolder) return
-    root.afterSave(id, function() {
-      enqueue({
-        args: ["move", id, "--folder", targetFolder],
-        silent: true,
-        onSuccess: function(result) {
-          root.pendingSelectId = String(result.id || id)
-          root.category = targetFolder === "" ? "all" : "folder:" + targetFolder
-          root.searchText = ""
-          root.searchResults = []
-          root.searching = false
-          if (noteList) noteList.clearSearch()
-          root.statusText = "Moved"
-          root.refreshAll()
-        },
-        onError: function(message) { root.statusText = message }
-      })
-    })
-  }
-
-  function trashNote(id) {
-    var note = findAny(id)
-    if (!note || note.trashed) return
-    root.afterSave(id, function() {
-      if (tableOpen && id === root.selectedId) closeTable(false)
-      enqueue({
-        args: ["trash", id],
-        silent: true,
-        onSuccess: function() {
-          if (root.selectedId === id) root.selectedId = ""
-          root.pendingSelectId = ""
-          root.statusText = "Moved to Trash"
-          root.refreshAll()
-          root.refreshTrash()
-        },
-        onError: function(message) { root.statusText = message }
-      })
-    })
-  }
-
-  function restoreNote(id) {
-    var note = findAny(id)
-    if (!note || !note.trashed) return
-    enqueue({
-      args: ["restore", id],
+  // Create the missing target from the backlinks pane. The store reindexes on
+  // create, so every existing `[[target]]` in this note resolves immediately.
+  function createBrokenLinkNote(target) {
+    var title = String(target === undefined || target === null ? "" : target).trim()
+    if (title === "" || !root.writesAllowed) return
+    root.enqueue({
+      args: ["create", "--title", title],
       silent: true,
       onSuccess: function(result) {
         root.pendingSelectId = String(result.id || "")
-        root.category = "all"
-        root.statusText = "Restored"
+        root.searchText = ""
+        root.searchResults = []
+        root.searching = false
+        if (noteList) noteList.clearSearch()
+        root.statusText = "Created “" + title + "”"
         root.refreshAll()
-        root.refreshTrash()
+        root.requestUnresolved()
+        root.requestBacklinks()
       },
       onError: function(message) { root.statusText = message }
     })
   }
 
+  function moveNoteTo(id, folder) {
+    root.moveNotes(root.actionIdsFor(id), folder)
+  }
+
+  function trashNote(id) {
+    root.trashNotes(root.actionIdsFor(id))
+  }
+
+  function restoreNote(id) {
+    root.restoreNotes(root.actionIdsFor(id))
+  }
+
   function requestDeleteNote(id) {
-    var note = findAny(id)
+    var ids = root.actionIdsFor(id)
+    if (ids.length === 0) return
+    var note = root.findAny(ids[0])
     if (!note || !note.trashed) return
-    root.deleteNoteTargetId = String(id)
-    root.deleteNoteTargetTitle = String(note.title || "Untitled")
+    root.deleteNoteTargetId = String(ids[0])
+    root.pendingDeleteIds = ids
+    root.deleteNoteTargetTitle = ids.length > 1
+      ? ids.length + " notes" : String(note.title || "Untitled")
     deleteNotePopup.open()
   }
 
   function confirmDeleteNote() {
-    var id = root.deleteNoteTargetId
-    if (id === "") return
+    var ids = root.pendingDeleteIds.length > 0
+      ? root.pendingDeleteIds.slice() : (root.deleteNoteTargetId === "" ? [] : [root.deleteNoteTargetId])
+    if (ids.length === 0) return
     root.deleteNoteTargetId = ""
+    root.pendingDeleteIds = []
     deleteNotePopup.close()
-    enqueue({
-      args: ["delete", id],
-      silent: true,
-      onSuccess: function() {
-        if (root.selectedId === id) root.selectedId = ""
-        root.pendingSelectId = ""
-        root.statusText = "Deleted forever"
-        root.refreshTrash()
-        root.refreshAll()
-      },
-      onError: function(message) { root.statusText = message }
-    })
+    root.deleteForeverNotes(ids)
   }
 
   function handleNoteAction(id, action) {
-    if (action === "pin") root.setPinnedNote(id)
+    var ids = root.actionIdsFor(id)
+    if (action === "pin") root.pinNotes(ids)
     else if (action === "duplicate") root.duplicateNote(id)
-    else if (action === "trash") root.trashNote(id)
-    else if (action === "restore") root.restoreNote(id)
+    else if (action === "trash") root.trashNotes(ids)
+    else if (action === "restore") root.restoreNotes(ids)
     else if (action === "delete-forever") root.requestDeleteNote(id)
+    else if (action === "tag-add") root.openBulkTagPrompt("add")
+    else if (action === "tag-remove") root.openBulkTagPrompt("remove")
   }
 
   function createFolder(path) {
@@ -2227,6 +3552,31 @@ Item {
   }
 
   function handleEscape() {
+    // A multi-selection is the innermost thing to dismiss: collapse it back to
+    // the active note before touching popups or panes.
+    if (root.selectedIds.length > 1) {
+      root.collapseSelection()
+      return
+    }
+    if (quickSwitcher && quickSwitcher.opened) {
+      quickSwitcher.close()
+      return
+    }
+    if (renameLinksPopup && renameLinksPopup.opened) {
+      root.pendingRename = null
+      root.renameLinksSourceTitle = ""
+      renameLinksPopup.close()
+      root.statusText = "Cancelled"
+      return
+    }
+    if (versionHistory && versionHistory.opened) {
+      versionHistory.close()
+      return
+    }
+    if (bulkTagPopup && bulkTagPopup.opened) {
+      bulkTagPopup.close()
+      return
+    }
     if (tagSuggestPopup && tagSuggestPopup.opened) {
       // Escape is the popup's cancel key, but never while a tag write is in
       // flight: closing then would let the result overwrite newer typing.
@@ -2256,6 +3606,7 @@ Item {
       searchText = ""
       searchResults = []
       searching = false
+      root.clearSelection()
       noteList.clearSearch()
       ensureSelection()
       return
@@ -2275,6 +3626,22 @@ Item {
   Component.onCompleted: {
     mode = width >= Style.space(1000) ? "split" : "edit"
     if (active) refreshAll()
+    root.loadSavedSearches()
+    root.loadTemplates()
+  }
+
+  Component.onDestruction: {
+    // Stop the bridge before its data root goes away. The queue dies with the
+    // window, so the exit handler has nothing to requeue or respawn.
+    root.activeJob = null
+    root.pendingJob = null
+    root.jobs = []
+    daemonEventTimer.stop()
+    daemon.running = false
+    // A hard crash may leave the temp file; a normal shutdown should not.
+    if (root.previewTempFile !== "") {
+      Quickshell.execDetached(["rm", "-f", root.previewTempFile])
+    }
   }
 
   onWidthChanged: {
@@ -2290,6 +3657,9 @@ Item {
   }
 
   Timer { id: saveTimer; interval: 600; onTriggered: root.flushSave() }
+  // Coalesces unsolicited index-change events from the bridge: a burst of
+  // writes from sync or a detached window becomes one refresh.
+  Timer { id: daemonEventTimer; interval: 400; onTriggered: root.refreshAll() }
   Timer {
     id: tagApplyTimer
     objectName: "tagApplyTimeoutTimer"
@@ -2317,6 +3687,20 @@ Item {
   Timer { id: searchTimer; interval: 170; onTriggered: root.runSearch() }
   Timer { id: refreshTimer; interval: 1100; onTriggered: if (!root.dirty) root.refreshAll() }
   Timer { id: armTimer; interval: 3200; onTriggered: { root.deleteArmed = false; root.deleteArmId = "" } }
+  // Twelve-second Undo window. The tick only refreshes the visible countdown;
+  // the single-shot timer owns the actual expiry.
+  Timer {
+    id: undoTimer
+    interval: 12000
+    repeat: false
+    onTriggered: root.clearUndoTrash()
+  }
+  Timer {
+    id: undoTickTimer
+    interval: 1000
+    repeat: true
+    onTriggered: if (root.undoRemaining > 0) root.undoRemaining -= 1
+  }
   Timer { id: folderArmTimer; interval: 3200; onTriggered: { root.folderDeleteArmed = false; root.folderDeletePath = "" } }
   Timer { id: chatContextTimer; interval: 400; onTriggered: root.pushChatContext(false) }
   Timer { id: chatNoticeTimer; interval: 2200; onTriggered: root.chatNotice = "" }
@@ -2324,7 +3708,7 @@ Item {
     id: pendingSelectTimer
     interval: 2500
     onTriggered: {
-      if (root.pendingSelectId && !root.findAny(root.pendingSelectId)) {
+      if (root.pendingSelectId && !root.hasVisibleId(root.pendingSelectId)) {
         root.pendingSelectId = ""
         root.pendingFocusEditor = false
         root.pendingCaretToEnd = false
@@ -2341,6 +3725,29 @@ Item {
     }
   }
 
+  // Live preview writer. The render is enqueued from onSaved, never from the
+  // debounce, so the backend always finds a complete file to read.
+  FileView {
+    id: previewWriter
+    property bool busy: false
+    property string pendingId: ""
+    property string pendingText: ""
+    property string targetId: ""
+    property string targetText: ""
+    // The last buffer successfully written, so a repeat can skip the write.
+    property string writtenPath: ""
+    property string writtenText: ""
+    atomicWrites: true
+    blockAllReads: true
+    printErrors: false
+    onSaved: root.previewFileSaved()
+    onSaveFailed: function(error) { root.previewFileFailed(String(error)) }
+  }
+
+  // Wait for a pause in typing before rendering the buffer. The autosave and
+  // draft timers are deliberately independent of this one.
+  Timer { id: previewDebounce; interval: 200; onTriggered: root.requestBufferPreview() }
+
   Timer { id: draftTimer; interval: 150; onTriggered: root.writeDraft() }
 
   function runSearch() {
@@ -2348,6 +3755,7 @@ Item {
     if (!query) {
       searching = false
       searchResults = []
+      root.clearSelection()
       ensureSelection()
       return
     }
@@ -2380,9 +3788,13 @@ Item {
   Shortcut {
     sequence: "/"
     enabled: root.active && !root.editorActive && !root.searchActive && !root.chatInputActive
+      && !quickSwitcher.opened
     onActivated: root.focusSearch()
   }
-  Shortcut { sequence: "Ctrl+P"; enabled: root.active; onActivated: root.togglePin() }
+  Shortcut { sequence: "Ctrl+P"; enabled: root.active; onActivated: root.openQuickSwitcher() }
+  Shortcut { sequence: "Ctrl+Shift+P"; enabled: root.active; onActivated: root.togglePin() }
+  Shortcut { sequence: "Ctrl+Shift+T"; enabled: root.active; onActivated: root.openBulkTagPrompt("add") }
+  Shortcut { sequence: "Ctrl+Shift+F"; enabled: root.active; onActivated: root.focusAdvancedSearch() }
   Shortcut { sequence: "Ctrl+E"; enabled: root.active; onActivated: root.cycleMode() }
   Shortcut { sequence: "Ctrl+S"; enabled: root.active; onActivated: root.flushSave() }
   Shortcut { sequence: "Ctrl+Shift+O"; enabled: root.active; onActivated: root.openInEditor() }
@@ -2415,6 +3827,32 @@ Item {
     onExited: function(exitCode) { root.handleJobExit(exitCode) }
   }
 
+  // Persistent backend bridge. One JSON request per line goes in; one response
+  // or event per line comes out. `pendingJob` keeps the request that started
+  // the bridge until `onStarted` can write it. stderr is diagnostics only:
+  // replies carry their own error messages, and an exit is the failure signal.
+  Process {
+    id: daemon
+    // Kept for diagnostics only: replies carry their own error messages.
+    property string lastError: ""
+    stdinEnabled: true
+    stdout: SplitParser {
+      onRead: function(line) { root.handleDaemonLine(line) }
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: daemon.lastError = String(text || "")
+    }
+    onStarted: {
+      root.daemonReady = true
+      root.daemonStarting = false
+      var job = root.pendingJob
+      root.pendingJob = null
+      if (job) root.daemonRequest(job)
+    }
+    onExited: function(exitCode) { root.handleDaemonExit(exitCode) }
+  }
+
   // `quill-window` daemonizes quickshell and returns immediately; a non-zero
   // exit only means the launcher could not start (missing note id, bad path).
   Process {
@@ -2435,9 +3873,10 @@ Item {
     stderr: StdioCollector { waitForEnd: true }
   }
 
-  // HTML export: chmod the renderer, run it with the temp Markdown source,
-  // then remove that source. The temporary file lives in dataRoot, never in
-  // notes/, so the library index can never mistake it for a note.
+  // Rich export (HTML or PDF): chmod the renderer, run it with the temp
+  // Markdown source, then remove that source. The temporary file lives in
+  // dataRoot, never in notes/, so the library index can never mistake it for
+  // a note.
   Process {
     id: exportValidateProcess
     stdout: StdioCollector { waitForEnd: true }
@@ -2452,10 +3891,14 @@ Item {
     onExited: function(exitCode) {
       if (exitCode !== 0) {
         var temp = root.exportPendingTemp
+        var fmt = root.exportPendingFormat
         root.exportPendingDest = ""
         root.exportPendingTemp = ""
+        root.exportPendingFormat = ""
         root.cleanupExportTemp(temp)
-        root.finishExport(false, "Could not run the HTML export renderer")
+        root.finishExport(false, fmt === "pdf"
+          ? "Could not run the PDF export renderer"
+          : "Could not run the HTML export renderer")
         return
       }
       root.startHtmlProcess()
@@ -2620,13 +4063,33 @@ Item {
         notes: root.notes
         folders: root.folders
         tags: root.tags
+        savedSearches: root.savedSearches
+        activeSearch: root.searchText
         category: root.category
         trashCount: root.trashCount
         onCategorySelected: function(next) { root.selectCategory(next) }
+        onTagSubtreeSelected: function(prefix) {
+          root.selectCategory("tagtree:" + String(prefix || ""))
+        }
+        onTagActionRequested: function(tag, action) {
+          root.openTagManager(String(tag || ""), String(action || ""))
+        }
         onCreateFolderRequested: function(path) { root.createFolder(path) }
         onRenameFolderRequested: function(path, next) { root.renameFolder(path, next) }
         onDeleteFolderRequested: function(path) { root.requestDeleteFolder(path) }
+        onSavedSearchSelected: function(query) { root.runSavedSearch(query) }
+        onSavedSearchRemoveRequested: function(query) { root.removeSavedSearch(query) }
+        onSavedSearchSaveRequested: root.saveCurrentSearch()
         onCollapseRequested: root.sidebarOpen = false
+        onNoteDropRequested: function(payload, folder) {
+          var parts = String(payload || "").split("\n")
+          var ids = []
+          for (var i = 0; i < parts.length; i++) {
+            var id = String(parts[i] || "").trim()
+            if (id !== "") ids.push(id)
+          }
+          root.moveNotes(ids, folder)
+        }
       }
 
       PaneRail {
@@ -2650,6 +4113,7 @@ Item {
         width: visible ? Math.max(Style.space(280), Math.min(Style.space(340), root.width * 0.28)) : 0
         notes: root.visibleNotes
         selectedId: root.selectedId
+        selectedIds: root.selectedIds
         searchText: root.searchText
         searching: root.searching
         showTrash: root.category === "trash"
@@ -2659,6 +4123,10 @@ Item {
         onNoteActionRequested: function(id, action) { root.handleNoteAction(id, action) }
         onNoteRenameRequested: function(id) { root.beginRenameNote(id) }
         onNoteMoveRequested: function(id, folder) { root.moveNoteTo(id, folder) }
+        onSelectionToggleRequested: function(id) { root.toggleSelection(id) }
+        onSelectionRangeRequested: function(id) { root.extendSelectionTo(id) }
+        onSelectAllRequested: root.selectAllVisible()
+        onSelectionCleared: root.collapseSelection()
         onSearchQueryChanged: function(text) {
           root.searchText = text
           if (text.trim() !== "") {
@@ -2667,6 +4135,7 @@ Item {
           } else {
             root.searching = false
             root.searchResults = []
+            root.clearSelection()
             root.ensureSelection()
           }
         }
@@ -2870,7 +4339,18 @@ Item {
           BorderSurface {
             id: backlinksBox
             width: parent.width
-            height: root.backlinksOpen ? Style.space(142) : Style.space(26)
+            // Header rows are 20-22 px plus the box's 3 px top/bottom margins.
+            // The broken-links section adds its own header and, when open, a
+            // short scrolling list so the editor pane above can still shrink
+            // without the panes collapsing into each other.
+            height: {
+              var total = root.backlinksOpen ? Style.space(142) : Style.space(26)
+              if (root.unresolvedShown) {
+                total += Style.space(24)
+                if (root.unresolvedOpen) total += Style.space(96)
+              }
+              return total
+            }
             color: Util.alpha(Commons.Color.foreground, 0.014)
             borderSpec: Border.none
             radius: Style.cornerRadius
@@ -2906,7 +4386,7 @@ Item {
               ListView {
                 visible: root.backlinksOpen
                 width: parent.width
-                height: Math.max(0, parent.height - Style.space(22))
+                height: root.backlinksOpen ? Style.space(116) : 0
                 clip: true
                 model: root.backlinks
                 spacing: Style.space(2)
@@ -2962,6 +4442,93 @@ Item {
                   font.pixelSize: Style.font.caption
                 }
               }
+
+              // -------------------------------------------- broken links
+              Item {
+                width: parent.width
+                height: root.unresolvedShown ? Style.space(22) : 0
+                visible: root.unresolvedShown
+
+                Text {
+                  objectName: "brokenLinksHeader"
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: "⚠  Broken links (" + root.unresolvedTargets.length + ")"
+                  textFormat: Text.PlainText
+                  color: root.unresolvedTargets.length > 0
+                    ? Commons.Color.urgent
+                    : Util.alpha(Commons.Color.foreground, 0.46)
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.bodySmall
+                  font.bold: root.unresolvedTargets.length > 0
+                }
+
+                MouseArea {
+                  anchors.fill: parent
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.unresolvedOpen = !root.unresolvedOpen
+                }
+              }
+
+              ListView {
+                objectName: "brokenLinksList"
+                visible: root.unresolvedOpen
+                width: parent.width
+                height: root.unresolvedOpen ? Style.space(96) : 0
+                clip: true
+                model: root.unresolvedTargets
+                spacing: Style.space(2)
+
+                delegate: BorderSurface {
+                  id: brokenLinkRow
+                  required property var modelData
+                  width: ListView.view.width
+                  height: Style.space(28)
+                  color: brokenMouse.containsMouse
+                    ? Style.hoverFillFor(Commons.Color.foreground, Commons.Color.accent)
+                    : "transparent"
+                  borderSpec: Border.none
+                  radius: Style.cornerRadius
+
+                  MouseArea {
+                    id: brokenMouse
+                    anchors.fill: parent
+                    acceptedButtons: Qt.NoButton
+                    hoverEnabled: true
+                  }
+
+                  Row {
+                    anchors.fill: parent
+                    anchors.leftMargin: Style.space(6)
+                    anchors.rightMargin: Style.space(6)
+                    spacing: Style.space(6)
+
+                    Text {
+                      width: Math.max(0, parent.width - brokenCreateButton.width - parent.spacing)
+                      anchors.verticalCenter: parent.verticalCenter
+                      text: String(brokenLinkRow.modelData.target || "")
+                      textFormat: Text.PlainText
+                      color: Commons.Color.foreground
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.bodySmall
+                      elide: Text.ElideRight
+                    }
+
+                    Button {
+                      id: brokenCreateButton
+                      objectName: "brokenLinkCreateButton"
+                      text: "Create"
+                      fontSize: Style.font.caption
+                      horizontalPadding: Style.space(7)
+                      verticalPadding: Style.space(2)
+                      enabled: root.writesAllowed
+                      opacity: enabled ? 1 : 0.45
+                      anchors.verticalCenter: parent.verticalCenter
+                      onClicked: root.createBrokenLinkNote(
+                        String(brokenLinkRow.modelData.target || ""))
+                    }
+                  }
+                }
+              }
             }
           }
         }
@@ -3002,7 +4569,38 @@ Item {
         font.family: Style.font.family
         font.pixelSize: Style.font.caption
         elide: Text.ElideRight
-        width: parent.width - shortcuts.width - Style.space(24)
+        width: Math.max(0, parent.width - shortcuts.width - undoSlot.width - Style.space(28))
+      }
+      // A fixed slot reserves the space even while Undo is hidden, so the
+      // status row never jumps when a trash arms the affordance.
+      Item {
+        id: undoSlot
+        anchors.verticalCenter: parent.verticalCenter
+        width: Style.space(54)
+        height: Style.space(16)
+
+        Text {
+          id: undoButton
+          objectName: "undoTrashButton"
+          visible: root.undoTrashIds.length > 0
+          anchors.centerIn: parent
+          text: root.undoRemaining > 0 ? "Undo · " + root.undoRemaining + "s" : "Undo"
+          textFormat: Text.PlainText
+          color: undoMouse.containsMouse
+            ? Commons.Color.accent : Util.alpha(Commons.Color.accent, 0.82)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+          font.underline: undoMouse.containsMouse
+
+          MouseArea {
+            id: undoMouse
+            anchors.fill: parent
+            anchors.margins: -Style.space(2)
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.undoTrash()
+          }
+        }
       }
       Text {
         id: shortcuts
@@ -3144,6 +4742,119 @@ Item {
     onCancelled: root.clearTagSuggestTarget()
   }
 
+  // Bulk tag entry for the whole selection. Add and Remove send one backend
+  // call for every captured id; the field takes spaces or commas.
+  Popup {
+    id: bulkTagPopup
+    objectName: "bulkTagPopup"
+    parent: Overlay.overlay
+    anchors.centerIn: Overlay.overlay
+    width: Style.space(360)
+    padding: Style.space(12)
+    modal: true
+    dim: true
+    focus: true
+    closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+    onOpened: {
+      bulkTagField.text = ""
+      bulkTagField.forceActiveFocus()
+    }
+    background: BorderSurface {
+      color: Commons.Color.background
+      borderSpec: Border.controlSpec("normal", Commons.Color.foreground, Commons.Color.accent)
+      radius: Style.cornerRadius
+    }
+
+    contentItem: Column {
+      width: bulkTagPopup.availableWidth
+      spacing: Style.space(9)
+
+      Text {
+        width: parent.width
+        text: root.bulkTagCount === 1
+          ? "Tags for 1 note" : "Tags for " + root.bulkTagCount + " notes"
+        textFormat: Text.PlainText
+        color: Commons.Color.foreground
+        font.family: Style.font.family
+        font.pixelSize: Style.font.title
+        font.bold: true
+      }
+
+      TextField {
+        id: bulkTagField
+        objectName: "bulkTagField"
+        width: parent.width
+        placeholderText: "Tags, comma or space separated"
+        font.pixelSize: Style.font.bodySmall
+        onTextEdited: if (root.bulkTagError !== "") root.bulkTagError = ""
+        onAccepted: root.confirmBulkTags("add")
+      }
+
+      Text {
+        width: parent.width
+        visible: root.bulkTagError !== ""
+        text: root.bulkTagError
+        textFormat: Text.PlainText
+        wrapMode: Text.WordWrap
+        color: Commons.Color.urgent
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
+      }
+
+      Row {
+        width: parent.width
+        spacing: Style.space(6)
+
+        Item {
+          width: Math.max(0, parent.width - bulkTagCancel.width
+            - bulkTagRemove.width - bulkTagAdd.width - parent.spacing * 3)
+          height: 1
+        }
+
+        Button {
+          id: bulkTagCancel
+          objectName: "bulkTagCancelButton"
+          text: "Cancel"
+          fontSize: Style.font.bodySmall
+          horizontalPadding: Style.space(10)
+          verticalPadding: Style.space(5)
+          onClicked: bulkTagPopup.close()
+        }
+        Button {
+          id: bulkTagRemove
+          objectName: "bulkTagRemoveButton"
+          text: "Remove"
+          active: root.bulkTagMode === "remove"
+          enabled: bulkTagField.text.trim() !== ""
+          fontSize: Style.font.bodySmall
+          horizontalPadding: Style.space(10)
+          verticalPadding: Style.space(5)
+          onClicked: root.confirmBulkTags("remove")
+        }
+        Button {
+          id: bulkTagAdd
+          objectName: "bulkTagAddButton"
+          text: "Add"
+          active: root.bulkTagMode !== "remove"
+          enabled: bulkTagField.text.trim() !== ""
+          fontSize: Style.font.bodySmall
+          horizontalPadding: Style.space(10)
+          verticalPadding: Style.space(5)
+          onClicked: root.confirmBulkTags("add")
+        }
+      }
+    }
+  }
+
+  // ------------------------------------------------------- quick switcher
+  QuickSwitcher {
+    id: quickSwitcher
+    entries: root.titleIndex
+    selectedId: root.selectedId
+    loading: root.titlesLoading
+    onNoteChosen: function(id, detached) { root.openNoteFromSwitcher(id, detached) }
+  }
+
   // ---------------------------------------------------------- rename dialog
   Popup {
     id: renameNotePopup
@@ -3230,6 +4941,112 @@ Item {
     }
   }
 
+  // ------------------------------------------------- rename link updates
+  // Dry runs that found `[[old title]]` links ask before rewriting other
+  // notes. Skipping still renames; the links keep pointing at the old title
+  // and show up under Broken links.
+  Popup {
+    id: renameLinksPopup
+    objectName: "renameLinksPopup"
+    parent: Overlay.overlay
+    anchors.centerIn: Overlay.overlay
+    width: Style.space(380)
+    padding: Style.space(12)
+    modal: true
+    dim: true
+    focus: true
+    closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+    onClosed: {
+      root.pendingRename = null
+      root.renameLinksSourceTitle = ""
+    }
+    background: BorderSurface {
+      color: Commons.Color.background
+      borderSpec: Border.controlSpec("normal", Commons.Color.foreground, Commons.Color.accent)
+      radius: Style.cornerRadius
+    }
+
+    contentItem: Column {
+      width: renameLinksPopup.availableWidth
+      spacing: Style.space(10)
+
+      Text {
+        width: parent.width
+        text: "Update links?"
+        textFormat: Text.PlainText
+        color: Commons.Color.foreground
+        font.family: Style.font.family
+        font.pixelSize: Style.font.title
+        font.bold: true
+      }
+
+      Text {
+        objectName: "renameLinksMessage"
+        width: parent.width
+        text: root.renameLinksMessageText()
+        textFormat: Text.PlainText
+        elide: Text.ElideRight
+        color: Util.alpha(Commons.Color.foreground, 0.56)
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
+      }
+
+      Row {
+        width: parent.width
+        spacing: Style.space(6)
+
+        Item {
+          width: Math.max(0, parent.width - renameLinksUpdateButton.width
+            - renameLinksSkipButton.width - renameLinksCancelButton.width
+            - parent.spacing * (renameLinksUpdateButton.visible ? 3 : 2))
+          height: 1
+        }
+
+        Button {
+          id: renameLinksUpdateButton
+          objectName: "renameLinksUpdateButton"
+          width: visible ? implicitWidth : 0
+          visible: !!root.pendingRename && Number(root.pendingRename.count || 0) > 0
+          text: "Update links"
+          active: true
+          fontSize: Style.font.bodySmall
+          horizontalPadding: Style.space(10)
+          verticalPadding: Style.space(5)
+          onClicked: {
+            if (!root.pendingRename) return
+            root.performRename(root.pendingRename.id, root.pendingRename.title, "update")
+          }
+        }
+        Button {
+          id: renameLinksSkipButton
+          objectName: "renameLinksSkipButton"
+          text: "Just rename"
+          fontSize: Style.font.bodySmall
+          horizontalPadding: Style.space(10)
+          verticalPadding: Style.space(5)
+          onClicked: {
+            if (!root.pendingRename) return
+            root.performRename(root.pendingRename.id, root.pendingRename.title, "skip")
+          }
+        }
+        Button {
+          id: renameLinksCancelButton
+          objectName: "renameLinksCancelButton"
+          text: "Cancel"
+          fontSize: Style.font.bodySmall
+          horizontalPadding: Style.space(10)
+          verticalPadding: Style.space(5)
+          onClicked: {
+            root.pendingRename = null
+            root.renameLinksSourceTitle = ""
+            renameLinksPopup.close()
+            root.statusText = "Cancelled"
+          }
+        }
+      }
+    }
+  }
+
   // ------------------------------------------------------- delete forever
   // Permanent deletion always goes through this modal; a menu row alone is
   // never the confirmation.
@@ -3256,7 +5073,9 @@ Item {
 
       Text {
         width: parent.width
-        text: "Delete note forever?"
+        text: root.pendingDeleteIds.length > 1
+          ? "Delete " + root.pendingDeleteIds.length + " notes forever?"
+          : "Delete note forever?"
         textFormat: Text.PlainText
         color: Commons.Color.foreground
         font.family: Style.font.family
@@ -3267,7 +5086,9 @@ Item {
       Text {
         objectName: "deleteNoteTitle"
         width: parent.width
-        text: "“" + root.deleteNoteTargetTitle + "” will be permanently deleted. This cannot be undone."
+        text: root.pendingDeleteIds.length > 1
+          ? root.pendingDeleteIds.length + " notes will be permanently deleted. This cannot be undone."
+          : "“" + root.deleteNoteTargetTitle + "” will be permanently deleted. This cannot be undone."
         textFormat: Text.PlainText
         wrapMode: Text.WordWrap
         color: Util.alpha(Commons.Color.foreground, 0.56)
@@ -3294,6 +5115,7 @@ Item {
           verticalPadding: Style.space(5)
           onClicked: {
             root.deleteNoteTargetId = ""
+            root.pendingDeleteIds = []
             deleteNotePopup.close()
           }
         }
@@ -3359,7 +5181,7 @@ Item {
 
         Button {
           objectName: "exportMarkdownButton"
-          width: (parent.width - parent.spacing) / 2
+          width: (parent.width - parent.spacing * 2) / 3
           text: "Markdown"
           active: root.exportFormat === "markdown"
           enabled: !root.exporting
@@ -3370,7 +5192,7 @@ Item {
         }
         Button {
           objectName: "exportHtmlButton"
-          width: (parent.width - parent.spacing) / 2
+          width: (parent.width - parent.spacing * 2) / 3
           text: "HTML"
           active: root.exportFormat === "html"
           enabled: !root.exporting
@@ -3378,6 +5200,17 @@ Item {
           horizontalPadding: Style.space(8)
           verticalPadding: Style.space(5)
           onClicked: root.setExportFormat("html")
+        }
+        Button {
+          objectName: "exportPdfButton"
+          width: (parent.width - parent.spacing * 2) / 3
+          text: "PDF"
+          active: root.exportFormat === "pdf"
+          enabled: !root.exporting
+          fontSize: Style.font.bodySmall
+          horizontalPadding: Style.space(8)
+          verticalPadding: Style.space(5)
+          onClicked: root.setExportFormat("pdf")
         }
       }
 
@@ -3401,7 +5234,7 @@ Item {
         width: parent.width
         text: root.exportError !== ""
           ? root.exportError
-          : "Markdown copies the current buffer verbatim. HTML is one standalone file with embedded images and maths."
+          : "Markdown copies the buffer verbatim; HTML is one standalone file with embedded images and maths, and PDF prints that same rendering via headless Chromium."
         textFormat: Text.PlainText
         wrapMode: Text.WordWrap
         color: root.exportError !== ""
@@ -3444,6 +5277,55 @@ Item {
     }
   }
 
+  // ------------------------------------------------------- version history
+  // Restoring is only offered while the open buffer is clean: the store
+  // snapshots the current note first, so any unsaved text would be captured
+  // as the "before restore" entry instead of being written.
+  VersionHistory {
+    id: versionHistory
+    storePath: root.storePath
+    canRestore: root.loaded && !root.dirty && root.saveState !== "Saving…"
+      && !root.loadingNote && root.writesAllowed
+    onRestored: function(id) {
+      if (id === root.selectedId) {
+        // The watcher may report the restored bytes before loadNote() finishes.
+        // A restore is only possible from a clean buffer, so any pending
+        // conflict belongs to an older disk state and must not become a banner.
+        root.diskChangePending = false
+        root.diskChangeText = ""
+        root.loadNote()
+      }
+      root.statusText = "Restored version"
+    }
+  }
+
+  // --------------------------------------------------------- tag dialogs
+  // The dialog owns the wording and merge warning; the write stays here so it
+  // passes through the same WritableGuard queue as every other command.
+  TagManager {
+    id: tagManager
+    parent: Overlay.overlay
+    anchors.centerIn: Overlay.overlay
+    width: Style.space(380)
+    tags: root.tags
+    onCommitRequested: function(action, tag, next) {
+      root.applyTagAction(String(action || ""), String(tag || ""), String(next || ""))
+    }
+  }
+
+  // Templates are files, so this panel is only an editor; a template created
+  // from the CLI appears in the menu on the next load.
+  TemplateManager {
+    id: templateManager
+    parent: Overlay.overlay
+    anchors.centerIn: Overlay.overlay
+    width: Style.space(760)
+    height: Style.space(520)
+    storePath: root.storePath
+    dataRoot: root.dataRoot
+    onTemplatesChanged: root.loadTemplates()
+  }
+
   // ------------------------------------------------------- template menu
   // Kept out of the main New note button: Ctrl+N and the button itself stay
   // an instant blank note. The chevron opts in to a built-in template.
@@ -3477,25 +5359,30 @@ Item {
 
     MenuSeparator {}
 
+    // Template entries are inserted between this separator and the manage
+    // item by rebuildTemplateMenu(); index 2 is the first free slot.
     ContextMenuItem {
-      objectName: "templateMeetingItem"
-      text: "Meeting notes"
-      onTriggered: root.createNoteFromTemplate("meeting")
+      objectName: "templateManageItem"
+      text: "Manage templates…"
+      onTriggered: {
+        newNoteTemplateMenu.close()
+        root.openTemplateManager()
+      }
     }
+  }
+
+  Component {
+    id: templateMenuItemComponent
     ContextMenuItem {
-      objectName: "templateDailyItem"
-      text: "Daily log"
-      onTriggered: root.createNoteFromTemplate("daily")
-    }
-    ContextMenuItem {
-      objectName: "templateProjectItem"
-      text: "Project spec"
-      onTriggered: root.createNoteFromTemplate("project")
-    }
-    ContextMenuItem {
-      objectName: "templateTasksItem"
-      text: "Task list"
-      onTriggered: root.createNoteFromTemplate("tasks")
+      id: templateMenuItem
+      property string templateId: ""
+      property string templateDescription: ""
+      onTriggered: {
+        newNoteTemplateMenu.close()
+        if (templateMenuItem.templateId !== "") {
+          root.createNoteFromTemplate(templateMenuItem.templateId)
+        }
+      }
     }
   }
 
@@ -3573,6 +5460,21 @@ Item {
             onClicked: root.openInEditor()
           }
 
+          Button {
+            objectName: "historyButton"
+            visible: !!root.selectedNote && !root.selectedNote.trashed
+            width: Style.space(23)
+            height: Style.space(23)
+            text: ""
+            iconText: "\uf1da"
+            iconSize: Style.font.bodySmall
+            tooltipText: "Version history"
+            horizontalPadding: 0
+            verticalPadding: 0
+            onClicked: versionHistory.openFor(root.selectedId,
+              root.selectedNote ? root.selectedNote.title : "")
+          }
+
           Dropdown {
             visible: !!root.selectedNote && !root.selectedNote.trashed
             width: root.compactHeader ? Style.space(104) : Style.space(136)
@@ -3603,7 +5505,7 @@ Item {
           }
           Button {
             visible: !!root.selectedNote && !root.selectedNote.trashed && !root.compactHeader
-            text: root.deleteArmed && root.deleteArmId === root.selectedId ? "Confirm trash" : "Trash"
+            text: root.deleteArmed && root.deleteArmId === root.selectionArmKey() ? "Confirm trash" : "Trash"
             foreground: root.deleteArmed ? Commons.Color.urgent : Util.alpha(Commons.Color.foreground, 0.6)
             fontSize: Style.font.bodySmall
             horizontalPadding: Style.space(7)
@@ -3620,7 +5522,7 @@ Item {
           }
           Button {
             visible: !!root.selectedNote && !!root.selectedNote.trashed && !root.compactHeader
-            text: root.deleteArmed && root.deleteArmId === root.selectedId ? "Confirm delete" : "Delete forever"
+            text: root.deleteArmed && root.deleteArmId === root.selectionArmKey() ? "Confirm delete" : "Delete forever"
             foreground: root.deleteArmed ? Commons.Color.urgent : Util.alpha(Commons.Color.foreground, 0.6)
             fontSize: Style.font.bodySmall
             horizontalPadding: Style.space(7)

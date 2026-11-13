@@ -80,6 +80,11 @@ function isMutatingArgs(args) {
   if (command === "folder") return true
   if (command === "draft") return stringValue(args[1]) === "discard"
   if (command === "attachment") return stringValue(args[1]) !== "list"
+  if (command === "searches") return stringValue(args[1]) !== "list"
+  if (command === "templates") {
+    var templatesAction = stringValue(args[1])
+    return templatesAction === "save" || templatesAction === "delete"
+  }
   var mutating = {
     "write": 1,
     "create": 1,
@@ -92,7 +97,9 @@ function isMutatingArgs(args) {
     "empty-trash": 1,
     "pin": 1,
     "tag-add": 1,
+    "tag-remove": 1,
     "tag-rename": 1,
+    "tag-delete": 1,
     "import-omanano": 1,
     "index": 1,
     "restore-version": 1

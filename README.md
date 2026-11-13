@@ -47,6 +47,7 @@ backlinks. Deleting `index.db` is safe; it is rebuilt automatically.
   scripts/quill-spellcheck  local hunspell spellcheck helper (JSON in / JSON out)
   scripts/quill-math   offline TeX → themed SVG renderer (JSON in / JSON out)
   scripts/quill-export-html  Markdown → one standalone HTML file (images + SVG maths)
+  scripts/quill-export-pdf   Markdown → PDF via that renderer + headless Chromium
   scripts/quill-window launcher for Detached.qml (stages it for `qs -p`)
   vendor/              vendored MathJax 3.2.2 (Apache-2.0), see vendor/README.md
   tools/               Joplin mirror scripts + systemd units (reference copies)
@@ -111,6 +112,15 @@ and YAML frontmatter is never rewritten). The chips, sidebar counts and Joplin
 mirror update as usual. The chip is hidden for trashed, read-only, too-large
 and draft-pending notes.
 
+The sidebar groups nested tags by their `/` segments. `#project/app` and
+`#project/site` both live under a `#project` parent whose count is the whole
+subtree; clicking the parent filters to every note carrying that prefix, and
+clicking a leaf filters to that exact tag. Right-click a real tag (or use its
+`⋯` button) to rename it, merge it into another tag, or delete it everywhere.
+Renaming onto an existing tag merges the two and removes the duplicate
+entries; every affected note is snapshotted first, so a bulk mistake is
+recoverable from version history.
+
 ## Crash drafts
 
 Edits are saved to the note after 600 ms, and a separate draft is written
@@ -140,12 +150,18 @@ Draft writes never wake the Joplin sync. Only the normal note save does.
 | `Ctrl+N` | New note |
 | `Ctrl+Shift+N` | New note in the current folder |
 | `Ctrl+F`, `/` | Focus search |
-| `Ctrl+P` | Pin / unpin |
+| `Ctrl+Shift+F` | Focus search and show the filter grammar hint |
+| `Ctrl+P` | Quick switcher: jump to any note; `Ctrl+Enter` opens it detached |
+| `Ctrl+Shift+P` | Pin / unpin the selection |
+| `Ctrl+A` | Select all visible notes |
+| `Ctrl+click`, `Shift+click` | Toggle one row / extend the range from the anchor |
+| `Shift+↑` / `Shift+↓` | Move the active note and extend the selection |
+| `Ctrl+Shift+T` | Add or remove tags on the selection |
 | `Ctrl+E` | Cycle Edit → Split → Preview |
 | `Ctrl+T` | Insert a 3×3 table at the caret and open the grid |
 | `Ctrl+S` | Flush the 600 ms autosave now |
 | `Ctrl+Shift+O` | Open the current note in Omarchy's editor (pencil button) |
-| `Ctrl+Shift+E` | Export the current buffer as Markdown or HTML |
+| `Ctrl+Shift+E` | Export the current buffer as Markdown, HTML or PDF |
 | `Ctrl+B` / `Ctrl+I` | Bold / italic |
 | `Ctrl+U` / `Ctrl+Shift+X` | Underline / strikethrough |
 | `Ctrl+Shift+H` | Highlight (==text==) |
@@ -154,7 +170,7 @@ Draft writes never wake the Joplin sync. Only the normal note save does.
 | `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo |
 | `Ctrl+Shift+Enter` | Open the library in its own window |
 | `Ctrl+Return` | Open the selected note in a detached window |
-| `Ctrl+Delete` | Trash (press twice; again to delete forever in Trash) |
+| `Ctrl+Delete` | Trash the selection (press twice; again to delete forever in Trash) |
 | `Shift+F10`, `Menu` | Note actions menu for the selected note |
 | `Ctrl+1` / `Ctrl+2` / `Ctrl+3` | Focus sidebar / list / editor |
 | `Esc` | Clear search, then close |
@@ -170,28 +186,47 @@ a mode button or press `Ctrl+E`.
 
 **New note** (and `Ctrl+N`) creates a blank `# Untitled` note immediately.
 `Ctrl+Shift+N` does the same in the current folder. The small `▾` beside the
-The chevron beside **New note** offers built-in templates; like the New note button, they create the note in the Inbox:
+New note button opens the template menu.
 
-| Template | Starting point |
-| --- | --- |
-| Meeting notes | attendees, agenda, notes, decisions, action items |
-| Daily log | focus, log, tomorrow |
-| Project spec | goal, scope, milestones, risks, links |
-| Task list | three empty checkboxes |
+Templates are Markdown files in `<data>/templates/`, one per template, with
+frontmatter for `name`, `description` and `icon`:
+
+```markdown
+---
+name: Weekly review
+description: What moved, what stalled, what is next
+icon: ★
+---
+
+# Weekly review — {{date}}
+
+## Wins
+-
+```
+
+The four templates that ship with Quill (Meeting notes, Daily log, Project
+spec, Task list) are written there on first run and can be edited, renamed or
+deleted like any other. **Manage templates…** at the bottom of the menu opens
+the editor: pick a template or press **New template**, set the fields and body,
+then **Save** (or **Delete…** twice). Adding a template never requires editing
+QML — `quill-store templates save weekly-review --name … --content-file …`
+works too, and the menu picks it up on the next open.
 
 Templates fill `{{date}}`, `{{time}}` and `{{datetime}}` with the local time
-when the note is created. The menu also has a **Blank note** row. Templates are
-plain Markdown; edit or delete any section after creation. Built-in templates
-cannot be changed from the UI.
+when the note is created; any other `{{…}}` is left as written. The menu also
+has a **Blank note** row. Templates are plain Markdown; edit or delete any
+section after creation.
 
 ## Note actions
 
 Right-click a row in the note list (or select it and press `Shift+F10` or the
 `Menu` key) to open a themed context menu at the pointer. It flips and clamps
 to stay inside the window. On an active note the menu offers **Pin** /
-**Unpin**, **Rename…**, **Duplicate**, **Move to folder…** and **Move to
-Trash**; the folder chooser lists Inbox and every folder. In Trash it offers
-**Restore** and **Delete forever…**.
+**Unpin**, **Rename…**, **Duplicate**, **Move to folder…**, **Add tag…**,
+**Remove tag…**, **Move to Trash**, and **Select all** when more than one row is
+visible; the folder chooser lists Inbox and every folder. With more than one
+row selected the same menu shows plural bulk actions and drops Rename and
+Duplicate. In Trash it offers **Restore** and **Delete forever…**.
 
 **Rename** opens a modal with the current title prefilled and keeps the same
 file id. A frontmatter `title` is updated when present, otherwise the first
@@ -202,6 +237,27 @@ are not copied, and the new copy is selected after the list refreshes.
 
 **Delete forever…** always opens a confirmation dialog naming the note.
 Closing the menu is not a confirmation.
+
+## Bulk actions
+
+Select more than one row with `Ctrl+click`, a `Shift+click` range, `Shift+↑` /
+`Shift+↓`, or `Ctrl+A`. Ranges grow from the row where the selection started,
+so the same keys can shrink a range again. The row the editor is showing stays
+the active note and follows the end of a Shift range.
+
+The context menu and keyboard shortcuts then act on the whole selection:
+**Pin 3 notes**, **Move 3 notes to folder…**, **Move 3 notes to Trash**,
+**Add tag…**, **Remove tag…**, and **Ctrl+Shift+P** / **Ctrl+Delete** /
+**Ctrl+Shift+T** do the same without opening the menu. `Ctrl+Delete` still asks
+for a second press. In Trash the same selection can be restored or deleted
+forever in one action. The bulk tag prompt takes one space- or
+comma-separated list.
+
+Dragging a row onto a folder in the library rail moves it there; dragging a
+row that is part of a multi-selection moves the whole selection. Dropping on
+**Inbox** clears the folder. After a trash, the status bar shows **Undo** for
+twelve seconds; it restores that whole batch in one step. A second trash
+replaces the pending Undo.
 
 ## Bar / IPC
 
@@ -246,6 +302,30 @@ slim rail with a **›** button and a vertical label. The state is per shell
 session only. **Ctrl+1** / **Ctrl+2** reopen the target pane if it is collapsed
 and then focus it; **Ctrl+F** also reopens Notes when needed. The detached note
 window keeps its own fixed two-pane layout and is unaffected.
+
+## Search filters
+
+The search box takes filters in the same query string as ordinary words:
+
+| Filter | Matches |
+| --- | --- |
+| `tag:alpha`, `tag:"two words"` | Notes carrying that tag |
+| `folder:Projects` | That folder and every folder below it |
+| `folder:` | The Inbox (notes with no folder) |
+| `after:2025-01-01` | Modified on or after that local day |
+| `before:2025-02-01` | Modified before that local day |
+| `"exact phrase"` | Words in that order |
+| `-term`, `-tag:x`, `-folder:y` | Exclude a word or filter |
+
+Plain terms still use prefix matching and the typo-tolerant fallback, so
+`proj` finds "project" and near misses appear with `≈`. **Ctrl+Shift+F** focuses
+the search box and shows a one-line reminder of the grammar without replacing
+the current query.
+
+Searches worth keeping can be saved from the sidebar: run a query, then click
+**＋** beside the **SEARCHES** header. Clicking a saved search re-runs it, and
+**×** on the row removes it. Saved searches live in the store (`quill-store
+searches`), not in shell configuration.
 
 ## Formatting toolbar
 
@@ -450,6 +530,23 @@ autosaves so the external text is not overwritten). **Reload** replaces the
 buffer with the disk text; **Keep mine** keeps the local text and saves it over
 the external change.
 
+## Markdown preview
+
+The preview splits a note into blocks, so it can render what Qt's
+`Text.MarkdownText` cannot: task checkboxes, GFM tables, images with the size
+handles described below, display and inline maths, footnotes (`[^note]`, with
+first-reference numbering and a clickable jump to the notes section), Pandoc
+definition lists (a bold `Term` line followed by indented `: definition`
+lines), and syntax-highlighted fenced code for JavaScript/TypeScript, Python,
+shell, JSON, YAML, HTML/CSS, SQL, Rust, C/C++, Go, Markdown and diff. Nested
+blockquotes, inline `<kbd>` key caps (theme-coloured) and `<mark>` highlights
+render through the RichText path.
+
+Raw HTML is a sanitised allowlist (`<u>`, `<span style>`, `<sup>`, `<sub>`,
+`<kbd>`, `<mark>`, `<b>`, `<i>`, `<s>`, `<code>`, `<var>`, `<samp>`, `<cite>`,
+`<dfn>`, `<del>`, `<ins>`, `<br>`), not full HTML: anything else stays literal
+text. The preview always renders the saved body, so edits appear after autosave.
+
 ## Tables
 
 Quill treats GitHub-flavoured Markdown tables as first-class blocks. A table
@@ -623,9 +720,9 @@ the note for Joplin and does not upload its rendered SVGs.
 - Inline maths inside code spans and fenced code is intentionally ignored.
 - A text block that contains inline maths is rendered by Quill's HTML
   converter as Qt RichText instead of `Text.MarkdownText`. Paragraph spacing is
-  matched to MarkdownText, but exotic Markdown in the same block (footnotes,
-  definition lists, raw HTML) may look slightly different, and MarkdownText-only
-  niceties such as footnotes are not available in that block.
+  matched to MarkdownText, but raw HTML in the same block follows the
+  sanitised allowlist, so it can look slightly different. Footnotes and
+  definition lists have their own blocks and are unaffected.
 - Display maths is recognised when its markers start a top-level line (leading
   indentation is allowed). Markers nested inside blockquotes or list items are
   not split out reliably and may stay literal text.
@@ -783,12 +880,20 @@ dialog for the current editor buffer:
   base64 `data:` URIs and maths as inline SVG. Remote `http(s)` images stay
   remote; missing, non-image or larger-than-10-MiB files become an inline
   "missing image" note instead of breaking the export.
+- **PDF** reuses that HTML renderer, injects a print stylesheet and prints it
+  with a headless Chromium/Chrome: A4 paper with 18 mm margins by default,
+  code wrapped instead of clipped, and blocks kept off page breaks. It needs
+  `chromium` (or another Chrome-family browser) on `PATH`, or `QUILL_CHROMIUM`
+  pointing at one; when no browser is found the export fails with a clear
+  message and writes nothing. Only the chosen PDF file is written.
 
 The dialog validates absolute paths, expands a leading `~/`, and never creates
 parent directories. Export reads the live buffer, so unsaved edits are
 included, but it does not save the note, create a Joplin note, or wake the
 Joplin sync. `scripts/quill-export-html` is the self-contained renderer used by
 the HTML option; it uses the vendored MathJax tree and needs no install step.
+`scripts/quill-export-pdf` drives that renderer and a headless browser for the
+PDF option.
 
 ## Joplin sync
 
@@ -923,7 +1028,11 @@ printf '# Hello\n' | $S write <id> --stdin
 printf '# Hello\n' | $S write <id> --create --stdin   # create a missing mapped id
 $S draft discard <id>                      # delete <note>.draft, keep the note
 $S create [--folder F] [--title T] [--content-stdin]
-$S create --template <meeting|daily|project|tasks> [--folder F]
+$S create --template <id> [--folder F]
+$S templates list
+$S templates show <id>
+$S templates save <id> [--name N] [--description D] [--icon I] [--content-file F]
+$S templates delete <id>
 $S rename <id> --title "New title"
 $S duplicate <id>                          # same folder, "<title> copy" title
 $S move <id> --folder "Work/Projects"
@@ -947,6 +1056,13 @@ $S attachment list
 $S attachment gc [--dry-run]
 $S stats
 ```
+
+For a long-lived backend, `scripts/quill-daemon` starts or reuses one
+`quill-store __serve` process on a Unix socket (never inside the data root) and
+bridges stdin/stdout to it. Commands, JSON shapes and errors are unchanged, the
+index stays warm and current through an inotify watcher, and `--status` /
+`--stop` inspect or stop the daemon. `scripts/bench --daemon` times the same
+metrics through one persistent socket instead of one process per command.
 
 `write --content-file <path>` is an additive convenience used by the QML
 editor, which cannot reliably close a child process's stdin. Files named
@@ -1021,11 +1137,12 @@ overwrites an existing note. OmaNano's files are never moved or modified.
 - The library and a detached window can both edit the same note. Draft files
   are last-writer-wins; close one window before switching to the other if both
   have the note dirty.
-- Markdown rendering is Qt's GitHub-dialect `Text.MarkdownText`; exotic
-
-  extensions (footnotes, definition lists, raw HTML) are not previewed. A text
-  block containing inline maths is rendered as RichText instead, so those
-  extensions are unavailable in that particular block (see **Maths → Limits**).
+- Markdown rendering is split between Qt's GitHub-dialect
+  `Text.MarkdownText` and Quill's RichText converter. Footnotes, definition
+  lists and fenced code have their own blocks; raw HTML is a sanitised
+  allowlist rather than full HTML. A text block containing inline maths
+  switches that whole block to RichText, so its paragraph spacing can differ
+  slightly from MarkdownText (see **Maths → Limits**).
 - Table formulas are Quill-only display helpers. Joplin shows the literal
   `=…` text, computed values are not exported, and sorting rows does not rewrite
   cell references.

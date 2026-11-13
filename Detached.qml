@@ -666,6 +666,25 @@ ShellRoot {
             verticalPadding: 0
             onClicked: root.openInEditor()
           }
+
+          Button {
+            objectName: "historyButton"
+            visible: root.noteId !== ""
+            width: Style.space(23)
+            height: Style.space(23)
+            text: ""
+            iconText: "\uf1da"
+            iconSize: Style.font.bodySmall
+            tooltipText: "Version history"
+            horizontalPadding: 0
+            verticalPadding: 0
+            onClicked: {
+              // A dirty buffer is saved first; restore is only enabled once the
+              // write lands, and the dialog explains the wait.
+              if (root.dirty && root.writesAllowed) root.save()
+              versionHistory.openFor(root.noteId, root.noteTitle)
+            }
+          }
         }
       }
 
@@ -797,10 +816,24 @@ ShellRoot {
           }
         }
       }
+
+      VersionHistory {
+        id: versionHistory
+        storePath: root.storePath
+        canRestore: root.loaded && !root.dirty && !root.saving && root.writesAllowed
+        onRestored: function(id) {
+          root.loadNote()
+          root.statusText = "Restored version"
+        }
+      }
     }
 
     Shortcut { sequence: "Ctrl+S"; onActivated: root.save() }
     Shortcut { sequence: "Ctrl+Shift+O"; onActivated: root.openInEditor() }
-    Shortcut { sequence: "Escape"; onActivated: window.visible = false }
+    Shortcut {
+      sequence: "Escape"
+      enabled: !versionHistory.opened
+      onActivated: window.visible = false
+    }
   }
 }

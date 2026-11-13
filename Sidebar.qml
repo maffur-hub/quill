@@ -3,6 +3,7 @@ import QtQuick.Controls
 import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
+import "TagTree.js" as TagTree
 
 // Left library rail: saved views, tag counts and the folder tree.
 BorderSurface {
@@ -11,6 +12,8 @@ BorderSurface {
   property var notes: []
   property var folders: []
   property var tags: []
+  property var savedSearches: []
+  property string activeSearch: ""
   property string category: "all"
   property int trashCount: 0
 
@@ -18,10 +21,19 @@ BorderSurface {
   signal createFolderRequested(string path)
   signal renameFolderRequested(string path, string next)
   signal deleteFolderRequested(string path)
+  signal savedSearchSelected(string query)
+  signal savedSearchRemoveRequested(string query)
+  signal savedSearchSaveRequested()
+  // Pure parent rows open a subtree; leaves keep using categorySelected.
+  signal tagSubtreeSelected(string prefix)
+  signal tagActionRequested(string tag, string action)
   signal collapseRequested()
+  // Payload is newline-separated note ids; folder is "" for the Inbox.
+  signal noteDropRequested(string payload, string folder)
 
   property string renamingPath: ""
   property bool creatingFolder: false
+  property string tagMenuTag: ""
 
   readonly property int pinnedCount: countWhere(function(note) { return !!note.pinned })
   readonly property int recentCount: countWhere(function(note) { return Date.now() - Number(note.modified || 0) < 7 * 86400000 })
@@ -47,6 +59,25 @@ BorderSurface {
 
   function beginRename(path) {
     renamingPath = path
+  }
+
+  // Place the tag menu under its row, flipping it when the window edge is
+  // close. The menu lives on the overlay so it can paint past the sidebar.
+  function openTagMenu(tag, row) {
+    var overlay = Overlay.overlay
+    if (!overlay || !row) return
+    tagMenuTag = String(tag)
+    var point = row.mapToItem(overlay, Style.space(8), row.height)
+    var margin = Style.space(4)
+    var width = tagMenu.width > 0 ? tagMenu.width : tagMenu.implicitWidth
+    var height = tagMenu.implicitHeight
+    var x = Number(point.x || 0)
+    var y = Number(point.y || 0)
+    if (x + width + margin > overlay.width) x -= width
+    if (y + height + margin > overlay.height) y -= height
+    x = Math.max(margin, Math.min(x, overlay.width - width - margin))
+    y = Math.max(margin, Math.min(y, overlay.height - height - margin))
+    tagMenu.popup(x, y)
   }
 
   function focusFirst() {
@@ -134,6 +165,66 @@ BorderSurface {
         width: railFlick.width
         spacing: Style.space(3)
 
+        Row {
+          width: parent.width
+          height: Style.space(24)
+
+          Text {
+            width: parent.width - (saveSearchButton.visible ? saveSearchButton.width : 0)
+            anchors.verticalCenter: parent.verticalCenter
+            text: "SEARCHES"
+            color: Util.alpha(Commons.Color.foreground, 0.5)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.bodySmall
+            font.bold: true
+          }
+          Button {
+            id: saveSearchButton
+            objectName: "saveSearchButton"
+            anchors.verticalCenter: parent.verticalCenter
+            width: Style.space(18)
+            height: Style.space(18)
+            text: ""
+            iconText: "＋"
+            iconSize: Style.font.bodySmall
+            horizontalPadding: 0
+            verticalPadding: 0
+            visible: root.activeSearch.trim() !== ""
+            enabled: visible
+            tooltipText: "Save current search"
+            onClicked: root.savedSearchSaveRequested()
+          }
+        }
+
+        Text {
+          visible: root.savedSearches.length === 0
+          width: parent.width
+          text: "No saved searches"
+          color: Util.alpha(Commons.Color.foreground, 0.32)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.WordWrap
+          leftPadding: Style.space(8)
+        }
+
+        Repeater {
+          model: root.savedSearches
+          delegate: SideRow {
+            required property var modelData
+            label: String(modelData.label || modelData.query)
+            count: 0
+            showCount: false
+            indent: 4
+            actionText: "×"
+            selected: root.activeSearch.trim() !== ""
+              && root.activeSearch.trim() === String(modelData.query)
+            onActivated: root.savedSearchSelected(String(modelData.query))
+            onActionTriggered: root.savedSearchRemoveRequested(String(modelData.query))
+          }
+        }
+
+        Item { width: 1; height: Style.space(6) }
+
         Text {
           width: parent.width
           height: Style.space(24)
@@ -157,14 +248,30 @@ BorderSurface {
         }
 
         Repeater {
-          model: root.tags
+          model: TagTree.build(root.tags)
           delegate: SideRow {
+            id: tagRow
             required property var modelData
-            label: "#" + String(modelData.tag)
-            count: Number(modelData.count)
-            indent: 4
-            selected: root.category === "tag:" + String(modelData.tag)
-            onActivated: root.categorySelected("tag:" + String(modelData.tag))
+            readonly property string tagPath: String(modelData.path)
+            readonly property bool realTag: modelData.isLeaf === true
+
+            label: "#" + String(modelData.label)
+            count: Number(modelData.count) || 0
+            showCount: true
+            indent: 4 + Number(modelData.depth) * 10
+            actionText: realTag ? "⋯" : ""
+            actionColor: Commons.Color.foreground
+            selected: realTag
+              ? root.category === "tag:" + tagPath
+              : root.category === "tagtree:" + tagPath
+            onActivated: {
+              if (realTag) root.categorySelected("tag:" + tagPath)
+              else root.tagSubtreeSelected(tagPath)
+            }
+            onActionTriggered: root.openTagMenu(tagPath, tagRow)
+            onRightClicked: {
+              if (realTag) root.openTagMenu(tagPath, tagRow)
+            }
           }
         }
 
@@ -227,7 +334,12 @@ BorderSurface {
           label: "Inbox"
           count: root.folderCount("")
           selected: root.category === "folder:"
+          dropEnabled: true
+          dropFolder: ""
           onActivated: root.categorySelected("folder:")
+          onDropRequested: function(payload, folder) {
+            root.noteDropRequested(payload, folder)
+          }
         }
 
         Repeater {
@@ -236,6 +348,7 @@ BorderSurface {
             id: folderItem
             required property var modelData
             readonly property string path: String(modelData)
+            property bool dropActive: false
             width: parent.width
             height: root.renamingPath === path ? Style.space(34) : Style.space(30)
 
@@ -268,9 +381,11 @@ BorderSurface {
               id: folderRow
               visible: root.renamingPath !== folderItem.path
               anchors.fill: parent
-              color: root.category === "folder:" + folderItem.path
-                ? Style.selectedAccentFill
-                : folderMouse.containsMouse ? Style.hoverFillFor(Commons.Color.foreground, Commons.Color.accent) : "transparent"
+              color: folderItem.dropActive
+                ? Util.alpha(Commons.Color.accent, 0.18)
+                : root.category === "folder:" + folderItem.path
+                  ? Style.selectedAccentFill
+                  : folderMouse.containsMouse ? Style.hoverFillFor(Commons.Color.foreground, Commons.Color.accent) : "transparent"
               borderSpec: root.category === "folder:" + folderItem.path
                 ? Border.controlSpec("selected", Commons.Color.accent, Commons.Color.accent)
                 : Border.none
@@ -346,6 +461,26 @@ BorderSurface {
                 cursorShape: Qt.PointingHandCursor
                 onClicked: root.categorySelected("folder:" + folderItem.path)
               }
+
+              DropArea {
+                id: folderDrop
+                anchors.fill: parent
+                keys: ["text/x-quill-note"]
+                onEntered: function(drag) {
+                  folderItem.dropActive = true
+                  drag.accept(Qt.MoveAction)
+                }
+                onExited: folderItem.dropActive = false
+                onDropped: function(drop) {
+                  folderItem.dropActive = false
+                  var payload = String(drop.text || "")
+                  if (payload === "" && drop.getDataAsString) {
+                    payload = String(drop.getDataAsString("text/x-quill-note") || "")
+                  }
+                  if (payload !== "") root.noteDropRequested(payload, folderItem.path)
+                  drop.accept(Qt.MoveAction)
+                }
+              }
             }
           }
         }
@@ -361,21 +496,73 @@ BorderSurface {
     }
   }
 
+  // Rename/delete for one real tag. Pure parent rows have no menu.
+  Menu {
+    id: tagMenu
+    objectName: "tagMenu"
+    parent: Overlay.overlay
+    width: Style.space(200)
+    padding: Style.space(4)
+    popupType: Qt.platform.pluginName !== "wayland" ? Popup.Window : Popup.Item
+    palette.window: Commons.Color.menu.background
+    palette.windowText: Commons.Color.menu.text
+    palette.text: Commons.Color.menu.text
+    palette.buttonText: Commons.Color.menu.text
+    palette.light: Commons.Color.menu.selectedBackground
+    palette.midlight: Util.alpha(Commons.Color.foreground, 0.12)
+    palette.mid: Util.alpha(Commons.Color.foreground, 0.16)
+    palette.dark: Commons.Color.menu.border
+
+    background: BorderSurface {
+      color: Commons.Color.menu.background
+      borderSpec: Border.controlSpec("normal", Commons.Color.menu.border,
+        Commons.Color.accent)
+      radius: Style.cornerRadius
+    }
+
+    ContextMenuItem {
+      objectName: "tagMenuRename"
+      text: "Rename or merge…"
+      onTriggered: root.tagActionRequested(root.tagMenuTag, "rename")
+    }
+    ContextMenuItem {
+      objectName: "tagMenuDelete"
+      text: "Delete tag…"
+      onTriggered: root.tagActionRequested(root.tagMenuTag, "delete")
+    }
+  }
+
   component SideRow: BorderSurface {
     id: sideRow
 
     property string label: ""
     property int count: 0
+    property bool showCount: true
     property bool selected: false
     property int indent: 0
     property bool rowFocus: false
+    // A small hover-only action (× on saved searches, ⋯ on tags). It is a
+    // sibling of the row MouseArea, never inside it, so the action keeps its
+    // own click.
+    property string actionText: ""
+    property color actionColor: Commons.Color.urgent
+    readonly property bool hovered: rowMouse.containsMouse || actionMouse.containsMouse
+    // Inbox opts into being a drop target; other SideRows leave this off.
+    property bool dropEnabled: false
+    property string dropFolder: ""
+    property bool dropActive: false
     signal activated()
+    signal actionTriggered()
+    signal rightClicked()
+    signal dropRequested(string payload, string folder)
 
     width: parent ? parent.width : Style.space(160)
     height: Style.space(30)
-    color: selected
-      ? Style.selectedAccentFill
-      : rowMouse.containsMouse ? Style.hoverFillFor(Commons.Color.foreground, Commons.Color.accent) : "transparent"
+    color: dropActive
+      ? Util.alpha(Commons.Color.accent, 0.18)
+      : selected
+        ? Style.selectedAccentFill
+        : hovered ? Style.hoverFillFor(Commons.Color.foreground, Commons.Color.accent) : "transparent"
     borderSpec: selected ? Border.controlSpec("selected", Commons.Color.accent, Commons.Color.accent) : Border.none
     radius: Style.cornerRadius
 
@@ -396,7 +583,8 @@ BorderSurface {
 
       Text {
         id: sideLabel
-        width: parent.width - sideCount.width - parent.spacing
+        width: parent.width - (sideCount.visible ? sideCount.width + parent.spacing : 0)
+          - (sideAction.visible ? sideAction.width + parent.spacing : 0)
         anchors.verticalCenter: parent.verticalCenter
         text: sideRow.label
         textFormat: Text.PlainText
@@ -408,6 +596,7 @@ BorderSurface {
       }
       Text {
         id: sideCount
+        visible: sideRow.showCount
         anchors.verticalCenter: parent.verticalCenter
         text: String(sideRow.count)
         color: Util.alpha(Commons.Color.foreground, 0.45)
@@ -419,9 +608,58 @@ BorderSurface {
     MouseArea {
       id: rowMouse
       anchors.fill: parent
+      acceptedButtons: Qt.LeftButton | Qt.RightButton
       hoverEnabled: true
       cursorShape: Qt.PointingHandCursor
-      onClicked: sideRow.activated()
+      onClicked: function(mouse) {
+        if (mouse.button === Qt.RightButton) sideRow.rightClicked()
+        else sideRow.activated()
+      }
+    }
+
+    Text {
+      id: sideAction
+      visible: sideRow.actionText !== "" && (rowMouse.containsMouse || actionMouse.containsMouse)
+      anchors.right: parent.right
+      anchors.rightMargin: Style.space(8)
+      anchors.verticalCenter: parent.verticalCenter
+      text: sideRow.actionText
+      color: actionMouse.containsMouse ? sideRow.actionColor : Util.alpha(Commons.Color.foreground, 0.5)
+      font.family: Style.font.family
+      font.pixelSize: Style.font.body
+
+      MouseArea {
+        id: actionMouse
+        anchors.fill: parent
+        anchors.margins: -4
+        hoverEnabled: true
+        cursorShape: Qt.PointingHandCursor
+        onClicked: sideRow.actionTriggered()
+      }
+    }
+
+    DropArea {
+      id: sideDrop
+      anchors.fill: parent
+      visible: sideRow.dropEnabled
+      enabled: sideRow.dropEnabled
+      keys: ["text/x-quill-note"]
+      onEntered: function(drag) {
+        if (!sideRow.dropEnabled) return
+        sideRow.dropActive = true
+        drag.accept(Qt.MoveAction)
+      }
+      onExited: sideRow.dropActive = false
+      onDropped: function(drop) {
+        sideRow.dropActive = false
+        if (!sideRow.dropEnabled) return
+        var payload = String(drop.text || "")
+        if (payload === "" && drop.getDataAsString) {
+          payload = String(drop.getDataAsString("text/x-quill-note") || "")
+        }
+        if (payload !== "") sideRow.dropRequested(payload, sideRow.dropFolder)
+        drop.accept(Qt.MoveAction)
+      }
     }
   }
 }

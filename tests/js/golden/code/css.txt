@@ -1,0 +1,4 @@
+.note {
+  color: #f07178;
+  margin: 12px;
+}

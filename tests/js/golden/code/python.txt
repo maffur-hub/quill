@@ -1,0 +1,4 @@
+# total the values
+@cache
+def total(values: list) -> int:
+    return sum(values)

@@ -1,0 +1,112 @@
+[
+  {
+    "kind": "text",
+    "text": "# Mixed note\n\nIntro with a footnote[^one] and a task line below.\n"
+  },
+  {
+    "kind": "table",
+    "table": {
+      "header": [
+        "A",
+        "B"
+      ],
+      "aligns": [
+        "left",
+        "left"
+      ],
+      "delimiters": [
+        "---",
+        "---"
+      ],
+      "rows": [
+        [
+          "1",
+          "2"
+        ]
+      ],
+      "startLine": 4,
+      "endLine": 6
+    },
+    "startLine": 4,
+    "endLine": 6
+  },
+  {
+    "kind": "math",
+    "tex": "x^2",
+    "startLine": 8,
+    "endLine": 10
+  },
+  {
+    "kind": "code",
+    "language": "js",
+    "code": "const marker = 1\n![not an image](x.png)\n| not | table |\n| --- | --- |\n- [ ] not a task",
+    "startLine": 12,
+    "endLine": 18
+  },
+  {
+    "kind": "deflist",
+    "block": {
+      "startLine": 20,
+      "endLine": 21,
+      "groups": [
+        {
+          "term": "Term",
+          "definitions": [
+            "Definition."
+          ]
+        }
+      ]
+    },
+    "startLine": 20,
+    "endLine": 21
+  },
+  {
+    "kind": "tasks",
+    "items": [
+      {
+        "checked": true,
+        "content": "Done",
+        "indent": 0,
+        "line": 23
+      },
+      {
+        "checked": false,
+        "content": "Todo",
+        "indent": 0,
+        "line": 24
+      }
+    ]
+  },
+  {
+    "kind": "image",
+    "source": "notes/quill.png",
+    "alt": "Quill",
+    "size": {
+      "alt": "Quill",
+      "altRaw": "Quill",
+      "source": "notes/quill.png",
+      "attributes": "",
+      "width": null,
+      "height": null,
+      "hasSize": false
+    },
+    "line": 26
+  },
+  {
+    "kind": "footnotes",
+    "items": [
+      {
+        "label": "one",
+        "number": 1,
+        "text": "First definition."
+      },
+      {
+        "label": "two",
+        "number": 2,
+        "text": "Unused but kept."
+      }
+    ],
+    "startLine": -1,
+    "endLine": -1
+  }
+]

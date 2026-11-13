@@ -1,0 +1,4 @@
+SELECT name, COUNT(*) AS total
+FROM notes
+WHERE local = 'yes'
+GROUP BY name;

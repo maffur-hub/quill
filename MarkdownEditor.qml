@@ -66,6 +66,18 @@ TextArea {
   readonly property string attachHome: Quickshell.env("HOME") || "/"
   readonly property bool attachCanConfirm: root.attachPath.trim() !== ""
 
+  // Files dropped from a file manager go through the same store call as
+  // "Attach file…": DropArea hands over urls, dropPaths turns them into local
+  // paths, and the queue feeds attachFile one file at a time. dropActive only
+  // drives the highlight; dropTotal/dropDone are the batch bookkeeping.
+  property bool dropActive: false
+  property var dropQueue: []
+  property int dropTotal: 0
+  property int dropDone: 0
+  // True while the attach process belongs to a drop. The picker and Draw…
+  // share attachFile, so finishAttach must not drain the drop queue for them.
+  property bool dropSaving: false
+
   // "Draw…": a themed freehand canvas. Strokes live in memory until Insert
   // exports a white-background PNG through the same attachment pipeline, so a
   // drawing behaves exactly like any other attached image.
@@ -1175,7 +1187,12 @@ TextArea {
 
   function finishAttach(exitCode) {
     attachTimer.stop()
-    if (!root.attaching) return
+    if (!root.attaching) {
+      // The watchdog cleared attaching before the process exited. The drop
+      // queue still has to advance so a timed-out file cannot stall it.
+      root.dropFinished()
+      return
+    }
     root.attaching = false
 
     var payload = null
@@ -1189,6 +1206,7 @@ TextArea {
       root.insertAttachmentMarkdown(String(payload.markdown))
       root.attachmentAdded(String(payload.path || ""))
       if (root.drawTempPath !== "") root.completeDrawInsert(true)
+      root.dropFinished()
       return
     }
 
@@ -1205,6 +1223,99 @@ TextArea {
     if (!message) message = "Could not attach file"
     root.attachFailed(message)
     if (root.drawTempPath !== "") root.completeDrawInsert(false, message)
+    root.dropFinished()
+  }
+
+  // --------------------------------------------------------- dropped files
+
+  // DropArea hands us url objects; only local file: urls can be attached.
+  // decodeURIComponent does the UTF-8 percent-decoding (spaces, accented and
+  // non-Latin names). A trailing slash is a directory, which the store cannot
+  // copy, so it is skipped. http:, data: and url-less text drags return "".
+  function dropUrlToPath(value) {
+    var url = String(value === undefined || value === null ? "" : value)
+    if (url.slice(0, 5).toLowerCase() !== "file:") return ""
+    var path = url.slice(5)
+    // file:///home/x is local; file://host/share and file:relative are not.
+    if (path.slice(0, 2) !== "//") return ""
+    path = path.slice(2)
+    if (path.charAt(0) !== "/") return ""
+    if (path.charAt(path.length - 1) === "/") return ""
+    try {
+      path = decodeURIComponent(path)
+    } catch (error) {
+      // A stray % is not an escape. Keep the raw path rather than losing a
+      // file whose name legitimately contains one.
+    }
+    path = path.replace(/\/{2,}/g, "/")
+    if (path === "" || path.charAt(path.length - 1) === "/") return ""
+    return path
+  }
+
+  function dropPaths(urls) {
+    var output = []
+    if (!urls) return output
+    for (var i = 0; i < urls.length; i++) {
+      var path = root.dropUrlToPath(urls[i])
+      if (path === "" || output.indexOf(path) >= 0) continue
+      output.push(path)
+    }
+    return output
+  }
+
+  // A drop appends to the queue and starts only when nothing is saving.
+  // finishAttach removes the finished file and starts the next on both success
+  // and failure, so one unreadable file never stalls the rest of the batch.
+  function handleDroppedFiles(paths) {
+    if (root.storePath === "" || !root.attachAllowed()) {
+      root.attachFailed("Attachments are not available in this view")
+      return false
+    }
+    var incoming = []
+    var total = paths ? paths.length : 0
+    for (var i = 0; i < total; i++) {
+      var path = String(paths[i] === undefined || paths[i] === null ? "" : paths[i])
+      if (path !== "") incoming.push(path)
+    }
+    if (incoming.length === 0) return false
+    if (root.dropQueue.length === 0 && !root.attaching) {
+      root.dropTotal = 0
+      root.dropDone = 0
+    }
+    root.dropQueue = root.dropQueue.concat(incoming)
+    root.dropTotal += incoming.length
+    if (!root.attaching) root.dropStartNext()
+    return true
+  }
+
+  function dropStartNext() {
+    root.dropSaving = false
+    while (root.dropQueue.length > 0) {
+      // Read-only (or the note was closed) mid-queue: discard the remainder
+      // instead of attaching into a view the user can no longer edit.
+      if (!root.attachAllowed()) break
+      if (root.attachFile(String(root.dropQueue[0]))) {
+        root.dropSaving = true
+        return true
+      }
+      // attachFile can still refuse (the store went away). Skip that file and
+      // try the next rather than stalling every drop behind it.
+      root.dropQueue = root.dropQueue.slice(1)
+    }
+    root.dropQueue = []
+    return false
+  }
+
+  function dropFinished() {
+    if (root.dropSaving) {
+      root.dropSaving = false
+      root.dropQueue = root.dropQueue.slice(1)
+      root.dropDone += 1
+    }
+    if (root.attaching) return
+    // A picker or Draw… save can finish while a drop is queued behind it.
+    // Start the first queued file now that the process is free.
+    root.dropStartNext()
   }
 
   // ---------------------------------------------------------------- drawing
@@ -2516,6 +2627,55 @@ TextArea {
       onWidthChanged: requestPaint()
       onHeightChanged: requestPaint()
       onPaint: root.paintSpellSquiggles(getContext("2d"))
+    }
+  }
+
+  // File drops. keys limits the target to url drags, so an ordinary text drag
+  // inside the editor is left to the TextArea and never shows the highlight.
+  // The url guard repeats in the handlers because a drag can still contain
+  // text alongside its urls.
+  DropArea {
+    id: editorDropArea
+    objectName: "quillEditorDropArea"
+    anchors.fill: parent
+    z: 3
+    keys: ["text/uri-list"]
+
+    onEntered: function(drag) {
+      root.dropActive = root.attachAllowed() && !!drag.hasUrls
+        && root.dropPaths(drag.urls).length > 0
+    }
+    onExited: root.dropActive = false
+    onDropped: function(drop) {
+      root.dropActive = false
+      if (!drop.hasUrls) return
+      var paths = root.dropPaths(drop.urls)
+      // Copy, never move: a file-manager drop must not remove the original.
+      drop.accept(Qt.CopyAction)
+      root.handleDroppedFiles(paths)
+    }
+  }
+
+  // Highlight for an incoming file drop. Non-interactive so the DropArea above
+  // keeps the drag and the text area keeps its caret. The editor root has no
+  // radius, so the overlay stays square and flush with it.
+  Rectangle {
+    objectName: "quillDropOverlay"
+    anchors.fill: parent
+    z: 2
+    visible: root.dropActive && root.attachAllowed()
+    enabled: false
+    radius: 0
+    color: Util.alpha(Commons.Color.accent, 0.08)
+    border.width: 1
+    border.color: Util.alpha(Commons.Color.accent, 0.55)
+
+    Text {
+      anchors.centerIn: parent
+      text: "Drop to attach"
+      color: Util.alpha(Commons.Color.foreground, 0.62)
+      font.family: Style.font.family
+      font.pixelSize: Style.font.bodySmall
     }
   }
 

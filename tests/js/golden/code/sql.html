@@ -1,0 +1,4 @@
+<span style="color:#c792ea; font-weight:bold">SELECT</span> name<span style="color:#9aa0a6">,</span> <span style="color:#7aa2f7">COUNT</span><span style="color:#9aa0a6">(</span>*<span style="color:#9aa0a6">)</span> <span style="color:#c792ea; font-weight:bold">AS</span> total
+<span style="color:#c792ea; font-weight:bold">FROM</span> notes
+<span style="color:#c792ea; font-weight:bold">WHERE</span> local = <span style="color:#a3d17a">'yes'</span>
+<span style="color:#c792ea; font-weight:bold">GROUP</span> <span style="color:#c792ea; font-weight:bold">BY</span> name<span style="color:#9aa0a6">;</span>

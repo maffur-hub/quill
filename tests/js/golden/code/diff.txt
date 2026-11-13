@@ -1,0 +1,6 @@
+diff --git a/note.md b/note.md
+--- a/note.md
++++ b/note.md
+@@ -1 +1 @@
+-old
++new
