@@ -135,6 +135,14 @@ TextArea {
   signal formatRejected(string message)
 
   readonly property bool richTextVisible: highlightingEnabled && text.length < 200000
+  // Preview mode hides the editor and gives it zero width. The mirror is what
+  // paints the styled text under the caret, so without a width there is
+  // nothing to paint: laying a long note out at width 0 wraps every word onto
+  // its own line, and every frame sync during the panel's close animation
+  // re-runs that layout (hundreds of milliseconds per frame on a 36k note).
+  // Skipping the mirror while the editor has no width is invisible and keeps
+  // the fade at its designed 120 ms.
+  readonly property bool underlayHasWidth: width > 0
 
   function alpha(colorValue, opacity) {
     if (!colorValue) return Qt.rgba(0, 0, 0, opacity)
@@ -2687,7 +2695,9 @@ TextArea {
       x: root.leftPadding
       y: root.topPadding
       width: Math.max(0, root.width - root.leftPadding - root.rightPadding)
-      text: root.richTextVisible ? root.highlightedMarkdown(root.text) : root.text
+      text: root.underlayHasWidth
+        ? (root.richTextVisible ? root.highlightedMarkdown(root.text) : root.text)
+        : ""
       textFormat: root.richTextVisible ? Text.RichText : Text.PlainText
       wrapMode: Text.Wrap
       lineHeightMode: Text.FixedHeight
