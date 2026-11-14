@@ -198,6 +198,12 @@ function printStylesheet(pageSize, pageMargin) {
   return "@page { size: " + pageSize + "; margin: " + pageMargin + "; }\n"
     + "@media print {\n"
     + "  html, body { background: #fff; }\n"
+    // The on-screen wrapper pads 48/24 px; on paper that stacks on top of the
+    // @page margin and leaves the note stranded in the middle of the sheet.
+    + "  main.note { padding: 0; max-width: none; }\n"
+    // A note that opens with a heading should not be pushed down by that
+    // heading's own top margin; the @page margin is the whole top margin.
+    + "  main.note > :first-child { margin-top: 0; }\n"
     + "  pre { white-space: pre-wrap; overflow: visible; word-break: break-word; }\n"
     + "  pre, blockquote, .math-display, img, svg { break-inside: avoid; }\n"
     + "  h1, h2, h3, h4, h5, h6 { break-after: avoid; }\n"

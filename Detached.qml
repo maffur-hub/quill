@@ -7,6 +7,7 @@ import qs.Commons as Commons
 import qs.Ui
 import "ImageSizing.js" as ImageSizing
 import "MarkdownFormat.js" as MarkdownFormat
+import "WheelScroll.js" as WheelScroll
 import "WritableGuard.js" as WritableGuard
 
 // A single Quill note in its own small Quickshell process. The library's
@@ -750,6 +751,24 @@ ShellRoot {
             function ensureVisible(rect) {
               if (contentY >= rect.y) contentY = rect.y
               else if (contentY + height <= rect.y + rect.height) contentY = rect.y + rect.height - height
+            }
+
+            // Qt's built-in wheel step is fixed, which is slow in a long note
+            // and ignores how fast the wheel is spun. Scale each notch by how
+            // quickly the notches arrive: a hard spin covers ground, a single
+            // deliberate roll stays precise.
+            property var wheelState: WheelScroll.create()
+
+            WheelHandler {
+              onWheel: function(event) {
+                var step = WheelScroll.step(editorScroll.wheelState,
+                  event.angleDelta.y, event.pixelDelta.y, Date.now())
+                if (step === 0) return
+                editorScroll.contentY = Math.max(0, Math.min(
+                  editorScroll.contentHeight - editorScroll.height,
+                  editorScroll.contentY - step))
+                event.accepted = true
+              }
             }
 
             MarkdownEditor {

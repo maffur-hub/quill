@@ -1,0 +1,635 @@
+#!/usr/bin/env node
+"use strict"
+
+// quill-print - render one Quill note as a PDF and send it to a CUPS printer.
+//
+//   quill-print --input <md> --title <title> [--note-dir <dir>]
+//               [--printer <name>] [--copies <n>]
+//               [--option <key>=<value>]...
+//               [--color <css-color>] [--font-px <n>]
+//               [--page-size <css-page-size>] [--page-margin <css-length>]
+//               [--renderer <path>] [--keep-pdf] [--render-only] [--dry-run]
+//   quill-print --list [--printer <name>]
+//
+// The note is rendered by the sibling quill-export-pdf (override with
+// --renderer) into a temporary directory, then the PDF is handed to `lp`.
+// Printer discovery uses `lpstat`; both commands are optional, so the script
+// still reports a useful --list result on a machine without CUPS.
+//
+// --option passes a CUPS job option through as `lp -o KEY=VALUE`; it may be
+// repeated. The key and value are validated against `lpoptions -p <printer> -l`
+// when that command is available, and passed through unchanged otherwise.
+// --render-only never submits, and --dry-run validates without submitting.
+//
+// --list prints the printers known to CUPS and never needs --input:
+//   {"ok":true,"cups":true,"default":"EPSON_ET_8500",
+//    "printers":[{"name":"EPSON_ET_8500","accepting":true,
+//                 "state":"idle","detail":""}],
+//    "options":[{"key":"PageSize","label":"Paper","values":["A4","Letter"],
+//                "default":"A4"}]}
+// The options describe the printer --list would print to (--printer when
+// given, otherwise the CUPS default) and are limited to paper, colour,
+// two-sided and quality; the array is empty without CUPS or lpoptions.
+//
+// Success prints one JSON object:
+//   {"ok":true,"printer":"EPSON_ET_8500","job":"42","bytes":1234}
+//   {"ok":true,"dryRun":true,"printer":"EPSON_ET_8500","copies":1,
+//    "input":"/abs/note.md","options":{"Duplex":"DuplexTumble"}}
+// "pdf" is added to the printing result when --keep-pdf was passed. Failure
+// prints one message to stderr and exits 1 without leaving temporary files
+// behind; a kept PDF is only left in place after a successful run.
+
+const fs = require("fs")
+const path = require("path")
+const os = require("os")
+const { spawnSync } = require("child_process")
+
+const DEFAULT_TITLE = "Untitled"
+const DEFAULT_RENDERER = path.join(__dirname, "quill-export-pdf")
+const MIN_COPIES = 1
+const MAX_COPIES = 99
+const PDF_MAGIC = "%PDF-"
+const MIN_PDF_BYTES = 512
+const MAX_OUTPUT_BYTES = 8 * 1024 * 1024
+const COMMAND_TIMEOUT_MS = 120000
+const STDERR_TAIL_CHARS = 400
+const MAX_DETAIL_CHARS = 200
+const BOOLEAN_FLAGS = ["keep-pdf", "render-only", "dry-run", "list"]
+
+// The only lpoptions keys (and their order) exposed to callers, so a UI can
+// render model-independent choices. ColorModel is an older alias for colour
+// mode and is only used when print-color-mode is absent.
+const PRINT_OPTION_KEYS = [
+  { key: "PageSize", label: "Paper" },
+  { key: "print-color-mode", label: "Colour", fallback: "ColorModel" },
+  { key: "Duplex", label: "Two-sided" },
+  { key: "cupsPrintQuality", label: "Quality" }
+]
+
+// A queue can list 40+ paper sizes; a cycling UI row cannot use that. Report
+// only these, in this order, when the printer offers them. Validation is not
+// restricted to the shortlist: any value lpoptions reports stays printable.
+const PAPER_SHORTLIST = [
+  "A4", "Letter", "Legal", "A5", "A6", "B5", "B6",
+  "EnvDL", "EnvC6", "Env10", "4x6", "5x7", "8x10", "Postcard"
+]
+
+// Keep stdout reserved for our single JSON object.
+for (const method of ["log", "info", "warn", "debug"]) {
+  console[method] = (...args) => process.stderr.write(args.join(" ") + "\n")
+}
+
+// ------------------------------------------------------------------ helpers
+
+function fail(message) {
+  const error = new Error(message)
+  error.isUsageError = true
+  throw error
+}
+
+function parseArguments(argv) {
+  const values = {}
+  for (let i = 0; i < argv.length; i++) {
+    const argument = argv[i]
+    if (!argument.startsWith("--")) fail("unexpected argument: " + argument)
+    let key = argument.slice(2)
+    let value
+    const equals = key.indexOf("=")
+    if (equals >= 0) {
+      value = key.slice(equals + 1)
+      key = key.slice(0, equals)
+    } else if (BOOLEAN_FLAGS.includes(key)) {
+      value = true
+    } else {
+      value = argv[++i]
+    }
+    if (value === undefined) {
+      if (key === "option") fail("--option expects KEY=VALUE")
+      fail("missing value for --" + key)
+    }
+    if (key === "option") {
+      // --option is repeatable; keep every occurrence in argv order.
+      if (!Array.isArray(values.option)) values.option = []
+      values.option.push(value)
+    } else {
+      values[key] = value
+    }
+  }
+  return values
+}
+
+function stringOption(value) {
+  return String(value === undefined || value === null || value === true ? "" : value)
+}
+
+function parseCopies(value) {
+  const raw = stringOption(value).trim()
+  if (raw === "") return MIN_COPIES
+  if (!/^[0-9]+$/.test(raw)) fail("--copies must be between 1 and 99")
+  const copies = Number(raw)
+  if (copies < MIN_COPIES || copies > MAX_COPIES) {
+    fail("--copies must be between 1 and 99")
+  }
+  return copies
+}
+
+function lastNonEmptyLine(text) {
+  const lines = String(text || "").split("\n")
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim()
+    if (line !== "") return line
+  }
+  return ""
+}
+
+// The renderer explains failures on stderr; keep the useful end of it on one
+// line so our own error stays a single quill-print: message.
+function stderrTail(text) {
+  const value = String(text || "").replace(/\s+/g, " ").trim()
+  if (value.length <= STDERR_TAIL_CHARS) return value
+  return "..." + value.slice(-STDERR_TAIL_CHARS)
+}
+
+// ---------------------------------------------------------------------- CUPS
+
+function lpstat(argv) {
+  const result = spawnSync("lpstat", argv, {
+    encoding: "utf8",
+    timeout: COMMAND_TIMEOUT_MS,
+    killSignal: "SIGKILL",
+    maxBuffer: MAX_OUTPUT_BYTES
+  })
+  return {
+    available: !result.error,
+    status: result.status,
+    stdout: String(result.stdout || "")
+  }
+}
+
+// `lpoptions -p NAME -l` prints the keys and values the queue accepts. Like
+// lpstat it is optional: a missing or failing command simply means "no option
+// information", never an error of its own.
+function lpoptions(printer) {
+  if (printer === "") return ""
+  const result = spawnSync("lpoptions", ["-p", printer, "-l"], {
+    encoding: "utf8",
+    timeout: COMMAND_TIMEOUT_MS,
+    killSignal: "SIGKILL",
+    maxBuffer: MAX_OUTPUT_BYTES
+  })
+  if (result.error || result.status !== 0) return ""
+  return String(result.stdout || "")
+}
+
+// One line per option:
+//   PageSize/Media Size: *A4 Letter A5
+//   ColorModel/Output Mode: *RGB Gray
+// The first colon separates the Key/Label name from the value list; a leading
+// "*" marks the current default. Placeholders such as Custom.WIDTHxHEIGHT are
+// meaningless without a UI that can prompt for them, so they are dropped.
+function parsePrinterOptions(text) {
+  const options = []
+  for (const raw of String(text || "").split("\n")) {
+    const line = raw.trim()
+    if (line === "") continue
+    const colon = line.indexOf(":")
+    if (colon < 0) continue
+    const name = line.slice(0, colon).trim()
+    if (name === "") continue
+    const slash = name.indexOf("/")
+    const key = (slash < 0 ? name : name.slice(0, slash)).trim()
+    if (key === "") continue
+    const label = (slash < 0 ? name : name.slice(slash + 1)).trim()
+
+    const values = []
+    let marked = ""
+    for (const token of line.slice(colon + 1).trim().split(/\s+/)) {
+      if (token === "" || token.includes("Custom.")) continue
+      if (token.startsWith("*")) {
+        const value = token.slice(1)
+        if (value === "") continue
+        values.push(value)
+        marked = value
+      } else {
+        values.push(token)
+      }
+    }
+    if (values.length === 0) continue
+    options.push({
+      key: key,
+      label: label,
+      values: values,
+      default: marked !== "" ? marked : values[0]
+    })
+  }
+  return options
+}
+
+// Keep the curated paper row useful: shortlist order first, with the queue's
+// own default kept at the front when the shortlist does not cover it. A queue
+// that offers none of the shortlist falls back to everything it reports (the
+// parser has already removed Custom.* placeholders).
+function curatePaperOption(option) {
+  if (option.key !== "PageSize") return option
+  const available = new Set(option.values)
+  const values = PAPER_SHORTLIST.filter(value => available.has(value))
+  if (values.length === 0) return option
+  if (!values.includes(option.default)) values.unshift(option.default)
+  return {
+    key: option.key,
+    label: option.label,
+    values: values,
+    default: option.default
+  }
+}
+
+// Reduce the full lpoptions listing to the curated, ordered whitelist. The
+// reported key is the one CUPS itself uses, so it can be fed back through
+// --option unchanged. MediaType, InputSlot and friends stay hidden.
+function supportedPrintOptions(text, curatePapers = true) {
+  const byKey = new Map()
+  for (const option of parsePrinterOptions(text)) {
+    if (!byKey.has(option.key)) byKey.set(option.key, option)
+  }
+  const supported = []
+  for (const entry of PRINT_OPTION_KEYS) {
+    let option = byKey.get(entry.key)
+      || (entry.fallback ? byKey.get(entry.fallback) : undefined)
+    if (!option) continue
+    if (curatePapers) option = curatePaperOption(option)
+    supported.push({
+      key: option.key,
+      label: entry.label,
+      values: option.values,
+      default: option.default
+    })
+  }
+  return supported
+}
+
+// "--option KEY=VALUE", split on the first "=" only: CUPS values never need
+// one, but keeping the rest intact avoids mangling values that do.
+function parsePrintOptions(raw) {
+  const entries = []
+  if (!Array.isArray(raw)) return entries
+  for (const item of raw) {
+    const text = stringOption(item)
+    const equals = text.indexOf("=")
+    if (equals < 0) fail("--option expects KEY=VALUE")
+    const key = text.slice(0, equals).trim()
+    if (key === "") fail("--option expects KEY=VALUE")
+    entries.push({ key: key, value: text.slice(equals + 1) })
+  }
+  return entries
+}
+
+// Validation needs the queue's own list. When lpoptions is unavailable (or
+// reports nothing) there is nothing to check against, so options pass through
+// and lp itself reports any problem.
+function validatePrintOptions(entries, printer) {
+  if (entries.length === 0) return
+  // Validation sees the uncurated PageSize list, so any printable value (for
+  // example A4.Borderless) is accepted even though --list hides it.
+  const supported = supportedPrintOptions(lpoptions(printer), false)
+  if (supported.length === 0) return
+  const byKey = new Map(supported.map(option => [option.key, option]))
+  for (const entry of entries) {
+    const option = byKey.get(entry.key)
+    if (!option) fail("Unsupported print option: " + entry.key)
+    if (!option.values.includes(entry.value)) {
+      fail("Unsupported value for " + entry.key + ": " + entry.value)
+    }
+  }
+}
+
+function printOptionObject(entries) {
+  const value = {}
+  for (const entry of entries) value[entry.key] = entry.value
+  return value
+}
+
+// `lpstat -a` prints "NAME accepting requests since ..." per printer. Only the
+// first token identifies the queue; the rest is human-readable detail.
+function parsePrinters(text) {
+  const printers = []
+  for (const raw of String(text || "").split("\n")) {
+    const line = raw.trim()
+    if (line === "" || line.startsWith("lpstat:")) continue
+    printers.push({ name: line.split(/\s+/)[0], accepting: true })
+  }
+  return printers
+}
+
+function parseDefaultPrinter(text) {
+  const match = /system default destination:\s*(\S+)/.exec(String(text || ""))
+  return match ? match[1] : ""
+}
+
+function printerState(remainder) {
+  if (remainder.startsWith("is idle")) return "idle"
+  if (remainder.startsWith("is processing") || remainder.startsWith("now printing")) {
+    return "printing"
+  }
+  if (remainder.startsWith("disabled")) return "disabled"
+  return ""
+}
+
+// "Waiting for job to complete." is CUPS's way of saying the queue is healthy
+// and has nothing to do; reporting it as detail would paint the dialog red.
+const BENIGN_DETAIL = /^waiting for job to complete\.?$/i
+
+// `lpstat -p` prints one block per queue:
+//   printer EPSON_ET_8500 is idle.  enabled since Sat 14 Nov 2026 15:18:39
+//       gstoraster filter failed.
+// The state sentence shares its line with "enabled since"/"disabled since", so
+// only lines indented below it are detail. The first useful detail wins.
+function parsePrinterStates(text) {
+  const states = {}
+  let name = ""
+  for (const raw of String(text || "").split("\n")) {
+    const block = /^printer (\S+) (.*)$/.exec(raw)
+    if (block) {
+      name = block[1]
+      states[name] = { state: printerState(block[2]), detail: "" }
+      continue
+    }
+    if (!/^\s/.test(raw)) {
+      name = ""
+      continue
+    }
+    const line = raw.trim()
+    if (name === "" || line === "" || states[name].detail !== "") continue
+    if (line.startsWith("enabled since") || line.startsWith("disabled since")) continue
+    if (BENIGN_DETAIL.test(line)) continue
+    states[name].detail = line.slice(0, MAX_DETAIL_CHARS)
+  }
+  return states
+}
+
+function cupsState() {
+  const listed = lpstat(["-a"])
+  let defaultPrinter = ""
+  let printers = []
+  if (listed.available) {
+    printers = parsePrinters(listed.stdout)
+    const described = lpstat(["-p"])
+    const states = described.available && described.status === 0
+      ? parsePrinterStates(described.stdout)
+      : {}
+    for (const printer of printers) {
+      const known = states[printer.name]
+      printer.state = known ? known.state : ""
+      printer.detail = known ? known.detail : ""
+    }
+    defaultPrinter = parseDefaultPrinter(lpstat(["-d"]).stdout)
+  }
+  return {
+    cups: listed.available && listed.status === 0,
+    default: defaultPrinter,
+    printers: printers
+  }
+}
+
+// An explicit --printer wins over the CUPS default. When lpstat is installed
+// the name must be known to CUPS; without lpstat there is nothing to check it
+// against, so the name is accepted as given and `lp` reports any problem.
+function resolvePrinter(requested) {
+  const explicit = stringOption(requested).trim()
+  const listed = lpstat(["-a"])
+  let printer = explicit
+  if (printer === "") {
+    printer = parseDefaultPrinter(lpstat(["-d"]).stdout)
+    if (printer === "") fail("No printer is configured")
+  }
+  if (listed.available) {
+    const known = parsePrinters(listed.stdout).some(entry => entry.name === printer)
+    if (!known) fail('No printer named "' + printer + '"')
+  }
+  return printer
+}
+
+// ------------------------------------------------------------------ renderer
+
+function validatePdf(file) {
+  let stat
+  try {
+    stat = fs.statSync(file)
+  } catch (error) {
+    return "the PDF renderer wrote no PDF"
+  }
+  if (!stat.isFile()) return "the PDF renderer wrote no PDF"
+  if (stat.size < MIN_PDF_BYTES) {
+    return "the PDF renderer wrote an incomplete PDF (" + stat.size + " bytes)"
+  }
+  let handle
+  try {
+    handle = fs.openSync(file, "r")
+    const header = Buffer.alloc(PDF_MAGIC.length)
+    const read = fs.readSync(handle, header, 0, PDF_MAGIC.length, 0)
+    if (read < PDF_MAGIC.length || header.toString("latin1") !== PDF_MAGIC) {
+      return "the PDF renderer wrote a file that is not a PDF"
+    }
+  } catch (error) {
+    return "cannot read the printed PDF"
+  } finally {
+    if (handle !== undefined) {
+      try { fs.closeSync(handle) } catch (error) { /* already closed */ }
+    }
+  }
+  return ""
+}
+
+function renderPdf(renderer, input, pdfPath, title, options) {
+  const args = [renderer, "--input", input, "--output", pdfPath, "--title", title]
+  for (const [flag, key] of [
+    ["--note-dir", "note-dir"],
+    ["--color", "color"],
+    ["--font-px", "font-px"],
+    ["--page-size", "page-size"],
+    ["--page-margin", "page-margin"]
+  ]) {
+    const value = stringOption(options[key])
+    if (value !== "") args.push(flag, value)
+  }
+
+  const result = spawnSync(process.execPath, args, {
+    encoding: "utf8",
+    timeout: COMMAND_TIMEOUT_MS,
+    killSignal: "SIGKILL",
+    maxBuffer: MAX_OUTPUT_BYTES
+  })
+  if (result.error) fail("cannot run the PDF renderer: " + result.error.message)
+
+  const invalid = validatePdf(pdfPath)
+  if (result.status !== 0 || invalid !== "") {
+    const detail = stderrTail(result.stderr)
+    if (invalid !== "") fail(detail !== "" ? invalid + ": " + detail : invalid)
+    if (detail !== "") fail("the PDF renderer failed: " + detail)
+    fail("the PDF renderer failed (exit " + result.status + ")")
+  }
+}
+
+// ----------------------------------------------------------------- printing
+
+function parseJob(output) {
+  const match = /request id is ([^\s]+)/.exec(String(output || ""))
+  if (!match) return ""
+  const name = match[1]
+  const dash = name.lastIndexOf("-")
+  if (dash < 0) return ""
+  const job = name.slice(dash + 1)
+  return /^[0-9]+$/.test(job) ? job : ""
+}
+
+// An empty destination means "use the CUPS default": lp is left to pick it,
+// which is the same queue resolvePrinter validated a moment earlier.
+function runLp(destination, copies, title, pdfPath, printOptions) {
+  const args = []
+  if (destination !== "") args.push("-d", destination)
+  if (copies !== 1) args.push("-n", String(copies))
+  args.push("-t", title)
+  for (const option of printOptions) args.push("-o", option.key + "=" + option.value)
+  args.push(pdfPath)
+
+  const result = spawnSync("lp", args, {
+    encoding: "utf8",
+    timeout: COMMAND_TIMEOUT_MS,
+    killSignal: "SIGKILL",
+    maxBuffer: MAX_OUTPUT_BYTES
+  })
+  if (result.error) {
+    if (result.error.code === "ENOENT") fail("The lp command is not available")
+    fail("cannot run lp: " + result.error.message)
+  }
+  if (result.status !== 0) {
+    const detail = lastNonEmptyLine(String(result.stderr || ""))
+      || lastNonEmptyLine(String(result.stdout || ""))
+    fail(detail !== "" ? detail : "lp failed with exit status " + result.status)
+  }
+  return parseJob(result.stdout)
+}
+
+// ---------------------------------------------------------------------- main
+
+function main() {
+  let options
+  try {
+    options = parseArguments(process.argv.slice(2))
+  } catch (error) {
+    process.stderr.write("quill-print: " + error.message + "\n")
+    process.exitCode = 1
+    return
+  }
+
+  const keepPdf = options["keep-pdf"] === true || options["render-only"] === true
+  let temporary = ""
+  let succeeded = false
+
+  try {
+    if (options.list === true) {
+      const state = cupsState()
+      const requested = stringOption(options.printer).trim()
+      const printer = requested !== "" ? requested : state.default
+      process.stdout.write(JSON.stringify({
+        ok: true,
+        cups: state.cups,
+        default: state.default,
+        printers: state.printers,
+        options: printer === "" ? [] : supportedPrintOptions(lpoptions(printer))
+      }) + "\n")
+      return
+    }
+
+    const input = stringOption(options.input)
+    const title = stringOption(options.title) === "" ? DEFAULT_TITLE : stringOption(options.title)
+    const copies = parseCopies(options.copies)
+    const printOptions = parsePrintOptions(options.option)
+    const requestedRenderer = stringOption(options.renderer).trim()
+    const renderer = requestedRenderer !== "" ? requestedRenderer : DEFAULT_RENDERER
+
+    if (input === "") fail("--input is required")
+
+    let inputStat
+    try {
+      inputStat = fs.statSync(input)
+      fs.accessSync(input, fs.constants.R_OK)
+    } catch (error) {
+      fail("cannot read input: " + input)
+    }
+    if (!inputStat.isFile()) fail("input is not a file: " + input)
+
+    const resolvedInput = path.resolve(input)
+
+    const requestedPrinter = stringOption(options.printer).trim()
+
+    if (options["dry-run"] === true) {
+      const printer = resolvePrinter(requestedPrinter)
+      validatePrintOptions(printOptions, printer)
+      process.stdout.write(JSON.stringify({
+        ok: true,
+        dryRun: true,
+        printer: printer,
+        copies: copies,
+        input: resolvedInput,
+        options: printOptionObject(printOptions)
+      }) + "\n")
+      return
+    }
+
+    // Resolve and validate before rendering in the submitting path: a bad
+    // option fails immediately, without spending a render on a job CUPS would
+    // reject. --render-only stays offline and only renders.
+    const submitting = options["render-only"] !== true
+    let printer = ""
+    let destination = ""
+    if (submitting) {
+      printer = resolvePrinter(requestedPrinter)
+      validatePrintOptions(printOptions, printer)
+      destination = requestedPrinter !== "" ? printer : ""
+    }
+
+    temporary = fs.mkdtempSync(path.join(os.tmpdir(), "quill-print-"))
+    const pdfPath = path.join(temporary, "note.pdf")
+    renderPdf(renderer, input, pdfPath, title, options)
+
+    const bytes = fs.statSync(pdfPath).size
+
+    // A preview stops here: the caller opens the PDF and brings its own print
+    // dialog. Nothing is sent to CUPS, and the file is always kept.
+    if (options["render-only"] === true) {
+      succeeded = true
+      process.stdout.write(JSON.stringify({
+        ok: true,
+        printer: "",
+        job: "",
+        bytes: bytes,
+        pdf: pdfPath
+      }) + "\n")
+      return
+    }
+
+    const job = runLp(destination, copies, title, pdfPath, printOptions)
+    succeeded = true
+
+    const payload = { ok: true, printer: printer, job: job, bytes: bytes }
+    if (keepPdf) {
+      payload.pdf = pdfPath
+    } else {
+      fs.rmSync(temporary, { recursive: true, force: true })
+      temporary = ""
+    }
+    process.stdout.write(JSON.stringify(payload) + "\n")
+  } catch (error) {
+    const message = error && error.message ? error.message : String(error)
+    process.stderr.write("quill-print: " + message + "\n")
+    process.exitCode = 1
+  } finally {
+    // A kept PDF is only useful when the run succeeded and its path was
+    // reported; failed runs always clean up after themselves.
+    if (temporary !== "" && !(keepPdf && succeeded)) {
+      try { fs.rmSync(temporary, { recursive: true, force: true }) } catch (cleanupError) { /* best effort */ }
+    }
+  }
+}
+
+main()

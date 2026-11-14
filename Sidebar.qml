@@ -4,6 +4,7 @@ import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
 import "TagTree.js" as TagTree
+import "PopupAnchor.js" as PopupAnchor
 
 // Left library rail: saved views, tag counts and the folder tree.
 BorderSurface {
@@ -66,6 +67,7 @@ BorderSurface {
   function openTagMenu(tag, row) {
     var overlay = Overlay.overlay
     if (!overlay || !row) return
+    PopupAnchor.anchor(tagMenu, overlay)
     tagMenuTag = String(tag)
     var point = row.mapToItem(overlay, Style.space(8), row.height)
     var margin = Style.space(4)

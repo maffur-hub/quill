@@ -9,6 +9,7 @@ import "MathSyntax.js" as MathSyntax
 import "MathText.js" as MathText
 import "MarkdownFormat.js" as MarkdownFormat
 import "PreviewBlocks.js" as PreviewBlocks
+import "PreviewSync.js" as PreviewSync
 import "CodeHighlight.js" as CodeHighlight
 import "MarkdownExtras.js" as MarkdownExtras
 
@@ -273,6 +274,51 @@ Item {
   // Reserved strip between the table viewport and the frame border.
   readonly property real tableScrollBarSpace: Style.space(7)
 
+  // Linked scrolling with the editor in split mode. The library reads the
+  // ratio, or drives it through scrollToRatio(); the signal lets it react to a
+  // wheel/drag in the preview without listening to an internal id.
+  signal scrolled()
+  readonly property real scrollMax: Math.max(0, flick.contentHeight - flick.height)
+  readonly property real scrollRatio: scrollMax > 0 ? flick.contentY / scrollMax : 0
+
+  function scrollToRatio(value) {
+    var ratio = Math.max(0, Math.min(1, Number(value) || 0))
+    if (scrollMax <= 0) return
+    flick.contentY = ratio * scrollMax
+  }
+
+  // Linked scrolling by source line. Each block records the lines it renders
+  // and the Repeater exposes its items, so a line can be turned into a pixel
+  // offset and back. The list rebuilds whenever a block's layout changes.
+  readonly property var lineAnchors: {
+    var output = []
+    var count = Math.min(root.blocks.length, blockRepeater.count)
+    for (var i = 0; i < count; i++) {
+      var block = root.blocks[i]
+      var item = blockRepeater.itemAt(i)
+      if (!item) continue
+      var start = Number(block.startLine !== undefined ? block.startLine : block.line)
+      var end = Number(block.endLine !== undefined ? block.endLine : start)
+      if (!isFinite(start) || start < 0) continue
+      if (!isFinite(end) || end < start) end = start
+      output.push({
+        line: start + root.lineOffset,
+        endLine: end + root.lineOffset,
+        y: item.y,
+        height: item.height
+      })
+    }
+    return output
+  }
+
+  // The source line at the top of the viewport.
+  readonly property real topLine: PreviewSync.lineForY(root.lineAnchors, flick.contentY)
+
+  function scrollToLine(line) {
+    flick.contentY = Math.max(0, Math.min(root.scrollMax,
+      PreviewSync.yForLine(root.lineAnchors, Number(line) || 0)))
+  }
+
   function tableWidthsFor(model, available) {
     if (!model) return []
     var values = TableEngine.computeTable(model)
@@ -459,6 +505,7 @@ Item {
     contentHeight: column.implicitHeight
     boundsBehavior: Flickable.StopAtBounds
     flickableDirection: Flickable.VerticalFlick
+    onContentYChanged: root.scrolled()
 
     Column {
       id: column
@@ -466,6 +513,7 @@ Item {
       spacing: Style.space(10)
 
       Repeater {
+        id: blockRepeater
         model: root.blocks
 
         delegate: Item {

@@ -5,6 +5,7 @@ import qs.Commons as Commons
 import qs.Ui
 import "MarkdownFormat.js" as MarkdownFormat
 import "EmojiData.js" as EmojiData
+import "PopupAnchor.js" as PopupAnchor
 
 // Formatting toolbar for the library editor.
 //
@@ -232,6 +233,7 @@ Item {
     closePopovers()
     root.pickerMousePick = false
     root.setPickerHex(MarkdownFormat.colourToHex(root.lastColor) || "#e03e2d")
+    PopupAnchor.anchor(colorPicker, Overlay.overlay)
     colorPicker.open()
   }
 

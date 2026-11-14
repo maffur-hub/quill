@@ -87,6 +87,13 @@ test('isMutatingArgs treats templates saves and deletes as writes', () => {
   assert.equal(guard.isMutatingArgs(['templates']), false)
 })
 
+test('isMutatingArgs treats settings gets as reads and sets as writes', () => {
+  assert.equal(guard.isMutatingArgs(['settings', 'get']), false)
+  assert.equal(guard.isMutatingArgs(['settings', 'set', '--json', '{}']), true)
+  assert.equal(guard.isMutatingArgs(['settings', 'set', '--stdin']), true)
+  assert.equal(guard.isMutatingArgs(['settings']), true)
+})
+
 test('isMutatingArgs treats tag-delete as a state write', () => {
   assert.equal(guard.isMutatingArgs(['tag-delete', 'alpha']), true)
 })

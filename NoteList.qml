@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls
+import "PopupAnchor.js" as PopupAnchor
 import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
@@ -149,10 +150,20 @@ BorderSurface {
     return Qt.point(x, y)
   }
 
+  // Qt clears a popup's parent item when it closes, and that breaks the
+  // declarative `parent: Overlay.overlay` binding for good. Without a parent
+  // item the next popup() creates nothing, so the menu opens on the first
+  // right-click after a restart and silently stays shut on every one after.
+  // Re-parent explicitly before each open instead of trusting the binding.
+  function anchorPopup(popup) {
+    PopupAnchor.anchor(popup, Overlay.overlay)
+  }
+
   function openNoteMenu(note, point) {
     if (!note) return
     var trashed = !!root.showTrash || !!note.trashed
     var menu = trashed ? trashMenu : noteMenu
+    root.anchorPopup(menu)
     menu.menuNoteId = String(note.id || "")
     // A right-click inside a multi-selection keeps it and shows plural labels.
     menu.bulkCount = root.selectedIds.length > 1 && root.isSelected(String(note.id))
@@ -202,6 +213,7 @@ BorderSurface {
 
   function openMoveMenu() {
     if (noteMenu.menuNoteId === "") return
+    root.anchorPopup(folderMenu)
     folderMenu.menuNoteId = noteMenu.menuNoteId
     folderMenu.rebuild()
     var target = root.popupPoint(folderMenu, Qt.point(root.menuAnchorX, root.menuAnchorY))
@@ -467,11 +479,13 @@ BorderSurface {
             acceptedButtons: Qt.LeftButton | Qt.RightButton
             cursorShape: Qt.PointingHandCursor
             onPressed: function(mouse) {
+              // Both buttons record their origin here, before any branch, so a
+              // right-press never compares movement against stale coordinates.
+              dragStarted = false
+              pressX = mouse.x
+              pressY = mouse.y
               if (mouse.button === Qt.LeftButton) {
                 root.forceActiveFocus()
-                dragStarted = false
-                pressX = mouse.x
-                pressY = mouse.y
                 return
               }
               if (mouse.button !== Qt.RightButton) return
@@ -490,6 +504,10 @@ BorderSurface {
             }
             onPositionChanged: function(mouse) {
               if (!pressed || dragStarted) return
+              // Only a left-button drag moves notes. A right-press opens the
+              // context menu, and movement while it is open must not turn
+              // into a drag that cancels the menu.
+              if (!(mouse.buttons & Qt.LeftButton)) return
               if (Math.abs(mouse.x - pressX) + Math.abs(mouse.y - pressY) < Style.space(4)) return
               // A real drag suppresses the click that would otherwise reset
               // the selection under the pointer.
@@ -501,6 +519,7 @@ BorderSurface {
               // accidental click after a drop.
               Qt.callLater(function() { rowMouse.dragStarted = false })
             }
+            onCanceled: dragStarted = false
             onClicked: function(mouse) {
               if (mouse.button !== Qt.LeftButton) return
               if (dragStarted) {
@@ -613,6 +632,12 @@ BorderSurface {
       onTriggered: root.noteActionRequested(noteMenu.menuNoteId, "duplicate")
     }
     ContextMenuItem {
+      objectName: "noteMenuReveal"
+      text: "Open file location"
+      visible: noteMenu.bulkCount <= 1
+      onTriggered: root.noteActionRequested(noteMenu.menuNoteId, "reveal")
+    }
+    ContextMenuItem {
       objectName: "noteMenuMove"
       text: noteMenu.bulkCount > 1
         ? "Move " + noteMenu.bulkCount + " notes to folder…" : "Move to folder…"
@@ -683,6 +708,12 @@ BorderSurface {
       text: trashMenu.bulkCount > 1
         ? "Restore " + trashMenu.bulkCount + " notes" : "Restore"
       onTriggered: root.noteActionRequested(trashMenu.menuNoteId, "restore")
+    }
+    ContextMenuItem {
+      objectName: "trashNoteMenuReveal"
+      text: "Open file location"
+      visible: trashMenu.bulkCount <= 1
+      onTriggered: root.noteActionRequested(trashMenu.menuNoteId, "reveal")
     }
 
     MenuSeparator {

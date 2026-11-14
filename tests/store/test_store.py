@@ -1470,6 +1470,118 @@ class TestTemplates(StoreTestCase):
         self.assertIn("template not found: meeting", error["error"])
 
 
+class TestSettings(StoreTestCase):
+    """The opaque UI settings channel stored under state.json "ui"."""
+
+    def state_path(self):
+        return self.root / "state.json"
+
+    def read_state_file(self):
+        return json.loads(self.state_path().read_text(encoding="utf-8"))
+
+    def test_get_on_fresh_root_is_empty_and_creates_nothing(self):
+        self.assertEqual(self.success("settings", "get"), {"ui": {}})
+        self.assertFalse(self.state_path().exists())
+        self.assertFalse(self.root.exists())
+
+    def test_get_treats_a_non_object_ui_as_empty(self):
+        self.success("list")
+        state = self.read_state_file()
+        state["ui"] = ["not", "an", "object"]
+        self.state_path().write_text(json.dumps(state), encoding="utf-8")
+        self.assertEqual(self.success("settings", "get"), {"ui": {}})
+
+    def test_set_json_round_trips_and_writes_version_one(self):
+        written = self.success(
+            "settings", "set", "--json", '{"mode": "split", "printCopies": 2}'
+        )
+        self.assertEqual(written, {"ui": {"mode": "split", "printCopies": 2}})
+        self.assertEqual(self.success("settings", "get"), written)
+        state = self.read_state_file()
+        self.assertEqual(state["version"], 1)
+        self.assertEqual(state["ui"], {"mode": "split", "printCopies": 2})
+
+    def test_set_stdin_round_trips(self):
+        written = self.success("settings", "set", "--stdin", stdin='{"mode":"edit"}')
+        self.assertEqual(written, {"ui": {"mode": "edit"}})
+        self.assertEqual(self.success("settings", "get"), {"ui": {"mode": "edit"}})
+
+    def test_set_preserves_pinned_searches_and_other_state(self):
+        identifier = self.create("Pinned", content="# Pinned\n\nbody\n")
+        self.success("pin", identifier)
+        self.success("searches", "add", "tag:alpha", "--label", "Alpha")
+
+        written = self.success("settings", "set", "--json", '{"theme":"dark"}')
+        self.assertEqual(written, {"ui": {"theme": "dark"}})
+
+        state = self.read_state_file()
+        self.assertEqual(state["version"], 1)
+        self.assertEqual(state["pinned"], [identifier])
+        self.assertEqual(
+            [entry["query"] for entry in state["searches"]], ["tag:alpha"]
+        )
+        self.assertEqual(state["ui"], {"theme": "dark"})
+        self.assertEqual(self.success("settings", "get"), {"ui": {"theme": "dark"}})
+
+    def test_set_replaces_the_whole_object(self):
+        self.success("settings", "set", "--json", '{"a":1,"b":2}')
+        replaced = self.success("settings", "set", "--json", '{"b":3}')
+        self.assertEqual(replaced, {"ui": {"b": 3}})
+        self.assertEqual(self.success("settings", "get"), {"ui": {"b": 3}})
+
+    def test_empty_object_clears_settings(self):
+        self.success("settings", "set", "--json", '{"a":1}')
+        cleared = self.success("settings", "set", "--json", "{}")
+        self.assertEqual(cleared, {"ui": {}})
+        self.assertEqual(self.success("settings", "get"), {"ui": {}})
+        self.assertEqual(self.read_state_file()["ui"], {})
+
+    def test_set_rejects_bad_payloads_without_writing(self):
+        cases = [
+            (["--json", '{"mode":'], "Settings must be a JSON object"),
+            (["--json", "[]"], "Settings must be a JSON object"),
+            (["--json", '"text"'], "Settings must be a JSON object"),
+            (["--json", "null"], "Settings must be a JSON object"),
+            (
+                ["--json", json.dumps({"a\x00b": 1})],
+                "Settings keys must not contain NUL",
+            ),
+            (
+                ["--json", json.dumps({"k" * 65: 1})],
+                "Settings keys must be at most 64 characters",
+            ),
+            (
+                ["--json", json.dumps({"": 1})],
+                "Settings keys must be non-empty strings",
+            ),
+            (
+                ["--stdin"],
+                "Settings are too large",
+            ),
+        ]
+        for args, message in cases:
+            with self.subTest(args=args):
+                stdin = (
+                    json.dumps({"blob": "x" * (64 * 1024 + 1)})
+                    if args == ["--stdin"] else None
+                )
+                error = self.failure("settings", "set", *args, stdin=stdin)
+                self.assertIn(message, error["error"])
+        self.assertFalse(self.state_path().exists())
+
+    def test_set_requires_exactly_one_source(self):
+        error = self.failure("settings", "set", "--json", "{}", "--stdin")
+        self.assertEqual(error["error"], "choose exactly one of --json and --stdin")
+        error = self.failure("settings", "set")
+        self.assertEqual(error["error"], "choose exactly one of --json and --stdin")
+        self.assertFalse(self.state_path().exists())
+
+    def test_sixty_four_character_key_is_accepted(self):
+        key = "k" * 64
+        written = self.success("settings", "set", "--json", json.dumps({key: True}))
+        self.assertEqual(written, {"ui": {key: True}})
+
+
 class TestTagRenameMerge(StoreTestCase):
     """tag-rename onto an existing tag is a merge, with dedupe and `merged`."""
 

@@ -126,20 +126,35 @@ function build(value, deps) {
 
   var result = []
   var buffer = []
+  var bufferStart = -1
+  var bufferEnd = -1
   var tasks = []
+  var tasksStart = -1
+  var tasksEnd = -1
 
   function flushText() {
     if (buffer.length === 0) return
     var joined = buffer.join("\n")
+    var first = bufferStart
+    var last = bufferEnd
     buffer = []
+    bufferStart = -1
+    bufferEnd = -1
     if (joined.trim() === "") return
-    result.push({ kind: "text", text: joined })
+    result.push({ kind: "text", text: joined, startLine: first, endLine: last })
   }
 
   function flushTasks() {
     if (tasks.length === 0) return
-    result.push({ kind: "tasks", items: tasks })
+    result.push({
+      kind: "tasks",
+      items: tasks,
+      startLine: tasksStart,
+      endLine: tasksEnd
+    })
     tasks = []
+    tasksStart = -1
+    tasksEnd = -1
   }
 
   var i = 0
@@ -225,7 +240,9 @@ function build(value, deps) {
         source: imageBlock.source,
         alt: imageBlock.alt,
         size: imageBlock,
-        line: i
+        line: i,
+        startLine: i,
+        endLine: i
       })
       i += 1
       continue
@@ -235,6 +252,8 @@ function build(value, deps) {
       ? format.parseTaskLine(lines[i]) : null
     if (task) {
       flushText()
+      if (tasksStart < 0) tasksStart = i
+      tasksEnd = i
       tasks.push({
         checked: task.checked,
         content: task.content,
@@ -246,6 +265,8 @@ function build(value, deps) {
     }
 
     flushTasks()
+    if (bufferStart < 0) bufferStart = i
+    bufferEnd = i
     buffer.push(lines[i])
     i += 1
   }

@@ -7,9 +7,11 @@ import qs.Commons as Commons
 import qs.Ui
 import "ImageSizing.js" as ImageSizing
 import "MarkdownFormat.js" as MarkdownFormat
+import "PopupAnchor.js" as PopupAnchor
 import "TableEngine.js" as TableEngine
 import "TagSuggest.js" as TagSuggest
 import "TagTree.js" as TagTree
+import "WheelScroll.js" as WheelScroll
 import "WritableGuard.js" as WritableGuard
 
 // Quill's library: three panes, a Markdown editor with live highlighting,
@@ -108,6 +110,37 @@ Item {
 
   property string mode: "split"
   property bool modeChosen: false
+  // Split mode can lock the preview's scroll position to the editor's.
+  // "position" maps the fraction of each pane's scrollable range, which is
+  // stable while either pane's height changes; "line" keeps the same source
+  // line at the top of both panes. scrollEcho stops the assignment bouncing
+  // straight back.
+  property bool linkedScroll: false
+  property string linkedMode: "line"
+  property bool scrollEcho: false
+  // Persistent UI preferences live in the store's state.json under `ui` and are
+  // restored on startup. restoreSession only gates the *layout* half of the
+  // restore — mode, panes, category and last note — while every preference in
+  // the Settings panel is always remembered.
+  property bool settingsLoaded: false
+  property bool restoreSession: true
+  property bool spellcheck: true
+  property bool highlighting: true
+  property int printCopies: 1
+  property string printPrinter: ""
+  // Page margin handed to the renderer as a CSS length. The renderer's own
+  // wrapper padding is dropped on paper, so this is the whole margin.
+  property string printMargin: "15mm"
+  // CUPS options reported by `quill-print --list` for the selected queue, and
+  // the raw value chosen for each key. Choices are rebuilt whenever the queue
+  // changes so a stale option never reaches the script.
+  property var printOptionList: []
+  property var printOptionChoices: ({})
+  property var printers: []
+  property bool printersLoaded: false
+  property bool printersLoading: false
+  property string restoreNoteId: ""
+  property bool refreshDeferred: false
   property var backlinks: []
   property bool backlinksOpen: false
   // Broken note links in the selected note (`[[Missing note]]`). Grouped by
@@ -181,6 +214,7 @@ Item {
   property bool sidebarOpen: true
   property bool noteListOpen: true
   property bool viewMenuOpen: false
+  property bool settingsOpen: false
   property string chatNotice: ""
 
   // Table grid state. The grid replaces the preview area while open; the mode
@@ -204,10 +238,27 @@ Item {
   property string exportCheckDest: ""
   property string exportCheckText: ""
   property string exportCheckFormat: ""
+  // Printing renders the same temporary Markdown as the PDF export and hands
+  // the PDF to scripts/quill-print, which talks to CUPS. The note file itself
+  // is never touched.
+  property bool printing: false
+  property bool printPopupOpen: false
+  property bool printPreview: false
+  // Why the last print attempt failed, shown inside the print dialog: the
+  // status line at the bottom of the window is hidden behind the modal.
+  property string printError: ""
+  property string printDefault: ""
+  property string printPendingTemp: ""
+  property string printPendingTitle: ""
+  property string printPendingNoteDir: ""
+  readonly property string printScriptPath: Quickshell.env("QUILL_PRINT_SCRIPT")
+    || String(Qt.resolvedUrl("scripts/quill-print")).replace(/^file:\/\//, "")
   readonly property string exportScriptPath: Quickshell.env("QUILL_EXPORT_SCRIPT")
     || String(Qt.resolvedUrl("scripts/quill-export-html")).replace(/^file:\/\//, "")
   readonly property string exportPdfScriptPath: Quickshell.env("QUILL_EXPORT_PDF_SCRIPT")
     || String(Qt.resolvedUrl("scripts/quill-export-pdf")).replace(/^file:\/\//, "")
+  readonly property string revealScriptPath: Quickshell.env("QUILL_REVEAL_SCRIPT")
+    || String(Qt.resolvedUrl("scripts/quill-reveal")).replace(/^file:\/\//, "")
   readonly property var exportPopupRef: exportPopup
 
   readonly property var visibleNotes: filteredNotes()
@@ -423,8 +474,166 @@ Item {
     root.pump()
   }
 
+  // -------------------------------------------------------------- settings
+  // Settings are read once at startup, before the first list, so the restored
+  // category is in place when the list arrives and the first row is not
+  // auto-selected over the note the user left open.
+  function loadSettings() {
+    if (root.storePath === "") { root.applySettings({}); return }
+    settingsTimeout.restart()
+    enqueue({
+      args: ["settings", "get"],
+      silent: true,
+      onSuccess: function(result) {
+        var ui = result && typeof result.ui === "object" && result.ui ? result.ui : {}
+        root.applySettings(ui)
+      },
+      onError: function() { root.applySettings({}) }
+    })
+  }
+
+  function applySettings(ui) {
+    if (root.settingsLoaded) return
+    var data = ui || {}
+    root.restoreSession = data.restoreSession !== false
+    root.spellcheck = data.spellcheck !== false
+    root.highlighting = data.highlighting !== false
+    root.linkedMode = data.linkedMode === "position" ? "position" : "line"
+    root.linkedScroll = data.linkedScroll === true
+    root.printCopies = root.settingNumber(data.printCopies, 1, 9, 1)
+    root.printPrinter = typeof data.printPrinter === "string" ? data.printPrinter : ""
+    root.printMargin = root.printMarginSetting(data.printMargin)
+    root.printOptionChoices = root.printOptionsSetting(data.printOptions)
+    if (root.restoreSession) {
+      var mode = String(data.mode || "")
+      if (mode === "edit" || mode === "split" || mode === "preview") {
+        root.mode = mode
+        root.modeChosen = true
+      }
+      if (typeof data.sidebar === "boolean") root.sidebarOpen = data.sidebar
+      if (typeof data.noteList === "boolean") root.noteListOpen = data.noteList
+      if (typeof data.category === "string" && data.category !== "") root.category = data.category
+      root.restoreNoteId = typeof data.note === "string" ? data.note : ""
+    }
+    root.settingsLoaded = true
+    settingsTimeout.stop()
+    if (root.refreshDeferred) {
+      root.refreshDeferred = false
+      root.refreshAll()
+    }
+  }
+
+  function settingNumber(value, low, high, fallback) {
+    var number = Math.floor(Number(value))
+    if (!isFinite(number)) return fallback
+    return Math.max(low, Math.min(high, number))
+  }
+
+  // Only the offered margins are honoured; anything else falls back to the
+  // default so a hand-edited state file cannot produce an odd page.
+  function printMarginSetting(value) {
+    var margin = String(value || "")
+    return margin === "10mm" || margin === "15mm" || margin === "22mm" ? margin : "15mm"
+  }
+
+  function printMarginLabel(margin) {
+    var value = root.printMarginSetting(margin)
+    if (value === "10mm") return "Narrow (10 mm)"
+    if (value === "22mm") return "Wide (22 mm)"
+    return "Normal (15 mm)"
+  }
+
+  function printMarginMenu() {
+    return [
+      { key: "10mm", label: "Narrow (10 mm)" },
+      { key: "15mm", label: "Normal (15 mm)" },
+      { key: "22mm", label: "Wide (22 mm)" }
+    ]
+  }
+
+  // Settings only ever carry plain string-to-string option choices; anything
+  // else (arrays, numbers, empty values) is discarded on the way in and out.
+  function printOptionsSetting(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return {}
+    var result = {}
+    var keys = Object.keys(value)
+    for (var i = 0; i < keys.length; i++) {
+      var key = String(keys[i])
+      var chosen = value[keys[i]]
+      if (key === "" || typeof chosen !== "string" || chosen === "") continue
+      result[key] = chosen
+    }
+    return result
+  }
+
+  // A restored folder or tag may have been deleted since the last session, so
+  // the category is validated against the freshly loaded lists before use.
+  function categoryExists(value) {
+    var text = String(value || "")
+    if (text === "" || text === "all" || text === "pinned" || text === "recent" || text === "trash") return true
+    if (text.indexOf("folder:") === 0) {
+      var folder = text.slice(7)
+      return folder === "" || root.folders.indexOf(folder) >= 0
+    }
+    if (text.indexOf("tag:") === 0) {
+      var tag = text.slice(4)
+      for (var i = 0; i < root.tags.length; i++) {
+        if (String(root.tags[i].tag || "") === tag) return true
+      }
+      return false
+    }
+    if (text.indexOf("tagtree:") === 0) {
+      var prefix = text.slice(8)
+      for (var j = 0; j < root.tags.length; j++) {
+        var name = String(root.tags[j].tag || "")
+        if (name === prefix || name.indexOf(prefix + "/") === 0) return true
+      }
+      return false
+    }
+    return false
+  }
+
+  // ----------------------------------------------------------- settings save
+  function currentSettings() {
+    return {
+      "version": 1,
+      "restoreSession": root.restoreSession,
+      // The grid editor temporarily switches edit mode to preview; persist the
+      // mode the user actually chose, never the table's stand-in.
+      "mode": root.tableOpen && root.tableReturnMode !== "" ? root.tableReturnMode : root.mode,
+      "category": root.category,
+      "note": root.selectedId,
+      "sidebar": root.sidebarOpen,
+      "noteList": root.noteListOpen,
+      "linkedScroll": root.linkedScroll,
+      "linkedMode": root.linkedMode,
+      "spellcheck": root.spellcheck,
+      "highlighting": root.highlighting,
+      "printCopies": root.printCopies,
+      "printPrinter": root.printPrinter,
+      "printMargin": root.printMargin,
+      "printOptions": root.printOptionsSetting(root.printOptionChoices)
+    }
+  }
+
+  function scheduleSettingsSave() {
+    if (!root.settingsLoaded) return
+    settingsTimer.restart()
+  }
+
+  function saveSettings() {
+    settingsTimer.stop()
+    if (!root.settingsLoaded || root.storePath === "") return
+    enqueue({
+      args: ["settings", "set", "--json", JSON.stringify(root.currentSettings())],
+      silent: true,
+      onError: function(message) { root.statusText = message }
+    })
+  }
+
   // ------------------------------------------------------------ library load
   function refreshAll(statusMessage) {
+    if (!root.settingsLoaded) { root.refreshDeferred = true; return }
     enqueue({
       args: ["list"],
       silent: true,
@@ -460,6 +669,24 @@ Item {
       if (!root.searchText) root.statusText = root.totalCount + " notes"
     }
     root.trashCount = Number(result.trashCount || 0)
+    if (root.restoreNoteId !== "") {
+      var wanted = root.restoreNoteId
+      if (!trashed) {
+        if (!root.categoryExists(root.category)) {
+          root.category = "all"
+        } else if (root.category === "trash") {
+          // The trashed list arrives in a second reply; keep the id for it.
+          wanted = ""
+        }
+        if (wanted !== "") {
+          root.restoreNoteId = ""
+          if (root.hasVisibleId(wanted)) root.pendingSelectId = wanted
+        }
+      } else if (root.category === "trash") {
+        root.restoreNoteId = ""
+        if (root.hasVisibleId(wanted)) root.pendingSelectId = wanted
+      }
+    }
     Qt.callLater(function() { root.ensureSelection() })
   }
 
@@ -488,11 +715,18 @@ Item {
     })
   }
 
+  // Qt clears a popup's parent when it closes; re-attach it to the overlay
+  // before every open so the second open is not invisible.
+  function anchorPopup(popup) {
+    PopupAnchor.anchor(popup, Overlay.overlay)
+  }
+
   function openQuickSwitcher() {
     // Open at once with whatever is cached; a cold cache shows the switcher's
     // loading state while the first title list arrives.
     if (root.titleIndex.length === 0) root.loadTitles(true)
     else if (Date.now() - root.titlesLoadedAt > 60000) root.loadTitles(false)
+    root.anchorPopup(quickSwitcher)
     quickSwitcher.open()
   }
 
@@ -555,6 +789,7 @@ Item {
       return
     }
     var count = root.tagNoteCount(name)
+    root.anchorPopup(tagManager)
     if (String(action) === "delete") tagManager.openDelete(name, count)
     else tagManager.openRename(name, count)
   }
@@ -639,7 +874,10 @@ Item {
   }
 
   function openTemplateManager() {
-    if (templateManager) templateManager.open()
+    if (templateManager) {
+      root.anchorPopup(templateManager)
+      templateManager.open()
+    }
   }
 
   function saveCurrentSearch() {
@@ -1686,6 +1924,7 @@ Item {
       noteTags,
       root.tagSuggestKnownTags())
     root.tagSuggestNoteId = id
+    root.anchorPopup(tagSuggestPopup)
     tagSuggestPopup.openFor(suggestions, noteTags)
   }
 
@@ -2433,11 +2672,24 @@ Item {
   }
 
   function openViewMenu() {
+    // One header dropdown at a time.
+    closeSettings()
     viewMenuOpen = true
   }
 
   function closeViewMenu() {
     viewMenuOpen = false
+  }
+
+  function openSettings() {
+    // One header dropdown at a time.
+    closeViewMenu()
+    root.loadPrinters()
+    settingsOpen = true
+  }
+
+  function closeSettings() {
+    settingsOpen = false
   }
 
   // ---------------------------------------------------------------- chat
@@ -2462,17 +2714,21 @@ Item {
     pushChatContext(true)
   }
 
-  function notePath(note) {
+  // `trashed` selects the trash branch: a trashed note keeps its id, folder
+  // prefix included, but lives under trash/ instead of notes/. Existing
+  // callers pass no second argument and keep getting the live path.
+  function notePath(note, trashed) {
     if (!note || !dataRoot) return ""
     var id = String(note.id || "")
     if (id === "") return ""
+    var base = trashed === true ? dataRoot + "/trash/" : dataRoot + "/notes/"
     // Store ids already include their folder ("Work/plan.md"). Only prepend a
     // folder for an id that does not carry it, so nested notes never double up.
     var folder = String(note.folder || "")
     if (folder !== "" && id.indexOf(folder + "/") !== 0 && id.indexOf("/") < 0) {
-      return dataRoot + "/notes/" + folder + "/" + id
+      return base + folder + "/" + id
     }
-    return dataRoot + "/notes/" + id
+    return base + id
   }
 
   // ---------------------------------------------------------------- export
@@ -2502,7 +2758,10 @@ Item {
     root.exportFormat = "markdown"
     root.exportPath = root.defaultExportPath(root.selectedNote.title, "markdown")
     root.exportOpen = true
-    if (exportPopup) exportPopup.open()
+    if (exportPopup) {
+      root.anchorPopup(exportPopup)
+      exportPopup.open()
+    }
     Qt.callLater(function() {
       if (root.exportOpen && exportPathField) {
         exportPathField.text = root.exportPath
@@ -2651,6 +2910,10 @@ Item {
       root.finishExport(true, dest)
       return
     }
+    if (mode === "print") {
+      root.runPrint(temp)
+      return
+    }
     root.runHtmlExporter(dest, temp)
   }
 
@@ -2658,9 +2921,18 @@ Item {
     var mode = String(view.targetMode || "")
     var temp = String(view.tempPath || "")
     view.destroy()
-    if (temp !== "") root.cleanupExportTemp(temp)
+    if (temp !== "") {
+      if (mode === "print") root.cleanupPrintTemp(temp)
+      else root.cleanupExportTemp(temp)
+    }
     var message = String(error === undefined ? "" : error).trim()
     if (message === "") message = "Could not write the export file"
+    if (mode === "print") {
+      root.printing = false
+      root.statusText = "Could not write the print source: " + message
+      root.printError = "Could not write the print source: " + message
+      return
+    }
     root.finishExport(false, mode === "html-source"
       ? "Could not write the export source: " + message
       : message)
@@ -2734,6 +3006,287 @@ Item {
     }
     if (message === "") message = format === "pdf" ? "PDF export failed" : "HTML export failed"
     root.finishExport(false, message.slice(0, 300))
+  }
+
+  // Printing reuses exportRich's temporary Markdown source: the script renders
+  // the PDF from it and sends that to CUPS, so the note file is never touched.
+  function requestPrint(preview) {
+    root.printError = ""
+    if (root.printing || root.exporting) return
+    if (!root.selectedNote || !root.loaded || root.tooLarge || root.loadingNote) {
+      root.statusText = "No note is ready to print"
+      root.printError = "No note is ready to print"
+      return
+    }
+    if (root.draftPending) {
+      root.statusText = "Recover or discard the draft first"
+      root.printError = "Recover or discard the draft first"
+      return
+    }
+    root.printPreview = preview === true
+    root.printing = true
+    var temp = root.dataRoot + "/.quill-print-" + Date.now() + ".md"
+    var view = exportFileComponent.createObject(root, { path: temp })
+    if (!view) {
+      root.printPreview = false
+      root.printing = false
+      root.statusText = "Could not prepare the print"
+      return
+    }
+    view.targetPath = temp
+    view.targetMode = "print"
+    view.tempPath = temp
+    root.printPendingTitle = root.selectedNote ? String(root.selectedNote.title || "Untitled") : "Untitled"
+    root.printPendingNoteDir = root.exportNoteDir()
+    view.setText(String(editor.text))
+  }
+
+  function openPrint() {
+    if (!root.selectedNote || !root.loaded || root.tooLarge || root.loadingNote) {
+      root.statusText = "No note is ready to print"
+      return
+    }
+    if (root.draftPending) {
+      root.statusText = "Recover or discard the draft first"
+      return
+    }
+    root.loadPrinters()
+    root.printError = ""
+    PopupAnchor.anchor(printPopup, Overlay.overlay)
+    if (printPopup) printPopup.open()
+  }
+
+  function closePrint() {
+    if (printPopup) printPopup.close()
+    root.printPopupOpen = false
+  }
+
+  function runPrint(temp) {
+    root.printPendingTemp = temp
+    printChmodProcess.command = ["chmod", "+x", root.printScriptPath]
+    printChmodProcess.running = true
+  }
+
+  function printerLabel(value) {
+    var name = String(value || "")
+    return name === "" ? "System default" : name
+  }
+
+  // An empty selection means "whatever CUPS considers default", and the state
+  // we can report for it is the default printer's own state.
+  function printerEntry(name) {
+    var wanted = String(name || "")
+    if (wanted === "") wanted = root.printDefault
+    for (var i = 0; i < root.printers.length; i++) {
+      var entry = root.printers[i]
+      if (entry && String(entry.name || "") === wanted) return entry
+    }
+    return null
+  }
+
+  // A CUPS detail ("gstoraster filter failed.") is more useful than the bare
+  // state, so it wins whenever the script reported one.
+  function printerStatus(name) {
+    var entry = root.printerEntry(name)
+    if (!entry) return ""
+    var text = ""
+    var detail = String(entry.detail || "")
+    if (detail !== "") {
+      text = detail
+    } else {
+      var state = String(entry.state || "")
+      if (state === "idle") text = "Ready"
+      else if (state === "printing") text = "Printing"
+      else if (state === "disabled") text = "Disabled"
+      else text = "Unknown"
+    }
+    // The row already carries the name unless the selection is implicit.
+    if (String(name || "") === "") text = String(entry.name || "") + " · " + text
+    return text
+  }
+
+  // CUPS values are terse; the dialog says what they mean.
+  function printOptionText(raw) {
+    var value = String(raw || "")
+    if (value === "") return ""
+    var labels = {
+      "RGB": "Colour",
+      "color": "Colour",
+      "Gray": "Greyscale",
+      "monochrome": "Greyscale",
+      "None": "Off",
+      "one-sided": "Off",
+      "DuplexNoTumble": "Long edge",
+      "two-sided-long-edge": "Long edge",
+      "DuplexTumble": "Short edge",
+      "two-sided-short-edge": "Short edge"
+    }
+    return labels[value] !== undefined ? labels[value] : value
+  }
+
+  // The label of the value currently chosen for `option`.
+  function printOptionLabel(option) {
+    var key = String(option && option.key ? option.key : "")
+    return root.printOptionText(root.printOptionChoices[key] || "")
+  }
+
+  // The current value for an option, falling back to the queue default.
+  function printOptionValue(option) {
+    var key = String(option && option.key ? option.key : "")
+    var chosen = String(root.printOptionChoices[key] || "")
+    if (chosen !== "") return chosen
+    return String(option && option["default"] !== undefined ? option["default"] : "")
+  }
+
+  // Menu entries for one option: [{ key, label }] in the queue's own order.
+  function printOptionMenu(option) {
+    // `values` arrives as a QVariantList, so length is the reliable test.
+    var raw = option ? option.values : null
+    var output = []
+    if (raw && typeof raw.length === "number") {
+      for (var i = 0; i < raw.length; i++) {
+        output.push({ key: String(raw[i]), label: root.printOptionText(raw[i]) })
+      }
+    }
+    return output
+  }
+
+  // Menu entries for the printer row: [{ key, label }].
+  function printerMenu() {
+    var output = [{ key: "", label: "System default" }]
+    for (var i = 0; i < root.printers.length; i++) {
+      var name = String(root.printers[i] && root.printers[i].name ? root.printers[i].name : "")
+      if (name !== "") output.push({ key: name, label: name })
+    }
+    return output
+  }
+
+  function setPrintOption(key, value) {
+    var wanted = String(key || "")
+    if (wanted === "") return
+    var chosen = {}
+    var keys = Object.keys(root.printOptionChoices || {})
+    for (var i = 0; i < keys.length; i++) chosen[keys[i]] = root.printOptionChoices[keys[i]]
+    chosen[wanted] = String(value || "")
+    root.printOptionChoices = chosen
+    root.scheduleSettingsSave()
+  }
+
+  // Keep the chosen values in step with the queue that just answered `--list`.
+  // A value survives only while the printer still offers it; otherwise the
+  // option's default (or first value) wins. Unreported options are dropped.
+  function normalisePrintOptions() {
+    var options = root.printOptionList && typeof root.printOptionList.length === "number"
+      ? root.printOptionList
+      : []
+    var next = {}
+    for (var i = 0; i < options.length; i++) {
+      var option = options[i]
+      var key = String(option && option.key ? option.key : "")
+      if (key === "") continue
+      var values = option.values && typeof option.values.length === "number" ? option.values : []
+      var current = String(root.printOptionChoices[key] || "")
+      var chosen = ""
+      for (var j = 0; j < values.length; j++) {
+        if (String(values[j]) === current) { chosen = current; break }
+      }
+      if (chosen === "") {
+        chosen = String(option.default || "")
+        if (chosen === "" && values.length > 0) chosen = String(values[0])
+      }
+      next[key] = chosen
+    }
+    var before = JSON.stringify(root.printOptionChoices || {})
+    var after = JSON.stringify(next)
+    root.printOptionChoices = next
+    if (before !== after) root.scheduleSettingsSave()
+  }
+
+  function setPrinter(name) {
+    root.printPrinter = String(name || "")
+    // The option whitelist is queue-specific, so re-query the new selection.
+    root.loadPrinters(true)
+  }
+
+  function loadPrinters(force) {
+    if (root.printersLoading || root.printScriptPath === "") return
+    if (!force && root.printersLoaded) return
+    root.printersLoading = true
+    printerListChmod.command = ["chmod", "+x", root.printScriptPath]
+    printerListChmod.running = true
+  }
+
+  function startPrintProcess() {
+    printProcess.outputText = ""
+    printProcess.errorText = ""
+    var args = [
+      root.printScriptPath,
+      "--input", root.printPendingTemp,
+      "--title", root.printPendingTitle,
+      "--note-dir", root.printPendingNoteDir,
+      "--color", String(Commons.Color.foreground),
+      "--font-px", String(Style.font.body)
+    ]
+    if (root.printPrinter !== "") args.push("--printer", root.printPrinter)
+    if (root.printCopies !== 1) args.push("--copies", String(root.printCopies))
+    args.push("--page-margin", root.printMargin)
+    var optionKeys = Object.keys(root.printOptionChoices || {})
+    for (var i = 0; i < optionKeys.length; i++) {
+      var optionValue = String(root.printOptionChoices[optionKeys[i]] || "")
+      if (optionValue === "") continue
+      args.push("--option", optionKeys[i] + "=" + optionValue)
+    }
+    // Preview keeps the rendered PDF so xdg-open can show it.
+    if (root.printPreview) args.push("--keep-pdf", "--render-only")
+    printProcess.command = args
+    printProcess.running = true
+  }
+
+  function cleanupPrintTemp(temp) {
+    var target = String(temp || "")
+    if (target === "") return
+    printCleanupProcess.command = ["rm", "-f", "--", target]
+    printCleanupProcess.running = true
+  }
+
+  function afterPrint(exitCode) {
+    var temp = root.printPendingTemp
+    var out = String(printProcess.outputText || "")
+    var err = String(printProcess.errorText || "")
+    var preview = root.printPreview
+    root.printPendingTemp = ""
+    root.printPendingTitle = ""
+    root.printPendingNoteDir = ""
+    root.printing = false
+    root.printPreview = false
+    root.cleanupPrintTemp(temp)
+    var payload = null
+    try { payload = JSON.parse(out.trim()) } catch (error) { payload = null }
+    if (exitCode === 0 && payload && payload.ok) {
+      // Preview keeps the PDF on disk on purpose: the viewer owns it now.
+      if (preview && typeof payload.pdf === "string" && payload.pdf !== "") {
+        printOpenProcess.command = ["xdg-open", payload.pdf]
+        printOpenProcess.running = true
+        root.statusText = "Opened print preview"
+        root.printError = ""
+        return
+      }
+      var printer = String(payload.printer || "")
+      var job = payload.job === undefined || payload.job === null ? "" : String(payload.job)
+      var sentTo = "Sent to " + (printer || "the printer")
+        + (job !== "" ? " (job " + job + ")" : "")
+      root.statusText = sentTo
+      // CUPS can accept a job it cannot finish - a failing filter, a stopped
+      // queue - so the dialog repeats the queue's complaint after submitting.
+      var queue = root.printerEntry(root.printPrinter)
+      var problem = queue ? String(queue.detail || "") : ""
+      root.printError = problem === "" ? "" : sentTo + " - the queue reports: " + problem
+      return
+    }
+    var detail = err.trim()
+    var message = detail === "" ? "Print failed" : "Print failed: " + detail.slice(0, 300)
+    root.statusText = message
+    root.printError = message
   }
 
   // .quill-context.json is how the agent knows "this note" and "here". Keep it
@@ -3084,6 +3637,7 @@ Item {
     root.bulkTagCount = ids.length
     root.bulkTagMode = String(mode || "add") === "remove" ? "remove" : "add"
     root.bulkTagError = ""
+    root.anchorPopup(bulkTagPopup)
     bulkTagPopup.open()
   }
 
@@ -3262,6 +3816,7 @@ Item {
     if (renameLinksPopup) renameLinksPopup.close()
     root.renameTargetId = String(id)
     root.renameNoteText = String(note.title || "Untitled")
+    root.anchorPopup(renameNotePopup)
     renameNotePopup.open()
   }
 
@@ -3290,6 +3845,7 @@ Item {
           if (count > 0) {
             root.renameLinksSourceTitle = sourceTitle
             root.pendingRename = { id: id, title: title, count: count }
+            root.anchorPopup(renameLinksPopup)
             renameLinksPopup.open()
           } else {
             // Nothing points at the old title, so the dry run already told us
@@ -3463,6 +4019,7 @@ Item {
     root.pendingDeleteIds = ids
     root.deleteNoteTargetTitle = ids.length > 1
       ? ids.length + " notes" : String(note.title || "Untitled")
+    root.anchorPopup(deleteNotePopup)
     deleteNotePopup.open()
   }
 
@@ -3485,6 +4042,60 @@ Item {
     else if (action === "delete-forever") root.requestDeleteNote(id)
     else if (action === "tag-add") root.openBulkTagPrompt("add")
     else if (action === "tag-remove") root.openBulkTagPrompt("remove")
+    else if (action === "reveal") root.revealNote(id)
+  }
+
+  // Show a note's Markdown file in the file manager, selected where the
+  // desktop supports it. Every desktop-specific detail lives in quill-reveal;
+  // this only resolves the path and reports the outcome on the status line.
+  function revealNote(id) {
+    // One reveal at a time: the Process is shared, so a second request while
+    // the first is in flight would overwrite its command and misreport.
+    if (revealProcess.running) return
+    var note = root.findAny(id)
+    if (!note) {
+      root.statusText = "Note not found"
+      return
+    }
+    var path = root.notePath(note, !!note.trashed)
+    if (path === "") {
+      root.statusText = "Cannot locate this note on disk"
+      return
+    }
+    if (root.revealScriptPath === "") {
+      root.statusText = "File location helper is unavailable"
+      return
+    }
+    if (root.dataRoot === "") {
+      root.statusText = "Library data folder is unavailable"
+      return
+    }
+    revealProcess.target = path
+    revealProcess.command = [root.revealScriptPath, path]
+    revealProcess.running = true
+    root.statusText = "Opening file location…"
+  }
+
+  function afterReveal(exitCode) {
+    if (exitCode === 0) {
+      root.statusText = "Opened in Files"
+      return
+    }
+    // The script reports one `quill-reveal: <message>` line; keep the last
+    // non-empty one, without the prefix, so the status line reads naturally.
+    var detail = String(revealProcess.stderr.text || "")
+    var lines = detail.split("\n")
+    var message = ""
+    for (var i = lines.length - 1; i >= 0; i--) {
+      var line = String(lines[i]).replace(/\s+$/, "")
+      if (line !== "") {
+        message = line
+        break
+      }
+    }
+    message = message.replace(/^quill-reveal: /, "")
+    if (message.length > 200) message = message.slice(0, 200)
+    root.statusText = message !== "" ? message : "Could not open the file manager"
   }
 
   function createFolder(path) {
@@ -3551,6 +4162,45 @@ Item {
     if (next !== "edit") flushSave()
   }
 
+  // Linked scrolling keeps the preview on the same part of the note as the
+  // editor. "position" maps the fraction of each pane's scrollable range, which
+  // survives unequal content; "line" anchors on the source line, which tracks
+  // the text even when one pane is much taller. scrollEcho stops the
+  // assignment from bouncing straight back.
+  function syncPreviewToEditor() {
+    if (!root.linkedScroll || root.mode !== "split" || root.scrollEcho) return
+    root.scrollEcho = true
+    if (root.linkedMode === "line") {
+      previewPane.scrollToLine(editor.lineAtY(editorScroll.contentY))
+    } else {
+      var maxY = Math.max(0, editorScroll.contentHeight - editorScroll.height)
+      previewPane.scrollToRatio(maxY > 0 ? editorScroll.contentY / maxY : 0)
+    }
+    Qt.callLater(function() { root.scrollEcho = false })
+  }
+
+  function syncEditorToPreview() {
+    if (!root.linkedScroll || root.mode !== "split" || root.scrollEcho) return
+    // The preview has no anchors until its blocks are laid out.
+    if (root.linkedMode === "line" && previewPane.lineAnchors.length === 0) return
+    root.scrollEcho = true
+    var maxY = Math.max(0, editorScroll.contentHeight - editorScroll.height)
+    var target = root.linkedMode === "line"
+      ? editor.yForLine(previewPane.topLine)
+      : previewPane.scrollRatio * maxY
+    editorScroll.contentY = Math.max(0, Math.min(maxY, target))
+    Qt.callLater(function() { root.scrollEcho = false })
+  }
+
+  onLinkedScrollChanged: {
+    root.scheduleSettingsSave()
+    if (linkedScroll) Qt.callLater(root.syncPreviewToEditor)
+  }
+  onLinkedModeChanged: {
+    root.scheduleSettingsSave()
+    if (linkedScroll) Qt.callLater(root.syncPreviewToEditor)
+  }
+
   function handleEscape() {
     // A multi-selection is the innermost thing to dismiss: collapse it back to
     // the active note before touching popups or panes.
@@ -3583,8 +4233,16 @@ Item {
       if (!tagSuggestPopup.applying) tagSuggestPopup.close()
       return
     }
+    if (root.printPopupOpen) {
+      root.closePrint()
+      return
+    }
     if (root.exportOpen) {
       root.closeExport()
+      return
+    }
+    if (root.settingsOpen) {
+      root.closeSettings()
       return
     }
     if (viewMenuOpen) {
@@ -3625,6 +4283,7 @@ Item {
 
   Component.onCompleted: {
     mode = width >= Style.space(1000) ? "split" : "edit"
+    root.loadSettings()
     if (active) refreshAll()
     root.loadSavedSearches()
     root.loadTemplates()
@@ -3644,6 +4303,18 @@ Item {
     }
   }
 
+  onSelectedIdChanged: root.scheduleSettingsSave()
+  onModeChanged: if (!root.tableOpen) root.scheduleSettingsSave()
+  onCategoryChanged: root.scheduleSettingsSave()
+  onSidebarOpenChanged: root.scheduleSettingsSave()
+  onNoteListOpenChanged: root.scheduleSettingsSave()
+  onRestoreSessionChanged: root.scheduleSettingsSave()
+  onSpellcheckChanged: root.scheduleSettingsSave()
+  onHighlightingChanged: root.scheduleSettingsSave()
+  onPrintCopiesChanged: root.scheduleSettingsSave()
+  onPrintPrinterChanged: root.scheduleSettingsSave()
+  onPrintMarginChanged: root.scheduleSettingsSave()
+
   onWidthChanged: {
     if (!modeChosen) mode = width >= Style.space(1000) ? "split" : "edit"
     if (chatOpen && width < Style.space(980)) {
@@ -3653,10 +4324,28 @@ Item {
   }
 
   onActiveChanged: {
-    if (!active) viewMenuOpen = false
+    if (!active) {
+      viewMenuOpen = false
+      settingsOpen = false
+      // Flush before the window goes away; the debounce would lose the change.
+      root.saveSettings()
+    }
   }
 
   Timer { id: saveTimer; interval: 600; onTriggered: root.flushSave() }
+  // Never let a broken or slow store block the first list: after two seconds
+  // the defaults are applied and the deferred refresh runs.
+  Timer {
+    id: settingsTimeout
+    interval: 2000
+    onTriggered: if (!root.settingsLoaded) root.applySettings({})
+  }
+
+  Timer {
+    id: settingsTimer
+    interval: 400
+    onTriggered: root.saveSettings()
+  }
   // Coalesces unsolicited index-change events from the bridge: a burst of
   // writes from sync or a detached window becomes one refresh.
   Timer { id: daemonEventTimer; interval: 400; onTriggered: root.refreshAll() }
@@ -3799,6 +4488,7 @@ Item {
   Shortcut { sequence: "Ctrl+S"; enabled: root.active; onActivated: root.flushSave() }
   Shortcut { sequence: "Ctrl+Shift+O"; enabled: root.active; onActivated: root.openInEditor() }
   Shortcut { sequence: "Ctrl+Shift+E"; enabled: root.active; onActivated: root.openExport() }
+  Shortcut { sequence: "Ctrl+Alt+P"; enabled: root.active; onActivated: root.openPrint() }
   Shortcut {
     sequence: "Ctrl+T"
     enabled: root.active && root.editorActive
@@ -3926,6 +4616,151 @@ Item {
     stderr: StdioCollector { waitForEnd: true }
   }
 
+  // Printing: chmod the script, run it with the temp Markdown source, then
+  // remove that source. The script renders the PDF itself and reports the CUPS
+  // job as one JSON object.
+  Process {
+    id: printChmodProcess
+    stdout: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: function(exitCode) {
+      if (exitCode !== 0) {
+        var temp = root.printPendingTemp
+        root.printPendingTemp = ""
+        root.printing = false
+        root.printPreview = false
+        root.cleanupPrintTemp(temp)
+        root.statusText = "Could not run the print script"
+        root.printError = "Could not run the print script"
+        return
+      }
+      root.startPrintProcess()
+    }
+  }
+
+  Process {
+    id: printProcess
+    property string outputText: ""
+    property string errorText: ""
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: printProcess.outputText = String(text || "")
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: printProcess.errorText = String(text || "")
+    }
+    onExited: function(exitCode) {
+      root.afterPrint(exitCode)
+    }
+  }
+
+  Process {
+    id: printCleanupProcess
+    stdout: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector { waitForEnd: true }
+  }
+
+  // Preview hands the rendered PDF to the desktop's default viewer; whatever
+  // dialog that viewer offers is the system one Quill itself cannot show.
+  Process {
+    id: printOpenProcess
+    stdout: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector { waitForEnd: true }
+
+    // The library is a floating surface, so a viewer opened from it lands
+    // underneath and looks like nothing happened. Close Quill once the viewer
+    // is up and the page is actually in front of the user.
+    onExited: function(exitCode) {
+      if (exitCode !== 0) {
+        var message = "Could not open the rendered PDF"
+        root.statusText = message
+        root.printError = message
+        return
+      }
+      root.requestClose()
+    }
+  }
+
+  Process {
+    id: printerListChmod
+    stdout: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: function(exitCode) {
+      if (exitCode !== 0) {
+        root.printersLoading = false
+        root.printersLoaded = true
+        root.statusText = "Could not run the print script"
+        return
+      }
+      var listArgs = [root.printScriptPath, "--list"]
+      if (root.printPrinter !== "") listArgs.push("--printer", root.printPrinter)
+      printerListProcess.command = listArgs
+      printerListProcess.running = true
+    }
+  }
+
+  Process {
+    id: printerListProcess
+    property string outputText: ""
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: printerListProcess.outputText = String(text || "")
+    }
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: function(exitCode) {
+      root.printersLoading = false
+      root.printersLoaded = true
+      var payload = null
+      try { payload = JSON.parse(String(printerListProcess.outputText || "").trim()) } catch (error) { payload = null }
+      if (exitCode !== 0 || !payload || payload.ok !== true) return
+      root.printDefault = String(payload.default || "")
+      var entries = []
+      var list = Array.isArray(payload.printers) ? payload.printers : []
+      for (var i = 0; i < list.length; i++) {
+        var item = list[i]
+        var name = String(item && item.name ? item.name : "")
+        if (name === "") continue
+        entries.push({
+          "name": name,
+          "accepting": item.accepting === true,
+          "state": String(item.state || ""),
+          "detail": String(item.detail || "")
+        })
+      }
+      root.printers = entries
+      var options = []
+      var reportedOptions = Array.isArray(payload.options) ? payload.options : []
+      for (var o = 0; o < reportedOptions.length; o++) {
+        var option = reportedOptions[o]
+        if (!option || typeof option !== "object") continue
+        var optionKey = String(option.key || "")
+        if (optionKey === "") continue
+        var optionValues = []
+        var reportedValues = Array.isArray(option.values) ? option.values : []
+        for (var v = 0; v < reportedValues.length; v++) optionValues.push(String(reportedValues[v]))
+        options.push({
+          "key": optionKey,
+          "label": String(option.label || optionKey),
+          "values": optionValues,
+          "default": String(option.default || "")
+        })
+      }
+      root.printOptionList = options
+      root.normalisePrintOptions()
+    }
+  }
+
+  // Show a note's file in the file manager. `command` stays empty while idle
+  // and is assigned per reveal; target mirrors the path for readability.
+  Process {
+    id: revealProcess
+    property string target: ""
+    stdout: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: function(exitCode) { root.afterReveal(exitCode) }
+  }
+
   Column {
     id: layoutColumn
     anchors.fill: parent
@@ -3982,6 +4817,31 @@ Item {
             current: root.chatOpen
             onActivated: root.toggleChat()
           }
+        }
+
+        Button {
+          visible: root.mode === "split"
+          text: ""
+          iconText: root.linkedScroll ? "\uf0c1" : "\uf127"
+          tooltipText: !root.linkedScroll
+            ? "Scroll edit and preview together — click to link"
+            : root.linkedMode === "line"
+              ? "Panes follow the same source line"
+              : "Panes scroll by position"
+          fontSize: Style.font.bodySmall
+          horizontalPadding: Style.space(8)
+          verticalPadding: Style.space(5)
+          onClicked: root.linkedScroll = !root.linkedScroll
+        }
+
+        Button {
+          text: ""
+          iconText: "\uf013"
+          tooltipText: "Settings"
+          fontSize: Style.font.bodySmall
+          horizontalPadding: Style.space(8)
+          verticalPadding: Style.space(5)
+          onClicked: root.settingsOpen ? root.closeSettings() : root.openSettings()
         }
 
         Button {
@@ -4240,10 +5100,29 @@ Item {
               contentHeight: editor.implicitHeight
               boundsBehavior: Flickable.StopAtBounds
               interactive: contentHeight > height
+              onContentYChanged: root.syncPreviewToEditor()
 
               function ensureVisible(rect) {
                 if (contentY >= rect.y) contentY = rect.y
                 else if (contentY + height <= rect.y + rect.height) contentY = rect.y + rect.height - height
+              }
+
+              // Qt's built-in wheel step is fixed, which is slow in a long note
+              // and ignores how fast the wheel is spun. Scale each notch by how
+              // quickly the notches arrive: a hard spin covers ground, a single
+              // deliberate roll stays precise.
+              property var wheelState: WheelScroll.create()
+
+              WheelHandler {
+                onWheel: function(event) {
+                  var step = WheelScroll.step(editorScroll.wheelState,
+                    event.angleDelta.y, event.pixelDelta.y, Date.now())
+                  if (step === 0) return
+                  editorScroll.contentY = Math.max(0, Math.min(
+                    editorScroll.contentHeight - editorScroll.height,
+                    editorScroll.contentY - step))
+                  event.accepted = true
+                }
               }
 
               MarkdownEditor {
@@ -4263,6 +5142,8 @@ Item {
                 accentColor: Commons.Color.accent
                 font.family: Style.font.family
                 font.pixelSize: Style.font.body
+                spellcheckEnabled: root.spellcheck
+                highlightingEnabled: root.highlighting
                 leftPadding: Style.space(10)
                 rightPadding: Style.space(10)
                 topPadding: Style.space(8)
@@ -4300,6 +5181,7 @@ Item {
               height: parent.height
 
               PreviewPane {
+                id: previewPane
                 anchors.fill: parent
                 visible: root.mode !== "edit" && !root.tableOpen
                 markdown: root.previewMarkdown
@@ -4314,6 +5196,7 @@ Item {
                 onImageResized: function(line, width) { root.setImageWidth(line, width) }
                 onImageReset: function(line) { root.clearImageSize(line) }
                 onTaskToggled: function(line) { root.toggleTaskAt(line) }
+                onScrolled: root.syncEditorToPreview()
                 onTableActivated: function(startLine, endLine) {
                   root.openTableAt(startLine, endLine)
                 }
@@ -4728,6 +5611,140 @@ Item {
           label: "Reset layout"
           showCheck: false
           onActivated: root.resetLayout()
+        }
+      }
+    }
+  }
+
+  // ------------------------------------------------------------ settings
+  // Same in-scene pattern as the view menu: a themed panel under the header
+  // with a backdrop that closes it on the first click outside. Rows keep it
+  // open so a choice is visible as it changes.
+  Item {
+    id: settingsOverlay
+    anchors.fill: parent
+    visible: root.settingsOpen
+    z: 100
+
+    MouseArea {
+      anchors.fill: parent
+      onClicked: root.closeSettings()
+    }
+
+    BorderSurface {
+      id: settingsMenu
+      width: Style.space(236)
+      height: settingsColumn.implicitHeight + Style.space(10)
+      color: Commons.Color.background
+      borderSpec: Border.controlSpec("normal", Commons.Color.foreground, Commons.Color.accent)
+      radius: Style.cornerRadius
+
+      x: Math.max(Style.space(8), root.width - width - Style.space(2))
+      y: headerRow.y + headerRow.height + Style.space(4)
+
+      MouseArea {
+        anchors.fill: parent
+        onClicked: {}
+      }
+
+      Column {
+        id: settingsColumn
+        anchors.fill: parent
+        anchors.margins: Style.space(5)
+        spacing: Style.space(1)
+
+        Text {
+          width: parent.width
+          text: "Settings"
+          textFormat: Text.PlainText
+          color: Commons.Color.foreground
+          font.family: Style.font.family
+          font.pixelSize: Style.font.body
+          font.bold: true
+          elide: Text.ElideRight
+        }
+
+        Rectangle {
+          width: parent.width
+          height: 1
+          color: Util.alpha(Commons.Color.foreground, 0.12)
+        }
+
+        SettingsSection {
+          label: "SESSION"
+        }
+
+        ViewMenuRow {
+          label: "Reopen last session"
+          checked: root.restoreSession
+          onActivated: root.restoreSession = !root.restoreSession
+        }
+
+        SettingsSection {
+          label: "SPLIT VIEW"
+        }
+
+        ViewMenuRow {
+          label: "Linked scrolling off"
+          checked: !root.linkedScroll
+          onActivated: root.linkedScroll = false
+        }
+        ViewMenuRow {
+          label: "Linked by position"
+          checked: root.linkedScroll && root.linkedMode === "position"
+          onActivated: {
+            root.linkedMode = "position"
+            root.linkedScroll = true
+          }
+        }
+        ViewMenuRow {
+          label: "Linked by line"
+          checked: root.linkedScroll && root.linkedMode === "line"
+          onActivated: {
+            root.linkedMode = "line"
+            root.linkedScroll = true
+          }
+        }
+
+        SettingsSection {
+          label: "EDITOR"
+        }
+
+        ViewMenuRow {
+          label: "Spellcheck"
+          checked: root.spellcheck
+          onActivated: root.spellcheck = !root.spellcheck
+        }
+        ViewMenuRow {
+          label: "Syntax highlighting"
+          checked: root.highlighting
+          onActivated: root.highlighting = !root.highlighting
+        }
+
+        SettingsSection {
+          label: "PRINTING"
+        }
+
+        SettingMenuRow {
+          label: "Printer"
+          value: root.printerLabel(root.printPrinter)
+          current: root.printPrinter
+          choices: root.printerMenu()
+          onPicked: (key) => root.setPrinter(key)
+        }
+        SettingStepper {
+          label: "Copies"
+          value: root.printCopies
+          minimum: 1
+          maximum: 9
+          onStepped: function(delta) { root.printCopies = root.settingNumber(root.printCopies + delta, 1, 9, 1) }
+        }
+        SettingMenuRow {
+          label: "Margins"
+          value: root.printMarginLabel(root.printMargin)
+          current: root.printMargin
+          choices: root.printMarginMenu()
+          onPicked: (key) => { root.printMargin = key; root.scheduleSettingsSave() }
         }
       }
     }
@@ -5277,6 +6294,171 @@ Item {
     }
   }
 
+  // ------------------------------------------------------- print dialog
+  // There is no system print dialog here, so printer choice, copies and CUPS
+  // health live in this modal. Preview renders the same PDF and opens it in the
+  // default viewer, where a real dialog does exist.
+  Popup {
+    id: printPopup
+    objectName: "printPopup"
+    parent: Overlay.overlay
+    anchors.centerIn: Overlay.overlay
+    width: Style.space(360)
+    padding: Style.space(12)
+    modal: true
+    dim: true
+    focus: true
+    closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+    onOpened: { root.printPopupOpen = true }
+    onClosed: { root.printPopupOpen = false }
+    background: BorderSurface {
+      color: Commons.Color.background
+      borderSpec: Border.controlSpec("normal", Commons.Color.foreground, Commons.Color.accent)
+      radius: Style.cornerRadius
+    }
+
+    contentItem: Column {
+      width: printPopup.availableWidth
+      spacing: Style.space(10)
+
+      Text {
+        width: parent.width
+        text: "Print note"
+        textFormat: Text.PlainText
+        color: Commons.Color.foreground
+        font.family: Style.font.family
+        font.pixelSize: Style.font.title
+        font.bold: true
+      }
+
+      Text {
+        objectName: "printNoteTitle"
+        width: parent.width
+        text: root.selectedNote ? String(root.selectedNote.title || "") : ""
+        textFormat: Text.PlainText
+        elide: Text.ElideRight
+        color: Util.alpha(Commons.Color.foreground, 0.6)
+        font.family: Style.font.family
+        font.pixelSize: Style.font.bodySmall
+      }
+
+      SettingMenuRow {
+        label: "Printer"
+        value: root.printerLabel(root.printPrinter)
+        current: root.printPrinter
+        choices: root.printerMenu()
+        onPicked: (key) => root.setPrinter(key)
+      }
+
+      Repeater {
+        model: root.printOptionList
+
+        SettingMenuRow {
+          required property var modelData
+          label: String(modelData.label || "")
+          value: root.printOptionLabel(modelData)
+          current: root.printOptionValue(modelData)
+          choices: root.printOptionMenu(modelData)
+          onPicked: (key) => root.setPrintOption(modelData.key, key)
+        }
+      }
+
+      SettingMenuRow {
+        label: "Margins"
+        value: root.printMarginLabel(root.printMargin)
+        current: root.printMargin
+        choices: root.printMarginMenu()
+        onPicked: (key) => { root.printMargin = key; root.scheduleSettingsSave() }
+      }
+
+      Text {
+        objectName: "printStatusText"
+        width: parent.width
+        visible: text !== ""
+        text: root.printerStatus(root.printPrinter)
+        textFormat: Text.PlainText
+        wrapMode: Text.Wrap
+        color: text !== "" && text !== "Ready"
+          ? Commons.Color.urgent
+          : Util.alpha(Commons.Color.foreground, 0.6)
+        font.family: Style.font.family
+        font.pixelSize: Style.font.bodySmall
+      }
+
+      SettingStepper {
+        label: "Copies"
+        value: root.printCopies
+        minimum: 1
+        maximum: 9
+        onStepped: function(delta) { root.printCopies = root.settingNumber(root.printCopies + delta, 1, 9, 1) }
+      }
+
+      Text {
+        width: parent.width
+        text: "Quill prints through CUPS; there is no system print dialog. Preview opens the rendered PDF, where your viewer offers one."
+        textFormat: Text.PlainText
+        wrapMode: Text.Wrap
+        color: Util.alpha(Commons.Color.foreground, 0.56)
+        font.family: Style.font.family
+        font.pixelSize: Style.font.bodySmall
+      }
+
+      Text {
+        width: parent.width
+        text: root.printError
+        visible: text !== ""
+        textFormat: Text.PlainText
+        color: Commons.Color.urgent
+        font.family: Style.font.family
+        font.pixelSize: Style.font.bodySmall
+        wrapMode: Text.Wrap
+      }
+
+      Row {
+        width: parent.width
+        spacing: Style.space(6)
+
+        Item {
+          width: Math.max(0, parent.width - printCancelButton.width
+            - printPreviewButton.width - printConfirmButton.width
+            - parent.spacing * 3)
+          height: 1
+        }
+
+        Button {
+          id: printCancelButton
+          objectName: "printCancelButton"
+          text: "Cancel"
+          fontSize: Style.font.bodySmall
+          horizontalPadding: Style.space(10)
+          verticalPadding: Style.space(5)
+          onClicked: root.closePrint()
+        }
+        Button {
+          id: printPreviewButton
+          objectName: "printPreviewButton"
+          text: "Preview"
+          enabled: !root.printing
+          fontSize: Style.font.bodySmall
+          horizontalPadding: Style.space(10)
+          verticalPadding: Style.space(5)
+          onClicked: root.requestPrint(true)
+        }
+        Button {
+          id: printConfirmButton
+          objectName: "printConfirmButton"
+          text: root.printing ? "Printing…" : "Print"
+          active: true
+          enabled: !root.printing
+          fontSize: Style.font.bodySmall
+          horizontalPadding: Style.space(10)
+          verticalPadding: Style.space(5)
+          onClicked: root.requestPrint(false)
+        }
+      }
+    }
+  }
+
   // ------------------------------------------------------- version history
   // Restoring is only offered while the open buffer is clean: the store
   // snapshots the current note first, so any unsaved text would be captured
@@ -5471,8 +6653,11 @@ Item {
             tooltipText: "Version history"
             horizontalPadding: 0
             verticalPadding: 0
-            onClicked: versionHistory.openFor(root.selectedId,
-              root.selectedNote ? root.selectedNote.title : "")
+            onClicked: {
+              root.anchorPopup(versionHistory)
+              versionHistory.openFor(root.selectedId,
+                root.selectedNote ? root.selectedNote.title : "")
+            }
           }
 
           Dropdown {
@@ -5502,6 +6687,16 @@ Item {
             horizontalPadding: Style.space(7)
             verticalPadding: Style.space(4)
             onClicked: root.openExport()
+          }
+          Button {
+            objectName: "printButton"
+            visible: !!root.selectedNote && !root.compactHeader
+            text: root.printing ? "Printing…" : "Print"
+            tooltipText: "Print note (Ctrl+Alt+P)"
+            fontSize: Style.font.bodySmall
+            horizontalPadding: Style.space(7)
+            verticalPadding: Style.space(4)
+            onClicked: root.openPrint()
           }
           Button {
             visible: !!root.selectedNote && !root.selectedNote.trashed && !root.compactHeader
@@ -5612,6 +6807,136 @@ Item {
     }
   }
 
+  component SettingsSection: Item {
+    id: section
+    property string label: ""
+
+    width: parent ? parent.width : 0
+    height: sectionText.implicitHeight + Style.space(6)
+
+    Text {
+      id: sectionText
+      x: Style.space(7)
+      anchors.bottom: parent.bottom
+      text: section.label
+      textFormat: Text.PlainText
+      color: Util.alpha(Commons.Color.foreground, 0.5)
+      font.family: Style.font.family
+      font.pixelSize: Style.font.bodySmall
+    }
+  }
+
+  // A settings row whose value is picked from a menu. The menu is a Popup
+  // re-parented to the overlay, because the row itself lives inside another
+  // popup and Qt needs both on the same parent to stack and dismiss cleanly.
+  component SettingMenuRow: BorderSurface {
+    id: menuRow
+
+    property string label: ""
+    property string value: ""
+    property string current: ""
+    // [{ key, label }] in display order.
+    property var choices: []
+    signal picked(string key)
+
+    width: parent ? parent.width : 0
+    height: Style.space(26)
+    color: menuRowMouse.containsMouse || menu.visible
+      ? Style.hoverFillFor(Commons.Color.foreground, Commons.Color.accent)
+      : "transparent"
+    borderSpec: Border.none
+    radius: Style.cornerRadius
+
+    Text {
+      id: menuRowLabel
+      anchors.left: parent.left
+      anchors.leftMargin: Style.space(7)
+      anchors.right: menuRowValue.left
+      anchors.rightMargin: Style.space(6)
+      anchors.verticalCenter: parent.verticalCenter
+      text: menuRow.label
+      textFormat: Text.PlainText
+      color: Commons.Color.foreground
+      font.family: Style.font.family
+      font.pixelSize: Style.font.bodySmall
+      elide: Text.ElideRight
+    }
+
+    Text {
+      id: menuRowValue
+      anchors.right: parent.right
+      anchors.rightMargin: Style.space(7)
+      anchors.verticalCenter: parent.verticalCenter
+      text: menuRow.value + "  \u25be"
+      textFormat: Text.PlainText
+      color: Util.alpha(Commons.Color.foreground, 0.7)
+      font.family: Style.font.family
+      font.pixelSize: Style.font.bodySmall
+    }
+
+    function openMenu() {
+      if (menu.visible) {
+        menu.close()
+        return
+      }
+      PopupAnchor.anchor(menu, Overlay.overlay)
+      // Size it here rather than trusting implicitHeight: the popup's content
+      // has not been laid out yet, and everything in it is a fixed 26 px row.
+      var rowCount = menuRow.choices && menuRow.choices.length ? menuRow.choices.length : 0
+      menu.width = menuRow.width
+      menu.height = Style.space(26) * rowCount + 2 * Style.space(3)
+      var overlayHeight = Overlay.overlay ? Overlay.overlay.height : 0
+      var below = menuRow.mapToItem(Overlay.overlay, 0, menuRow.height).y + Style.space(2)
+      // Drop upwards when the list would run off the bottom of the screen.
+      var y = below
+      if (overlayHeight > 0 && y + menu.height > overlayHeight - Style.space(4)) {
+        y = menuRow.mapToItem(Overlay.overlay, 0, 0).y - menu.height - Style.space(2)
+      }
+      menu.x = menuRow.mapToItem(Overlay.overlay, 0, 0).x
+      menu.y = Math.max(Style.space(4), y)
+      menu.open()
+    }
+
+    MouseArea {
+      id: menuRowMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: menuRow.openMenu()
+    }
+
+    Popup {
+      id: menu
+      padding: Style.space(3)
+      closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+      dim: false
+
+      background: BorderSurface {
+        color: Commons.Color.background
+        borderSpec: Border.controlSpec("normal", Commons.Color.foreground, Commons.Color.accent)
+        radius: Style.cornerRadius
+      }
+
+      contentItem: Column {
+        width: menu.availableWidth
+
+        Repeater {
+          model: menuRow.choices
+
+          ViewMenuRow {
+            required property var modelData
+            label: String(modelData.label || "")
+            checked: String(modelData.key || "") === menuRow.current
+            onActivated: {
+              menu.close()
+              menuRow.picked(String(modelData.key || ""))
+            }
+          }
+        }
+      }
+    }
+  }
+
   component ViewMenuRow: BorderSurface {
     id: viewRow
 
@@ -5665,6 +6990,107 @@ Item {
       hoverEnabled: true
       cursorShape: Qt.PointingHandCursor
       onClicked: viewRow.activated()
+    }
+  }
+
+  component SettingStepper: BorderSurface {
+    id: stepper
+    property string label: ""
+    property int value: 1
+    property int minimum: 1
+    property int maximum: 9
+    signal stepped(int delta)
+
+    width: parent ? parent.width : 0
+    height: Style.space(26)
+    color: stepperHover.containsMouse
+      ? Style.hoverFillFor(Commons.Color.foreground, Commons.Color.accent)
+      : "transparent"
+    borderSpec: Border.none
+    radius: Style.cornerRadius
+
+    MouseArea {
+      id: stepperHover
+      anchors.fill: parent
+      hoverEnabled: true
+      acceptedButtons: Qt.NoButton
+    }
+
+    Text {
+      anchors.left: parent.left
+      anchors.leftMargin: Style.space(7)
+      anchors.right: valueRow.left
+      anchors.rightMargin: Style.space(5)
+      anchors.verticalCenter: parent.verticalCenter
+      text: stepper.label
+      textFormat: Text.PlainText
+      color: Commons.Color.foreground
+      font.family: Style.font.family
+      font.pixelSize: Style.font.bodySmall
+      elide: Text.ElideRight
+    }
+
+    Row {
+      id: valueRow
+      anchors.right: parent.right
+      anchors.rightMargin: Style.space(5)
+      anchors.verticalCenter: parent.verticalCenter
+      spacing: Style.space(2)
+
+      Rectangle {
+        width: Style.space(16); height: Style.space(16)
+        radius: Style.cornerRadius
+        color: minusArea.containsMouse ? Style.hoverFillFor(Commons.Color.foreground, Commons.Color.accent) : "transparent"
+        opacity: stepper.value > stepper.minimum ? 1 : 0.3
+
+        Text {
+          anchors.centerIn: parent
+          text: "−"
+          color: Commons.Color.foreground
+          font.family: Style.font.family
+          font.pixelSize: Style.font.bodySmall
+        }
+
+        MouseArea {
+          id: minusArea
+          anchors.fill: parent
+          hoverEnabled: true
+          onClicked: if (stepper.value > stepper.minimum) stepper.stepped(-1)
+        }
+      }
+
+      Text {
+        width: Style.space(18)
+        anchors.verticalCenter: parent.verticalCenter
+        text: String(stepper.value)
+        textFormat: Text.PlainText
+        color: Commons.Color.foreground
+        font.family: Style.font.family
+        font.pixelSize: Style.font.bodySmall
+        horizontalAlignment: Text.AlignHCenter
+      }
+
+      Rectangle {
+        width: Style.space(16); height: Style.space(16)
+        radius: Style.cornerRadius
+        color: plusArea.containsMouse ? Style.hoverFillFor(Commons.Color.foreground, Commons.Color.accent) : "transparent"
+        opacity: stepper.value < stepper.maximum ? 1 : 0.3
+
+        Text {
+          anchors.centerIn: parent
+          text: "+"
+          color: Commons.Color.foreground
+          font.family: Style.font.family
+          font.pixelSize: Style.font.bodySmall
+        }
+
+        MouseArea {
+          id: plusArea
+          anchors.fill: parent
+          hoverEnabled: true
+          onClicked: if (stepper.value < stepper.maximum) stepper.stepped(1)
+        }
+      }
     }
   }
 

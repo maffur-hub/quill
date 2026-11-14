@@ -1040,6 +1040,75 @@ TextArea {
     forceActiveFocus()
   }
 
+  // Qt starts the caret blink when it sees the cursor become visible, not
+  // merely when the editor takes focus. A click that focuses the editor while
+  // its window is still activating can leave cursorVisible false, so the caret
+  // delegate is never created and nothing appears until the first keystroke.
+  // Re-assert visibility and re-seat the cursor by one position and back.
+  function nudgeCaret() {
+    if (!root.activeFocus || root.selectedText !== "") return
+    // Only force the flag when Qt thinks the caret is hidden: writing it while
+    // it is already true is a no-op, and toggling it around would restart the
+    // blink for no reason.
+    if (!root.cursorVisible) root.cursorVisible = true
+    var position = root.cursorPosition
+    if (position > 0) {
+      root.cursorPosition = position - 1
+      root.cursorPosition = position
+    }
+  }
+
+  onActiveFocusChanged: if (activeFocus) Qt.callLater(root.nudgeCaret)
+
+  Connections {
+    target: root.Window.window
+    function onActiveChanged() {
+      if (root.Window.window && root.Window.window.active) root.nudgeCaret()
+    }
+  }
+
+  // ---- source lines ----------------------------------------------------
+  // The preview follows the editor by source line, and TextEdit only exposes
+  // positions and pixels. Caching the first offset of every line lets a
+  // scroll convert a line to its pixel offset (positionToRectangle) and back
+  // (positionAt) without rescanning the note.
+
+  property var lineStarts: [0]
+
+  function rebuildLineStarts() {
+    var starts = [0]
+    var value = root.text
+    var index = value.indexOf("\n")
+    while (index >= 0) {
+      starts.push(index + 1)
+      index = value.indexOf("\n", index + 1)
+    }
+    root.lineStarts = starts
+  }
+
+  // The source line shown at pixel `y` (content coordinates of this item).
+  function lineAtY(y) {
+    var starts = root.lineStarts
+    if (!starts || starts.length === 0) return 0
+    var position = root.positionAt(0, Math.max(0, Number(y) || 0))
+    var low = 0
+    var high = starts.length - 1
+    while (low < high) {
+      var mid = Math.floor((low + high + 1) / 2)
+      if (starts[mid] <= position) low = mid
+      else high = mid - 1
+    }
+    return low
+  }
+
+  // The pixel offset where `line` starts.
+  function yForLine(line) {
+    var starts = root.lineStarts
+    if (!starts || starts.length === 0) return 0
+    var index = Math.max(0, Math.min(starts.length - 1, Math.floor(Number(line) || 0)))
+    return root.positionToRectangle(starts[index]).y
+  }
+
   // ------------------------------------------------------------ attachments
 
   // Editing is blocked while the note is read-only, disabled, or a crash-draft
@@ -2535,6 +2604,7 @@ TextArea {
   persistentSelection: true
 
   onTextChanged: {
+    root.rebuildLineStarts()
     if (root.spellSnapshot !== root.text && root.spellIssues.length > 0) {
       root.spellIssues = []
       root.spellRevision += 1
@@ -2573,7 +2643,10 @@ TextArea {
 
   onStorePathChanged: spellTimer.restart()
 
-  Component.onCompleted: spellTimer.restart()
+  Component.onCompleted: {
+    root.rebuildLineStarts()
+    spellTimer.restart()
+  }
 
   FontMetrics {
     id: editorMetrics
@@ -2581,12 +2654,28 @@ TextArea {
   }
 
   cursorDelegate: Rectangle {
+    id: caret
+
     // Track the caret rectangle Qt computes for the current line so the caret
     // always matches the text size, including wrapped lines.
     width: 2
     height: root.cursorRectangle.height
     color: root.accentColor
+
+    // The caret owns its own visibility. Qt also calls setVisible() on this
+    // item, both when focus moves between windows and while it tracks the
+    // viewport of a long document; that call permanently replaces a `visible:`
+    // binding, which is how the caret used to disappear until the next
+    // keystroke. Assignments from handlers survive, so it restores itself.
     visible: root.activeFocus
+    opacity: root.activeFocus ? 1 : 0
+
+    onVisibleChanged: if (!visible && root.activeFocus) visible = true
+
+    Connections {
+      target: root
+      function onActiveFocusChanged() { caret.visible = root.activeFocus }
+    }
   }
 
   background: Item {

@@ -48,6 +48,7 @@ backlinks. Deleting `index.db` is safe; it is rebuilt automatically.
   scripts/quill-math   offline TeX → themed SVG renderer (JSON in / JSON out)
   scripts/quill-export-html  Markdown → one standalone HTML file (images + SVG maths)
   scripts/quill-export-pdf   Markdown → PDF via that renderer + headless Chromium
+  scripts/quill-reveal       show a note's file in the file manager, selected if possible
   scripts/quill-window launcher for Detached.qml (stages it for `qs -p`)
   vendor/              vendored MathJax 3.2.2 (Apache-2.0), see vendor/README.md
   tools/               Joplin mirror scripts + systemd units (reference copies)
@@ -72,7 +73,7 @@ attachments/ pasted images and attached files, content-addressed
 backups/versions/  local note snapshots (newest 50 per note)
 backups/joplin/    remote Joplin bodies saved before replacement/trash
                    (newest 50 per Joplin note; see Joplin sync)
-state.json   pinned note ids
+state.json   pinned note ids, saved searches, UI settings (`ui`)
 index.db     derived SQLite index (WAL, FTS5)
 .quill-context.json  note the chat currently sees (id, title, path, selection)
 AGENTS.md    instructions for the chat agent (it is embedded in Quill)
@@ -179,8 +180,8 @@ Draft writes never wake the Joplin sync. Only the normal note save does.
 | `Ctrl+C` | Copy selected preview text (when the preview has focus) |
 
 Split is the default when the library is at least 1000 px wide; narrow layouts
-open in Edit mode. The mode choice is remembered for the session once you click
-a mode button or press `Ctrl+E`.
+open in Edit mode. The mode choice is remembered across restarts once you click
+a mode button or press `Ctrl+E` (see [Settings](#settings)).
 
 ## Creating notes and templates
 
@@ -227,6 +228,11 @@ to stay inside the window. On an active note the menu offers **Pin** /
 visible; the folder chooser lists Inbox and every folder. With more than one
 row selected the same menu shows plural bulk actions and drops Rename and
 Duplicate. In Trash it offers **Restore** and **Delete forever…**.
+
+**Open file location** shows the note's Markdown file in the file manager with
+the file selected — via the desktop's `org.freedesktop.FileManager1` interface,
+falling back to `nautilus`/`dolphin`/`thunar --select`, then to opening the
+folder. It also appears in the Trash menu, where it points into `trash/`.
 
 **Rename** opens a modal with the current title prefilled and keeps the same
 file id. A frontmatter `title` is updated when present, otherwise the first
@@ -298,10 +304,77 @@ both left panes, split mode and closes Agent. Editor and Preview can never both
 be off: turning one off leaves the other visible, and both on means Split.
 
 The Library and Notes headers each have a small **‹** button and collapse to a
-slim rail with a **›** button and a vertical label. The state is per shell
-session only. **Ctrl+1** / **Ctrl+2** reopen the target pane if it is collapsed
-and then focus it; **Ctrl+F** also reopens Notes when needed. The detached note
-window keeps its own fixed two-pane layout and is unaffected.
+slim rail with a **›** button and a vertical label. Both are restored on the
+next start while **Reopen last session** is on. **Ctrl+1** / **Ctrl+2** reopen
+the target pane if it is collapsed and then focus it; **Ctrl+F** also reopens
+Notes when needed. The detached note window keeps its own fixed two-pane layout
+and is unaffected.
+
+The gear beside the Edit / Split / Preview buttons opens **Settings**, described
+below. Opening Settings closes the View menu and vice versa; Escape, a click
+outside, or the window losing focus closes it.
+
+## Linked scrolling
+
+In split mode the editor and the preview can follow each other. The chain button
+in the header turns this on and off, and Settings picks how the two panes are
+matched:
+
+| Mode | Behaviour |
+| --- | --- |
+| Off | The panes scroll independently |
+| By position | Each pane mirrors its fraction of the scrollable range |
+| By line | The same source line stays at the top of both panes |
+
+**By line** is the default mode, and the accurate one. Every preview block
+records the source lines it renders (`PreviewBlocks.js` stamps
+`startLine`/`endLine`), and `PreviewSync.js` converts a line to a pixel offset
+and back between those block anchors. The editor side uses
+`positionToRectangle` / `positionAt` over a cached line-start table, since
+`TextEdit` exposes no line lookup. Block boundaries are exact; inside a block the
+mapping is interpolated, so a very long paragraph whose lines wrap differently in
+the two panes can drift by a line or two.
+
+Linked scrolling is a stored preference rather than a session flag, so the
+mode you choose survives a shell restart.
+
+## Settings
+
+The gear beside Edit / Split / Preview opens a panel under the header with every
+preference in one place:
+
+| Setting | Values |
+| --- | --- |
+| Reopen last session | on / off |
+| Linked scrolling | off / by position / by line |
+| Spellcheck | on / off |
+| Syntax highlighting | on / off |
+| Printer | System default, or any CUPS queue |
+| Copies | 1–9 |
+
+Choices are written 400 ms after a change and flushed when the window closes.
+They live in `<data root>/state.json` under `ui`, next to pins and saved
+searches, so they survive a shell restart. The store owns the file:
+`quill-store settings get` returns `{"ui": …}` and `settings set --json '<object>'`
+replaces it; the keys are opaque to the CLI, which only enforces a 64 KiB cap
+and 64-character key names. Editing preferences therefore never touches a note.
+
+### Reopening where you left off
+
+With **Reopen last session** on, the next shell start restores the note you had
+open, the Edit / Split / Preview mode, the library and notes panes if they were
+visible, and the active view — All, Pinned, Recent, Trash, a folder or a tag. A
+saved note, folder or tag that no longer exists is dropped: the window falls
+back to All notes and the first visible row rather than opening empty.
+
+Turn the toggle off to always start from the default layout with nothing
+selected. The other settings — spellcheck, highlighting, printer, copies and
+linked scrolling — are remembered either way.
+
+The panel's own state is read once at startup, before the first list is loaded,
+so the restored category is in place when the notes arrive and the first row is
+never selected over the note you left open. If the store does not answer within
+two seconds the defaults are used and the window opens normally.
 
 ## Search filters
 
@@ -545,7 +618,10 @@ render through the RichText path.
 Raw HTML is a sanitised allowlist (`<u>`, `<span style>`, `<sup>`, `<sub>`,
 `<kbd>`, `<mark>`, `<b>`, `<i>`, `<s>`, `<code>`, `<var>`, `<samp>`, `<cite>`,
 `<dfn>`, `<del>`, `<ins>`, `<br>`), not full HTML: anything else stays literal
-text. The preview always renders the saved body, so edits appear after autosave.
+text. The preview renders the live editor buffer (200 ms after typing stops,
+through `preview --content-file`), so edits appear without waiting for the
+autosave. Trashed, read-only and draft-pending notes keep showing the saved
+body.
 
 ## Tables
 
@@ -881,7 +957,9 @@ dialog for the current editor buffer:
   remote; missing, non-image or larger-than-10-MiB files become an inline
   "missing image" note instead of breaking the export.
 - **PDF** reuses that HTML renderer, injects a print stylesheet and prints it
-  with a headless Chromium/Chrome: A4 paper with 18 mm margins by default,
+  with a headless Chromium/Chrome: A4 paper with 18 mm margins by default (the
+  screen wrapper's padding is dropped on paper, so the margin is the whole
+  margin),
   code wrapped instead of clipped, and blocks kept off page breaks. It needs
   `chromium` (or another Chrome-family browser) on `PATH`, or `QUILL_CHROMIUM`
   pointing at one; when no browser is found the export fails with a clear
@@ -894,6 +972,60 @@ Joplin sync. `scripts/quill-export-html` is the self-contained renderer used by
 the HTML option; it uses the vendored MathJax tree and needs no install step.
 `scripts/quill-export-pdf` drives that renderer and a headless browser for the
 PDF option.
+
+## Printing
+
+The **Print** button sits beside **Export** in the note header, or press
+`Ctrl+Alt+P`. Both open Quill's own print dialog: the note title, a **Printer**
+menu, one menu for each option the queue actually supports — normally **Paper**,
+**Colour**, **Two-sided** and **Quality** — a **Margins** menu, a **Copies**
+stepper, and **Cancel / Preview / Print**. Every menu row shows the current value
+and opens a list of everything the queue offers, with a checkmark on the active
+one.
+
+Those option rows come from the printer, not from Quill: the dialog reads
+`lpoptions -p <queue> -l` and shows only the settings that queue reports, in the
+driver's own values. A queue that offers greyscale and duplex therefore grows
+**Colour — Greyscale** and **Two-sided — Long edge** rows, while a driver with
+no duplex shows none. Switching the printer reloads them, and each choice is
+remembered for the next print.
+
+**Margins** is Quill's own, not the driver's: **Narrow** 10 mm, **Normal** 15 mm
+(the default) and **Wide** 22 mm, applied as the PDF's `@page` margin. The
+renderer drops its on-screen wrapper padding on paper, so the page margin is the
+only margin — a note that opens with a heading starts at the margin instead of
+being pushed down by the heading's own spacing.
+
+The dialog exists because there is no system print dialog to borrow — no GTK
+print dialog and no portal one — so **Print** would otherwise submit silently to
+whatever CUPS considers the default. The **Printer** row shows the queue's state
+next to the name, including CUPS complaints such as an offline printer or a
+failing filter, so a job that would disappear into the queue is visible first.
+
+**Preview** renders the PDF, keeps it, and opens it in your default viewer with
+`xdg-open`. That is where a real print dialog lives: check the pages, then print
+from the viewer. Preview submits nothing to CUPS, and Quill closes as the viewer
+comes up — the library floats above ordinary windows, so leaving it open would
+hide the pages you just asked to see.
+
+Printing uses the same PDF renderer as **PDF** export and hands the file to
+`scripts/quill-print`, which submits it with `lp`. The note file is never
+modified: Print reads the live editor buffer, so unsaved edits are included, but
+it does not save the note or touch the Joplin queue. The temporary Markdown is
+always removed, and a job PDF is removed unless a preview needed it.
+
+`scripts/quill-print --list` prints the queues, their state, the current default
+and the options the selected queue supports as JSON. The printer, the copy count
+and every option choice are remembered in **Settings**; `--printer NAME`,
+`--copies N`, `--page-margin <css-length>`, repeatable `--option KEY=VALUE` and
+`--render-only` are the same knobs on the command line, and an option is rejected if the queue does not list
+it.
+
+Failures are reported inside the dialog, in the warning colour: a missing
+printer, a stopped CUPS daemon, a script that will not run, or stderr from `lp`.
+A job CUPS accepts while the queue reports a problem is reported the same way —
+accepting a job is not printing it — so a queue with a failing filter cannot fail
+silently, with only a cheerful job number to show for it.
 
 ## Joplin sync
 
@@ -1129,8 +1261,9 @@ overwrites an existing note. OmaNano's files are never moved or modified.
   Hyprland may tile them unless you add a float rule for `class:org.quickshell`.
 - `folder delete --force` moves `.md` notes to the root and deletes other file
   types inside that folder. The UI only offers the non-forced form.
-- Preview updates after autosave (600 ms) or `Ctrl+S`, because rendering is
-  deliberately done from the backend's saved view of the note.
+- Preview updates as you type (200 ms after the last keystroke) through
+  `preview --content-file`; trashed, read-only and draft-pending notes render
+  the saved body instead.
 - Crash drafts follow the note's current path. Renaming, moving or trashing a
   note does not move an existing `.draft`, so recovery is offered again only if
   the note returns to the same path before the draft is removed.
@@ -1146,6 +1279,10 @@ overwrites an existing note. OmaNano's files are never moved or modified.
 - Table formulas are Quill-only display helpers. Joplin shows the literal
   `=…` text, computed values are not exported, and sorting rows does not rewrite
   cell references.
+- Settings are stored per data root, not per machine or per window. Session
+  restore applies to the library only: a detached window still opens the note
+  it was launched with, and a note that was moved or trashed between sessions
+  falls back to the first visible row.
 
 ## License
 

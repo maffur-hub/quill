@@ -53,6 +53,8 @@ MAX_STATE_BYTES = 1024 * 1024
 MAX_SEARCH_LIMIT = 500
 MAX_TITLES_LIMIT = 20000
 MAX_SAVED_SEARCHES = 50
+MAX_UI_SETTINGS_BYTES = 64 * 1024
+MAX_UI_SETTINGS_KEY_CHARS = 64
 FUZZY_TRIGGER = 5      # run the fallback when exact hits are fewer than this
 FUZZY_MIN_TOKEN = 3    # shorter tokens stay plain prefix matches
 FUZZY_TERMS = 4        # expansions kept per token
@@ -3164,6 +3166,61 @@ def command_searches(args) -> dict:
     return {"searches": entries}
 
 
+def command_settings(args) -> dict:
+    """Read or replace the opaque UI settings object in state.json.
+
+    `get` is deliberately read-only: it must not create the data root, so it
+    skips `ensure_store()`/`locked()`. The store never interprets `ui`; the
+    front end owns its shape and replaces the whole object on every `set`.
+    """
+    action = str(getattr(args, "settings_action", "") or "")
+    if action == "get":
+        ui = read_state().get("ui")
+        return {"ui": ui if isinstance(ui, dict) else {}}
+    if action != "set":
+        raise StoreError(f"unknown settings action: {action}")
+
+    raw_json = getattr(args, "settings_json", None)
+    from_stdin = bool(getattr(args, "settings_stdin", False))
+    if (raw_json is not None) == from_stdin:
+        raise StoreError("choose exactly one of --json and --stdin")
+    if from_stdin:
+        raw = read_stdin(MAX_UI_SETTINGS_BYTES)
+        if len(raw) > MAX_UI_SETTINGS_BYTES:
+            raise StoreError("Settings are too large")
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise StoreError("Settings must be UTF-8 JSON") from error
+    else:
+        text = str(raw_json)
+        if len(text.encode("utf-8")) > MAX_UI_SETTINGS_BYTES:
+            raise StoreError("Settings are too large")
+
+    try:
+        settings = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise StoreError(f"Settings must be a JSON object: {error.msg}") from error
+    if not isinstance(settings, dict):
+        raise StoreError("Settings must be a JSON object")
+    for key in settings:
+        if not isinstance(key, str) or not key:
+            raise StoreError("Settings keys must be non-empty strings")
+        if "\x00" in key:
+            raise StoreError("Settings keys must not contain NUL")
+        if len(key) > MAX_UI_SETTINGS_KEY_CHARS:
+            raise StoreError(
+                f"Settings keys must be at most {MAX_UI_SETTINGS_KEY_CHARS} characters"
+            )
+    serialized = json.dumps(settings, ensure_ascii=False).encode("utf-8")
+    if len(serialized) > MAX_UI_SETTINGS_BYTES:
+        raise StoreError("Settings are too large")
+
+    with locked():
+        update_state(ui=settings)
+    return {"ui": settings}
+
+
 def command_search(args) -> dict:
     ensure_store()
     parsed = parse_search_query(args.query)
@@ -4381,6 +4438,22 @@ WATCH_DEBOUNCE = 0.4
 WATCH_READ_TIMEOUT = 0.5
 
 
+def daemon_identity() -> str:
+    """A digest that changes when the data root or this script changes.
+
+    A long-lived daemon serves a snapshot of the command table it was started
+    with, so a store upgrade must not keep talking to an old one: including the
+    file's size and mtime in the socket name gives the new build a new socket,
+    and the previous daemon exits on its idle timeout.
+    """
+    try:
+        info = Path(__file__).resolve().stat()
+        stamp = f"{info.st_mtime_ns}:{info.st_size}"
+    except OSError:
+        stamp = ""
+    return hashlib.sha1(f"{ROOT}|{stamp}".encode("utf-8")).hexdigest()[:12]
+
+
 def daemon_socket_path() -> Path:
     """Return the daemon socket, never inside the data root.
 
@@ -4392,13 +4465,11 @@ def daemon_socket_path() -> Path:
     if override:
         candidate = Path(os.path.expanduser(override)).resolve()
     else:
-        digest = hashlib.sha1(str(ROOT).encode("utf-8")).hexdigest()[:12]
         runtime = os.environ.get("XDG_RUNTIME_DIR")
         base = Path(os.path.expanduser(runtime)) if runtime else Path(tempfile.gettempdir())
-        candidate = base / f"quill-{digest}.sock"
+        candidate = base / f"quill-{daemon_identity()}.sock"
     if candidate == ROOT or ROOT in candidate.parents:
-        digest = hashlib.sha1(str(ROOT).encode("utf-8")).hexdigest()[:12]
-        candidate = Path(tempfile.gettempdir()) / f"quill-{digest}.sock"
+        candidate = Path(tempfile.gettempdir()) / f"quill-{daemon_identity()}.sock"
     return candidate
 
 
@@ -5001,6 +5072,8 @@ def command_is_mutating(args) -> bool:
         return str(getattr(args, "searches_action", "") or "") in {"add", "remove"}
     if command == "templates":
         return str(getattr(args, "templates_action", "") or "") in {"save", "delete"}
+    if command == "settings":
+        return str(getattr(args, "settings_action", "") or "") != "get"
     return command in MUTATING_COMMANDS
 
 
@@ -5180,6 +5253,16 @@ def build_parser() -> argparse.ArgumentParser:
     searches_remove = searches_sub.add_parser("remove")
     searches_remove.add_argument("query")
     searches_remove.set_defaults(func=command_searches)
+
+    settings = sub.add_parser("settings")
+    settings_sub = settings.add_subparsers(dest="settings_action", required=True)
+    settings_sub.add_parser("get").set_defaults(func=command_settings)
+    settings_set = settings_sub.add_parser("set")
+    settings_set.add_argument("--json", dest="settings_json", default=None,
+                              help="replace the ui object with this JSON object")
+    settings_set.add_argument("--stdin", dest="settings_stdin", action="store_true",
+                              help="read the replacement ui object from stdin")
+    settings_set.set_defaults(func=command_settings)
 
     sub.add_parser("tags").set_defaults(func=command_tags)
 

@@ -81,6 +81,7 @@ function isMutatingArgs(args) {
   if (command === "draft") return stringValue(args[1]) === "discard"
   if (command === "attachment") return stringValue(args[1]) !== "list"
   if (command === "searches") return stringValue(args[1]) !== "list"
+  if (command === "settings") return stringValue(args[1]) !== "get"
   if (command === "templates") {
     var templatesAction = stringValue(args[1])
     return templatesAction === "save" || templatesAction === "delete"

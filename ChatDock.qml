@@ -4,6 +4,7 @@ import Quickshell
 import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
+import "PopupAnchor.js" as PopupAnchor
 
 // Right-hand chat dock for the library window.
 //
@@ -45,6 +46,7 @@ Item {
   function showChatMenu(x, y, selection, message) {
     chatMenuSelection = String(selection === undefined || selection === null ? "" : selection)
     chatMenuMessage = String(message === undefined || message === null ? "" : message)
+    PopupAnchor.anchor(chatMessageMenu, Overlay.overlay)
     chatMessageMenu.popup(Number(x || 0), Number(y || 0))
   }
 

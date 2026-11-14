@@ -34,9 +34,15 @@ export QUILL_STORE_PATH="${QUILL_STORE_PATH:-$script_dir/quill-store}"
 export QUILL_ALLOW_REAL_DATA=1
 
 mkdir -p "$stage"
-for file in Detached.qml MarkdownEditor.qml DraftBanner.qml DraftWriter.qml PreviewPane.qml MathService.qml ImageSizing.js TableEngine.js MathSyntax.js MathText.js MarkdownFormat.js WritableGuard.js; do
-  if ! cmp -s "$plugin_dir/$file" "$stage/$file"; then
-    cp "$plugin_dir/$file" "$stage/$file"
+# Stage every top-level component and JS module by glob. A fixed list silently
+# rots: Detached.qml gained VersionHistory.qml and PreviewPane.qml gained the
+# block renderer modules, and an omitted import is a hard load failure
+# ("VersionHistory is not a type") rather than a degraded window.
+for file in "$plugin_dir"/*.qml "$plugin_dir"/*.js; do
+  [[ -f "$file" ]] || continue
+  name=$(basename "$file")
+  if ! cmp -s "$file" "$stage/$name"; then
+    cp "$file" "$stage/$name"
   fi
 done
 ln -sfn /usr/share/omarchy/shell/Commons "$stage/Commons"

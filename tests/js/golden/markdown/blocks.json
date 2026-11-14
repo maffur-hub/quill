@@ -1,7 +1,9 @@
 [
   {
     "kind": "text",
-    "text": "# Mixed note\n\nIntro with a footnote[^one] and a task line below.\n"
+    "text": "# Mixed note\n\nIntro with a footnote[^one] and a task line below.\n",
+    "startLine": 0,
+    "endLine": 3
   },
   {
     "kind": "table",
@@ -75,7 +77,9 @@
         "indent": 0,
         "line": 24
       }
-    ]
+    ],
+    "startLine": 23,
+    "endLine": 24
   },
   {
     "kind": "image",
@@ -90,7 +94,9 @@
       "height": null,
       "hasSize": false
     },
-    "line": 26
+    "line": 26,
+    "startLine": 26,
+    "endLine": 26
   },
   {
     "kind": "footnotes",

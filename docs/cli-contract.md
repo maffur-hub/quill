@@ -22,7 +22,7 @@ Top-level commands:
 
 ```text
 list read write draft create duplicate rename move trash restore delete pin
-empty-trash versions restore-version folder search titles searches tags
+empty-trash versions restore-version folder search titles searches settings tags
 templates tag-rename tag-delete tag-add tag-remove backlinks unresolved preview
 import-omanano index attachment stats
 ```
@@ -37,6 +37,8 @@ folder      create <path>
 searches    list
             add <query> [--label LABEL]
             remove <query>
+settings    get
+            set (--json JSON | --stdin)
 templates   list
             show <id>
             save <id> [--name N] [--description D] [--icon I]
@@ -145,8 +147,12 @@ and keeps the SQLite index warm and current between requests.
 Resolution order:
 
 1. `$QUILL_SOCKET`, expanded and resolved.
-2. `$XDG_RUNTIME_DIR/quill-<sha1(str(ROOT))[:12]>.sock`.
-3. `/tmp/quill-<sha1(str(ROOT))[:12]>.sock` when `XDG_RUNTIME_DIR` is unset.
+2. `$XDG_RUNTIME_DIR/quill-<sha1(ROOT + "|" + store stamp)[:12]>.sock`.
+3. `/tmp/quill-<...>.sock` when `XDG_RUNTIME_DIR` is unset.
+
+The store stamp is the size and `mtime_ns` of the `quill-store` file itself, so
+upgrading the store yields a new socket: the previous daemon keeps serving its
+old command table until its idle timeout, and a new one starts with the new one.
 
 The socket is never placed inside the data root, and every socket path that
 would resolve under `ROOT` is redirected to `/tmp`. The server chmods it to
@@ -509,6 +515,36 @@ saved-search list, newest entries last:
 - `searches remove <query>` removes an exact match on the stored query string.
   It is idempotent: an unknown query returns the unchanged list without error.
 - `add` and `remove` take the exclusive lock; `list` does not.
+
+#### `settings get`, `settings set (--json JSON | --stdin)`
+
+UI settings are an opaque JSON object stored as `state.json` key `ui`. The
+store never validates or interprets the keys and values inside it; the front
+end owns the schema and may change it without a store migration.
+
+Both forms return the stored object:
+
+```json
+{"ui": {"mode": "split", "printCopies": 2}}
+```
+
+- `settings get` is read-only. It returns `{"ui": {}}` when `state.json` is
+  missing, when `ui` is absent, or when `ui` is not a JSON object. It does
+  **not** call `ensure_store()`, so it never creates the data root,
+  `state.json`, templates, or the lock file.
+- `settings set` requires exactly one of `--json JSON` or `--stdin`. Giving
+  both or neither fails with
+  `{"error": "choose exactly one of --json and --stdin"}`.
+- The payload must be a JSON **object**. `null`, arrays, strings, numbers, and
+  malformed JSON fail with an error beginning `Settings must be a JSON object`.
+  `{}` is valid and clears the settings.
+- Every top-level key must be a non-empty string without NUL and at most 64
+  characters. Values may be any JSON.
+- The serialized payload is capped at 64 KiB (`MAX_UI_SETTINGS_BYTES`); larger
+  input fails with `{"error": "Settings are too large"}`.
+- `set` **replaces the whole `ui` object** rather than merging per key. It
+  takes the exclusive lock and preserves every other `state.json` key
+  (`version`, `pinned`, `searches`, and any unknowns).
 
 #### `tags`
 
@@ -1181,7 +1217,7 @@ lists the installed ids.
 | Variable | Meaning |
 | --- | --- |
 | `QUILL_DATA_DIR` | Data root. Default `~/.local/share/quill`. Resolved to an absolute path. |
-| `QUILL_SOCKET` | Overrides the daemon socket path. Default `$XDG_RUNTIME_DIR/quill-<hash>.sock`, else `/tmp/quill-<hash>.sock`. |
+| `QUILL_SOCKET` | Overrides the daemon socket path. Default `$XDG_RUNTIME_DIR/quill-<hash>.sock` (hash of the data root and the store file stamp), else `/tmp/quill-<hash>.sock`. |
 | `XDG_RUNTIME_DIR` | Preferred parent for the default daemon socket. Unset falls back to `/tmp`. |
 | `QUILL_E2E` | Set to `1` to enable the live-root mutation guard. Any other value (or unset) disables the guard. |
 | `QUILL_E2E_ALLOW_REAL` | Break-glass override: exactly `1` disables the E2E guard. Quill's own tooling must **never** set this. |
@@ -1211,14 +1247,15 @@ attachment save
 attachment gc
 searches add
 searches remove
+settings set
 templates save
 templates delete
 ```
 
 `draft discard` is mutating; other draft actions (none currently) would not be.
 `attachment list`, `versions`, `unresolved`, `titles`, `searches list`,
-`templates list`, `templates show`, and all read-only commands are not
-mutating.
+`settings get`, `templates list`, `templates show`, and all read-only commands
+are not mutating.
 
 ## Storage layout and guarantees
 
@@ -1229,7 +1266,7 @@ mutating.
   templates/              one <id>.md template per note template
   attachments/            content-addressed blobs
   backups/versions/       per-note snapshot directories
-  state.json              {"version": 1, "pinned": [...], "searches": [...]}
+  state.json              {"version": 1, "pinned": [...], "searches": [...], "ui": {}}
   index.db                derived SQLite cache (FTS5), safe to delete
   index.db-wal, -shm      SQLite WAL sidecars
   .lock                   flock file
@@ -1238,8 +1275,9 @@ mutating.
 ### Markdown is authoritative
 
 `notes/` and `trash/` are the source of truth. `index.db` is a cache and may
-be deleted at any time; `index --rebuild` recreates it. `state.json` holds pins
-and saved searches; saving one never drops the other or any unknown keys.
+be deleted at any time; `index --rebuild` recreates it. `state.json` holds pins,
+saved searches, and the opaque UI settings; saving one never drops the others
+or any unknown keys.
 `templates/` is the source of truth for note templates; it is seeded once and
 never re-seeded while the directory exists. Drafts live beside their note as
 `<note>.md.draft` and are deliberately outside `*.md` scans.
@@ -1322,6 +1360,8 @@ keeps the newest `QUILL_VERSION_RETENTION` snapshots and never fails a save.
 | Attachment reference scan | 8 MiB per note |
 | Indexed note body | 512 KiB |
 | `state.json` | 1 MiB |
+| `settings set` payload (`MAX_UI_SETTINGS_BYTES`) | 64 KiB (`65536` bytes) |
+| `settings` top-level key | 64 characters |
 | `list` notes | 2000 |
 | `list` folders | 2000 |
 | `search --limit` | clamped 1..500; default 50 |
