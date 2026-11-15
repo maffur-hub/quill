@@ -645,24 +645,36 @@ def attachment_files() -> list[Path]:
     return sorted(files)
 
 
-def referenced_attachment_names() -> set[str]:
-    """Names mentioned by any note, including trashed notes.
+def referenced_attachment_names(strict: bool = False) -> set[str]:
+    """Names mentioned by any note, including trashed notes and drafts.
 
     Content is matched as text rather than parsed, because a note may use the
     angle-bracket destination form or HTML. False positives only keep files,
     which is the safe direction for `attachment gc`.
+
+    Drafts count because a crash draft is the only copy of the text that
+    references the image. With `strict`, a note that cannot be read aborts the
+    scan instead of being treated as empty: `gc` deletes files, so it must not
+    guess.
     """
     blobs: list[str] = []
     for base in (NOTES, TRASH):
         if not base.exists():
             continue
-        for path in base.rglob("*.md"):
-            try:
-                if path.is_symlink() or not path.is_file():
-                    continue
-                payload = read_note_bytes(path, MAX_REFERENCE_BYTES)
-            except OSError:
+        for path in sorted(base.rglob("*")):
+            name = path.name
+            if not (name.endswith(".md") or name.endswith(".md.draft")):
                 continue
+            if not path.is_file():
+                continue
+            try:
+                payload = read_note_bytes(path, MAX_REFERENCE_BYTES)
+            except OSError as error:
+                if not strict:
+                    continue
+                raise StoreError(
+                    f"could not read {path.relative_to(ROOT).as_posix()}; "
+                    "refusing to delete attachments it may reference") from error
             blobs.append(payload.decode("utf-8", errors="replace"))
     text = "\n".join(blobs)
     names: set[str] = set()
@@ -4493,7 +4505,7 @@ def command_attachment_gc(args) -> dict:
     freed = 0
     kept = 0
     with locked():
-        referenced = referenced_attachment_names()
+        referenced = referenced_attachment_names(strict=True)
         for path in attachment_files():
             if path.name in referenced:
                 kept += 1

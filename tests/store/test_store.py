@@ -764,6 +764,7 @@ class TestFolderContainment(StoreTestCase):
         self.assertOutsideUntouched()
         self.assertTrue((self.root / "notes" / "Linked").is_symlink())
 
+
 class TestAttachments(StoreTestCase):
     def test_save_list_and_gc(self):
         image = b"\x89PNG\r\n\x1a\n" + b"fake-png-body"
@@ -807,6 +808,34 @@ class TestAttachments(StoreTestCase):
         self.assertEqual(len(remaining), 1)
         self.assertTrue(remaining[0]["referenced"])
         self.assertEqual(self.read(identifier)["content"], f"# With image\n\n{saved['markdown']}\n")
+
+    def test_gc_keeps_an_attachment_only_a_draft_references(self):
+        image_path = Path(self._temp.name) / "only-draft.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"draft-only")
+        saved = self.success("attachment", "save", "--file", str(image_path))
+        identifier = self.create("Drafting", content="# Drafting\n\nno image yet\n")
+        note = self.note_path(identifier)
+        note.with_name(note.name + ".draft").write_text(
+            f"# Drafting\n\n{saved['markdown']}\n", encoding="utf-8")
+
+        collected = self.success("attachment", "gc")
+        self.assertEqual(collected["removed"], 0)
+        self.assertEqual(collected["kept"], 1)
+
+    def test_gc_refuses_when_a_note_cannot_be_read(self):
+        image_path = Path(self._temp.name) / "unreadable-note.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"guarded")
+        self.success("attachment", "save", "--file", str(image_path))
+        identifier = self.create("Guarded", content="# Guarded\n\nbody\n")
+        note = self.note_path(identifier)
+        note.chmod(0o000)
+        try:
+            error = self.failure("attachment", "gc")
+            self.assertIn("refusing to delete attachments", error["error"])
+        finally:
+            note.chmod(0o644)
+        self.assertEqual(len(self.success("attachment", "list")["attachments"]), 1)
+        self.assertEqual(len(list((self.root / "attachments").iterdir())), 1)
 
 
 class TestDrafts(StoreTestCase):
