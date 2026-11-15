@@ -345,6 +345,64 @@ class TestVersions(StoreTestCase):
         self.failure("restore-version", identifier, "20000101T000000Z-0000000000000000.md")
 
 
+class TestVersionRelocation(StoreTestCase):
+    """Version history is keyed by note id, so it must follow the note."""
+
+    def history(self, identifier):
+        return [snapshot["name"] for snapshot in self.success("versions", identifier)["versions"]]
+
+    def assertCarried(self, before, moved):
+        # The relocation itself snapshots the note, so the new history may have
+        # one extra entry; every older snapshot must still be there.
+        self.assertTrue(before)
+        self.assertEqual(set(before) - set(moved), set())
+
+    def test_move_carries_version_history(self):
+        identifier = self.create("Moved", content="# Moved\n\nzero\n")
+        self.success("write", identifier, "--stdin", stdin="# Moved\n\none\n")
+        before = self.history(identifier)
+        self.assertTrue(before)
+        moved = self.success("move", identifier, "--folder", "Archive")["id"]
+        self.assertNotEqual(moved, identifier)
+        self.assertCarried(before, self.history(moved))
+        self.assertEqual(self.history(identifier), [])
+
+    def test_folder_rename_carries_version_history(self):
+        identifier = self.create(
+            "Renamed", content="# Renamed\n\nzero\n", folder="Inbox")
+        self.success("write", identifier, "--stdin", stdin="# Renamed\n\none\n")
+        before = self.history(identifier)
+        self.assertTrue(before)
+        self.success("folder", "rename", "Inbox", "Archive")
+        moved = "Archive/" + Path(identifier).name
+        self.assertCarried(before, self.history(moved))
+        self.assertEqual(self.history(identifier), [])
+
+    def test_folder_delete_carries_version_history(self):
+        identifier = self.create(
+            "Flattened", content="# Flattened\n\nzero\n", folder="Deep/Nested")
+        self.success("write", identifier, "--stdin", stdin="# Flattened\n\none\n")
+        before = self.history(identifier)
+        self.assertTrue(before)
+        result = self.success("folder", "delete", "Deep", "--force")
+        self.assertEqual(result["moved"], 1)
+        flattened = Path(identifier).name
+        self.assertCarried(before, self.history(flattened))
+        self.assertEqual(self.history(identifier), [])
+
+    def test_restore_carries_version_history_when_the_name_is_taken(self):
+        identifier = self.create("Taken", content="# Taken\n\nzero\n")
+        self.success("write", identifier, "--stdin", stdin="# Taken\n\none\n")
+        before = self.history(identifier)
+        self.assertTrue(before)
+        self.success("trash", identifier)
+        # Another note now owns the old path, so the restore has to rename.
+        self.write_note_file(identifier, b"# Other\n\nfresh\n")
+        restored = self.success("restore", identifier)["id"]
+        self.assertNotEqual(restored, identifier)
+        self.assertCarried(before, self.history(restored))
+
+
 class TestSearch(StoreTestCase):
     def test_exact_prefix_and_typo_fallback(self):
         zebra = self.create("Zebra", content="# Zebra\n\nthe quick brown zebra jumps\n")

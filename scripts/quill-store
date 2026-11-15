@@ -461,6 +461,37 @@ def prune_versions(identifier: str) -> None:
         return
 
 
+def move_version_dir(old_id: str, new_id: str) -> None:
+    """Carry a note's version history to its new id after a path change.
+
+    Version directories are keyed by the note's path, so a move, restore or
+    folder rename would otherwise leave the snapshots under an id nothing can
+    reach. History is best-effort here: failing to carry it must never abort
+    the file operation that already succeeded.
+    """
+    if old_id == new_id:
+        return
+    try:
+        source = version_dir(old_id)
+        target = version_dir(new_id)
+        if source == target or not source.is_dir():
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.exists():
+            source.rename(target)
+            return
+        # Both ids already have history (for example restored under a name it
+        # used before): merge them, keeping the newer copy of each snapshot.
+        for path in version_files(source):
+            destination = target / path.name
+            if destination.exists():
+                continue
+            shutil.move(str(path), str(destination))
+        shutil.rmtree(source, ignore_errors=True)
+    except (StoreError, OSError):
+        return
+
+
 def snapshot_path(identifier: str, raw: str) -> Path:
     """Resolve a basename or absolute snapshot path inside one note's dir."""
     directory = version_dir(identifier).resolve()
@@ -2396,10 +2427,11 @@ def move_note(identifier: str, source: Path, target_dir: Path, pins: set[str]) -
     move_draft(source, target)
     prune_empty_dirs(source.parent)
     next_id = target.relative_to(NOTES).as_posix()
+    move_version_dir(identifier, next_id)
     if identifier in pins:
         pins.discard(identifier)
         pins.add(next_id)
-    prune_versions(identifier)
+    prune_versions(next_id)
     return next_id
 
 
@@ -2468,7 +2500,9 @@ def restore_note(identifier: str, source: Path) -> str:
     shutil.move(str(source), str(target))
     move_draft(source, target)
     prune_empty_dirs(source.parent)
-    return target.relative_to(NOTES).as_posix()
+    next_id = target.relative_to(NOTES).as_posix()
+    move_version_dir(identifier, next_id)
+    return next_id
 
 
 def command_restore(args) -> dict:
@@ -2684,6 +2718,12 @@ def command_folder(args) -> dict:
                 raise StoreError(f"folder already exists: {next_name}")
             target.parent.mkdir(parents=True, exist_ok=True)
             source.rename(target)
+            # Note ids carry the folder path, so their history does too.
+            for path in sorted(target.rglob("*.md")):
+                if not path.is_file():
+                    continue
+                relative = path.relative_to(target).as_posix()
+                move_version_dir(f"{folder}/{relative}", f"{next_name}/{relative}")
             pins = pinned_set()
             next_pins = set()
             for pin in pins:
@@ -2727,10 +2767,13 @@ def command_folder(args) -> dict:
                         with contextlib.suppress(OSError):
                             path.unlink()
                         continue
+                    identifier = path.relative_to(NOTES).as_posix()
                     destination = root / path.name
                     if destination.exists():
                         destination = unique_target(root, path.name, "moved")
                     shutil.move(str(path), str(destination))
+                    move_version_dir(
+                        identifier, destination.relative_to(NOTES).as_posix())
                     moved += 1
                 pins = pinned_set()
                 next_pins = set()
