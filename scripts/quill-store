@@ -292,6 +292,30 @@ def rel_folder(path: Path, base: Path) -> str:
     return "" if folder == "." else folder
 
 
+def folder_path(folder: str, create: bool = False) -> Path:
+    """Return `folder` under notes/, refusing a path that leaves through a link.
+
+    A folder that is itself a symlink (or sits below one) would otherwise make
+    create, move and delete write outside the data root, where the index never
+    looks again.
+    """
+    cleaned = clean_folder(folder)
+    base = NOTES
+    if create:
+        base.mkdir(parents=True, exist_ok=True)
+    root = base.resolve()
+    candidate = base / cleaned if cleaned else base
+    try:
+        resolved = candidate.resolve()
+    except OSError as error:
+        raise StoreError(f"could not resolve folder: {error}") from error
+    if resolved != root and root not in resolved.parents:
+        raise StoreError("folder path escapes the notes directory")
+    if create:
+        candidate.mkdir(parents=True, exist_ok=True)
+    return candidate
+
+
 def prune_empty_dirs(start: Path) -> None:
     """Remove `start` and its now-empty ancestors, never the notes root."""
     root = NOTES.resolve()
@@ -1945,8 +1969,7 @@ def command_create(args) -> dict:
     if len(encoded) > MAX_NOTE_BYTES:
         raise StoreError(f"note exceeds {MAX_NOTE_BYTES} bytes")
     with locked():
-        parent = NOTES / folder
-        parent.mkdir(parents=True, exist_ok=True)
+        parent = folder_path(folder, create=True)
         identifier = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}.md"
         path = parent / identifier
         while path.exists():
@@ -2171,8 +2194,8 @@ def command_duplicate(args) -> dict:
         if len(data) > MAX_NOTE_BYTES:
             raise StoreError(f"note exceeds {MAX_NOTE_BYTES} bytes")
         content = decode_note_utf8(data)
-        folder_path = source.parent.relative_to(NOTES)
-        folder = "" if str(folder_path) == "." else folder_path.as_posix()
+        source_folder = source.parent.relative_to(NOTES)
+        folder = "" if str(source_folder) == "." else source_folder.as_posix()
         conn = index_connect()
         try:
             sync_index(conn)
@@ -2191,8 +2214,7 @@ def command_duplicate(args) -> dict:
                 raise StoreError("note content is not valid UTF-8") from error
             if len(encoded) > MAX_NOTE_BYTES:
                 raise StoreError(f"note exceeds {MAX_NOTE_BYTES} bytes")
-            target_dir = NOTES / folder_path
-            target_dir.mkdir(parents=True, exist_ok=True)
+            target_dir = folder_path(folder, create=True)
             new_id = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}.md"
             target = target_dir / new_id
             while target.exists():
@@ -2462,8 +2484,7 @@ def command_move(args) -> dict:
     folder = clean_folder(args.folder)
     targets = batch_targets(args)
     with locked():
-        target_dir = NOTES / folder
-        target_dir.mkdir(parents=True, exist_ok=True)
+        target_dir = folder_path(folder, create=True)
         pins = pinned_set()
         pins_before = set(pins)
         new_ids = [
@@ -2720,23 +2741,25 @@ def command_folder(args) -> dict:
             folder = clean_folder(args.path)
             if not folder:
                 raise StoreError("folder name is empty")
-            target = NOTES / folder
-            if target.exists():
+            target = folder_path(folder)
+            if target.exists() or target.is_symlink():
                 raise StoreError(f"folder already exists: {folder}")
+            if target == NOTES:
+                raise StoreError("folder name is empty")
             target.mkdir(parents=True)
             result = {"folder": folder}
         elif action == "rename":
             folder = clean_folder(args.path)
             if not folder:
                 raise StoreError("cannot rename the notes root")
-            source = NOTES / folder
+            source = folder_path(folder)
             if not source.is_dir():
                 raise StoreError(f"folder not found: {folder}")
             next_name = clean_folder(args.new)
             if not next_name:
                 raise StoreError("new folder name is empty")
-            target = NOTES / next_name
-            if target.exists() and target != source:
+            target = folder_path(next_name)
+            if (target.exists() or target.is_symlink()) and target != source:
                 raise StoreError(f"folder already exists: {next_name}")
             target.parent.mkdir(parents=True, exist_ok=True)
             source.rename(target)
@@ -2760,7 +2783,7 @@ def command_folder(args) -> dict:
             folder = clean_folder(args.path)
             if not folder:
                 raise StoreError("cannot delete the notes root")
-            target = NOTES / folder
+            target = folder_path(folder)
             if not target.is_dir():
                 raise StoreError(f"folder not found: {folder}")
             files = [path for path in target.rglob("*") if path.is_file()]
@@ -4320,11 +4343,11 @@ def command_import(args) -> dict:
                 if not path.is_file():
                     continue
                 relative = path.relative_to(source_notes)
-                target = NOTES / relative
+                target_dir = folder_path(relative.parent.as_posix(), create=True)
+                target = target_dir / relative.name
                 if target.exists():
                     skipped += 1
                     continue
-                target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(path, target)
                 imported += 1
                 imported_ids.append(relative.as_posix())

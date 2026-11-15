@@ -724,6 +724,46 @@ class TestFolders(StoreTestCase):
         self.assertTrue(self.success("list")["notes"])
 
 
+
+class TestFolderContainment(StoreTestCase):
+    """A symlinked folder must not move Quill's writes outside notes/."""
+
+    def setUp(self):
+        super().setUp()
+        self.outside = Path(self._temp.name) / "outside"
+        self.outside.mkdir()
+        self.keep = self.outside / "keep.txt"
+        self.keep.write_text("do not touch", encoding="utf-8")
+        notes = self.root / "notes"
+        notes.mkdir(parents=True, exist_ok=True)
+        os.symlink(self.outside, notes / "Linked")
+        self.identifier = self.success(
+            "create", "--title", "Stay", "--content-stdin", stdin="# Stay\n"
+        )["id"]
+
+    def assertOutsideUntouched(self):
+        self.assertEqual(
+            sorted(path.name for path in self.outside.iterdir()), ["keep.txt"])
+        self.assertEqual(self.keep.read_text(encoding="utf-8"), "do not touch")
+
+    def test_create_and_move_into_a_linked_folder_are_refused(self):
+        error = self.failure("create", "--folder", "Linked", "--title", "Lost")
+        self.assertIn("escapes the notes directory", error["error"])
+        error = self.failure("move", self.identifier, "--folder", "Linked")
+        self.assertIn("escapes the notes directory", error["error"])
+        self.assertOutsideUntouched()
+        self.assertTrue(self.read(self.identifier))
+
+    def test_folder_commands_refuse_a_linked_folder(self):
+        error = self.failure("folder", "create", "Linked/Nested")
+        self.assertIn("escapes the notes directory", error["error"])
+        error = self.failure("folder", "delete", "Linked", "--force")
+        self.assertIn("escapes the notes directory", error["error"])
+        error = self.failure("folder", "rename", "Linked", "Elsewhere")
+        self.assertIn("escapes the notes directory", error["error"])
+        self.assertOutsideUntouched()
+        self.assertTrue((self.root / "notes" / "Linked").is_symlink())
+
 class TestAttachments(StoreTestCase):
     def test_save_list_and_gc(self):
         image = b"\x89PNG\r\n\x1a\n" + b"fake-png-body"
