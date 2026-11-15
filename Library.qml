@@ -2111,12 +2111,19 @@ Item {
   // A stable temp path per note: the renderer reads a copy of the buffer, so
   // it must never live inside the notes root. The id is sanitised because it
   // can contain folder separators, and only this file name is derived from it.
+  // Each library instance gets its own file name: the panel and the desktop
+  // library window can both have the same note open, and a shared path had
+  // them overwriting the file the other was about to render.
+  readonly property string previewToken: Math.random().toString(36).slice(2, 10)
+    + "-" + Date.now().toString(36)
+
   function previewTempPath() {
     var id = String(root.selectedId || "")
     var safe = id.replace(/[^A-Za-z0-9._-]/g, "-")
     if (safe === "") safe = "note"
     var dir = String(Quickshell.env("TMPDIR") || "/tmp")
-    return dir.replace(/\/+$/, "") + "/quill-preview-" + safe + ".md"
+    return dir.replace(/\/+$/, "") + "/quill-preview-" + root.previewToken
+      + "-" + safe + ".md"
   }
 
   // Forget which buffer text the pane shows and orphan any render already in
@@ -2288,6 +2295,12 @@ Item {
         if (seq !== root.previewSeq || requestedId !== root.selectedId) return
         root.previewMarkdown = String(result.markdown || "")
         root.previewLineOffset = Number(result.lineOffset || 0)
+        // Record what this copy shows, so a later request for the same saved
+        // text (a save that changed nothing else, a refresh) skips the fetch
+        // instead of re-rendering the same bytes. Both paths resolve links the
+        // same way, so the result would be identical.
+        root.previewRenderedId = requestedId
+        root.previewRenderedText = String(root.savedTextById[requestedId] || "")
         root.previewLoading = false
       },
       onError: function(message) {
