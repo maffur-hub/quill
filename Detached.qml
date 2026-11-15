@@ -7,6 +7,8 @@ import qs.Commons as Commons
 import qs.Ui
 import "ImageSizing.js" as ImageSizing
 import "MarkdownFormat.js" as MarkdownFormat
+import "NoteLinks.js" as NoteLinks
+import "PopupAnchor.js" as PopupAnchor
 import "WheelScroll.js" as WheelScroll
 import "WritableGuard.js" as WritableGuard
 
@@ -41,6 +43,10 @@ ShellRoot {
   property bool loading: true
   property bool loaded: false
   property bool tooLarge: false
+  // The note file disappeared from notes/ (trashed or deleted elsewhere). The
+  // buffer is kept for reference but editing stops, so a save cannot recreate
+  // a file the index no longer knows about.
+  property bool noteMissing: false
   property bool dirty: false
   property bool saving: false
   property bool suppressDirty: false
@@ -89,6 +95,64 @@ ShellRoot {
     return value
   }
 
+  // quill-window lives next to the store script, so a redirected install still
+  // launches the matching window.
+  readonly property string windowPath: {
+    var path = String(root.storePath || "")
+    var slash = path.lastIndexOf("/")
+    return (slash > 0 ? path.slice(0, slash + 1) : "") + "quill-window"
+  }
+
+  // A detached window owns one note, so a link to another note opens it in a
+  // second window rather than discarding this note's unsaved edits.
+  function openLinkedNote(id) {
+    var target = String(id || "").trim()
+    if (target === "") return
+    if (target === root.noteId) {
+      root.statusText = "This note"
+      return
+    }
+    Quickshell.execDetached([root.windowPath, target, "Note", root.dataRoot])
+    root.statusText = "Opened in a new window"
+  }
+
+  // quill:// links and Markdown links to a note file stay inside Quill;
+  // everything else goes to the OS opener. See NoteLinks.js.
+  function openLink(link) {
+    var target = NoteLinks.classify(link, root.noteId, root.dataRoot)
+    if (target.kind === "note") {
+      root.openLinkedNote(target.value)
+      return
+    }
+    if (target.kind === "missing") {
+      root.statusText = "No note matches “" + target.value + "”"
+      return
+    }
+    if (target.kind === "tag") {
+      root.statusText = "Tag “#" + target.value + "” — open the library to browse it"
+      return
+    }
+    if (target.kind !== "external") return
+    var url = root.externalLinkUrl(target.value)
+    if (url !== "") Qt.openUrlExternally(url)
+  }
+
+  // The watched file is gone: edited or deleted elsewhere, or moved to Trash
+  // by the library. Keep the text on screen, stop the watcher and the saves.
+  function markMissing() {
+    if (root.noteId === "" || root.noteMissing) return
+    root.noteMissing = true
+    root.loaded = false
+    root.saving = false
+    root.dirty = false
+    root.diskChangePending = false
+    root.diskChangeText = ""
+    root.draftPending = false
+    root.statusText = "This note is no longer in notes/ — it may have been trashed"
+    saveTimer.stop()
+    draftTimer.stop()
+  }
+
   function loadNote() {
     if (!noteId) {
       tooLarge = true
@@ -108,9 +172,18 @@ ShellRoot {
   function applyLoaded(exitCode, outputText, errorText) {
     loading = false
     if (exitCode !== 0) {
+      var message = String(errorText || "").trim()
+      if (/note not found/i.test(message)) {
+        // Trashed (or deleted) before this window read it. Nothing to edit.
+        root.noteMissing = true
+        root.loaded = false
+        root.dirty = false
+        root.statusText = "This note is no longer in notes/ — it may have been trashed"
+        return
+      }
       tooLarge = true
       loaded = false
-      statusText = String(errorText || "").trim() || "Could not read this note"
+      statusText = message || "Could not read this note"
       return
     }
     var result = {}
@@ -122,6 +195,7 @@ ShellRoot {
       return
     }
     suppressDirty = true
+    root.noteMissing = false
     tooLarge = !!result.tooLarge
     editor.text = tooLarge ? "" : String(result.content || "")
     editor.resetFormatHistory()
@@ -522,6 +596,10 @@ ShellRoot {
     printErrors: false
     onFileChanged: reload()
     onLoaded: root.handleExternalContent(String(text()))
+    onLoadFailed: function(error) {
+      // The file vanished between the watch event and the read.
+      if (root.loaded) root.markMissing()
+    }
   }
 
   Component {
@@ -683,6 +761,9 @@ ShellRoot {
               // A dirty buffer is saved first; restore is only enabled once the
               // write lands, and the dialog explains the wait.
               if (root.dirty && root.writesAllowed) root.save()
+              // Qt drops a popup's parent on close, so re-attach it to the
+              // overlay or the second open paints nothing.
+              PopupAnchor.anchor(versionHistory, Overlay.overlay)
               versionHistory.openFor(root.noteId, root.noteTitle)
             }
           }
@@ -777,7 +858,7 @@ ShellRoot {
               width: editorScroll.width
               height: Math.max(editorScroll.height, implicitHeight)
               storePath: root.storePath
-              enabled: root.loaded && !root.tooLarge && !root.draftPending
+              enabled: root.loaded && !root.tooLarge && !root.draftPending && !root.noteMissing
               selectByMouse: true
               wrapMode: TextEdit.Wrap
               onCursorRectangleChanged: editorScroll.ensureVisible(cursorRectangle)
@@ -791,9 +872,11 @@ ShellRoot {
               bottomPadding: Style.space(24)
               placeholderText: root.loading
                 ? "Loading note…"
-                : root.tooLarge
-                  ? "This note is too large to edit safely in Quill."
-                  : "Start writing Markdown…"
+                : root.noteMissing
+                  ? "This note is no longer in notes/."
+                  : root.tooLarge
+                    ? "This note is too large to edit safely in Quill."
+                    : "Start writing Markdown…"
               placeholderTextColor: Util.alpha(Commons.Color.foreground, 0.28)
               onTextChanged: root.markDirty()
               onLinkRequested: formatBar.openLinkPopover()
@@ -825,10 +908,7 @@ ShellRoot {
             editable: root.loaded && !root.tooLarge && !root.draftPending
             tableEditing: false
             lineOffset: root.previewLineOffset
-            onLinkActivated: function(link) {
-              var target = root.externalLinkUrl(link)
-              if (target !== "") Qt.openUrlExternally(target)
-            }
+            onLinkActivated: function(link) { root.openLink(link) }
             onImageResized: function(line, width) { root.setImageWidth(line, width) }
             onImageReset: function(line) { root.clearImageSize(line) }
             onTaskToggled: function(line) { root.toggleTaskAt(line) }
