@@ -167,6 +167,22 @@ class DaemonTestCase(unittest.TestCase):
         self.assertTrue(still_alive["ok"], still_alive)
         self.assertEqual(still_alive["id"], 4)
 
+    def test_an_error_reply_carries_the_cli_error_code(self):
+        """A machine-readable reason must survive the daemon, not just the CLI.
+
+        The UI decides whether to offer the "changed on disk" banner from
+        `code`, so unwrapping the JSON error down to its message is not enough.
+        """
+        self.start_server()
+        note_id = self.success("create", "--title", "Guarded")["id"]
+        self.success("write", note_id, "--stdin", stdin="# Guarded\n\nfirst\n")
+        reply = self.command(
+            "write", note_id, "--stdin", "--if-mtime", "1",
+            stdin="# Guarded\n\nsecond\n")
+        self.assertFalse(reply["ok"], reply)
+        self.assertEqual(reply.get("code"), "stale", reply)
+        self.assertIn("changed on disk", reply["error"])
+
     def test_ping_reports_temp_root_and_shutdown_stops_the_process(self):
         self.start_server()
         self.assertIsNotNone(self.process)

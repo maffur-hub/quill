@@ -418,6 +418,9 @@ Item {
       if (job.onSuccess) job.onSuccess(payload.result || {})
     } else {
       var message = root.parseError(payload.error)
+      // The daemon forwards the CLI's `code` beside the message; parseError
+      // only sees the text, so restore it here.
+      if (payload.code) root.lastErrorCode = String(payload.code)
       if (!job.silent) root.statusText = message
       if (job.onError) job.onError(message)
     }

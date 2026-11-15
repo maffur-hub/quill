@@ -5065,6 +5065,11 @@ def serve(socket_path: Path, watch: bool = True, idle: float = 0.0) -> None:
             message = parsed["error"]
         reply["ok"] = False
         reply["error"] = message
+        if isinstance(parsed, dict) and isinstance(parsed.get("code"), str):
+            # The CLI keeps a machine-readable reason in `code`; carry it over
+            # the wire too, or the UI can only treat a stale save as a generic
+            # failure and never offers the conflict banner.
+            reply["code"] = parsed["code"]
         return reply
 
     def client_thread(client: _Client) -> None:
