@@ -1486,6 +1486,7 @@ Item {
       id: saveView
       property string targetNoteId: ""
       property int targetVersion: 0
+      property int targetGeneration: 0
       property string targetText: ""
       atomicWrites: true
       blockAllReads: true
@@ -1593,6 +1594,7 @@ Item {
     inFlightSaveText = text
     view.targetNoteId = selectedId
     view.targetVersion = editVersion
+    view.targetGeneration = generation
     view.targetText = text
     saveState = "Saving…"
     view.setText(text)
@@ -1601,6 +1603,9 @@ Item {
   function bufferSaved(view) {
     var noteId = view.targetNoteId
     var version = view.targetVersion
+    // Captured when the save started: afterWrite compares it with the current
+    // writeGeneration to spot a save that a reload superseded.
+    var generation = view.targetGeneration
     var contentPath = view.path
     var savedText = String(view.targetText || "")
     view.destroy()
