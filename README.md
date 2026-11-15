@@ -1254,6 +1254,33 @@ It copies `~/.local/share/omanano/notes/**/*.md` into `notes/`, keeps the
 original filenames and mtimes, carries over pinned ids that exist, and never
 overwrites an existing note. OmaNano's files are never moved or modified.
 
+## Performance
+
+`scripts/bench` builds a disposable library (temp `QUILL_DATA_DIR`, never the
+live one) and reports the median of three runs:
+
+```
+./scripts/bench --notes 2000 --runs 3
+```
+
+Measured on an AMD Ryzen 7 desktop, 2,000 notes / 7.8 MiB of Markdown:
+
+| operation | median |
+| --- | --- |
+| index rebuild | 4.0 s |
+| list | 244 ms |
+| search (FTS5, bm25) | 213 ms |
+| tags | 191 ms |
+| write one note | 142 ms |
+| read one note | 139 ms |
+| index size | 11.9 MB |
+
+A 16-note library answers list/search/tags in about 140 ms. Those figures
+include one process start per command, which is what a detached CLI caller
+pays; the library's editor and the detached window keep a `quill-store
+__serve` bridge open instead, so their calls skip it — add `--daemon` to the
+benchmark to time the same commands over one persistent connection.
+
 ## Known limits
 
 - Only the note currently open in the library or a detached window is watched.
@@ -1272,9 +1299,10 @@ overwrites an existing note. OmaNano's files are never moved or modified.
 - Crash drafts follow the note's path on move, trash, restore, folder rename
   and folder delete. Two drafts for the same note (a crash and a manual copy)
   are never merged: the destination file wins.
-- The library and a detached window can both edit the same note. Draft files
-  are last-writer-wins; close one window before switching to the other if both
-  have the note dirty.
+- The library and a detached window can both edit the same note: each save
+  names the version its buffer was based on, and a window working from older
+  text gets the usual reload-or-keep banner instead of overwriting. Crash
+  drafts are still last-writer-wins.
 - Markdown rendering is split between Qt's GitHub-dialect
   `Text.MarkdownText` and Quill's RichText converter. Footnotes, definition
   lists and fenced code have their own blocks; raw HTML is a sanitised
