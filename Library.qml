@@ -92,6 +92,11 @@ Item {
   // an external reload). A save that started before the bump still lands on
   // disk, so its result must not be adopted as the buffer's saved state.
   property int writeGeneration: 0
+  // Code from the last failed job ("stale" when another window saved first).
+  property string lastErrorCode: ""
+  // One-shot: the next save skips the compare-and-swap guard. Set when the
+  // user picks Keep mine, whose whole point is to overwrite the disk copy.
+  property bool ignoreStaleWrite: false
   property double loadedModified: 0
   property string saveState: "Ready"
   property string statusText: "Ready"
@@ -456,10 +461,14 @@ Item {
 
   function parseError(raw) {
     var text = String(raw || "").trim()
+    root.lastErrorCode = ""
     if (!text) return "Quill backend failed"
     try {
       var payload = JSON.parse(text)
-      if (payload && payload.error) return String(payload.error)
+      if (payload && payload.error) {
+        root.lastErrorCode = String(payload.code || "")
+        return String(payload.error)
+      }
     } catch (error) { /* plain text error */ }
     return text
   }
@@ -1487,6 +1496,7 @@ Item {
       property string targetNoteId: ""
       property int targetVersion: 0
       property int targetGeneration: 0
+      property int targetGuard: 0
       property string targetText: ""
       atomicWrites: true
       blockAllReads: true
@@ -1582,6 +1592,16 @@ Item {
       }
       if (!dirty) return
     }
+    // Compare-and-swap: name the version this buffer was based on so the store
+    // can refuse the write if another window saved in the meantime. Skipped
+    // while a save of ours is still in flight, because its mtime is not known
+    // yet and the queue runs them in order anyway.
+    var expectedMtime = 0
+    if (!root.ignoreStaleWrite && root.inFlightSaveText === ""
+        && root.loadedModified > 0) {
+      expectedMtime = Math.round(root.loadedModified)
+    }
+    root.ignoreStaleWrite = false
     saveSeq += 1
     var path = dataRoot + "/.quill-save-" + saveSeq + "-" + Date.now() + ".md"
     var view = saveFileComponent.createObject(root, { path: path })
@@ -1595,6 +1615,7 @@ Item {
     view.targetNoteId = selectedId
     view.targetVersion = editVersion
     view.targetGeneration = generation
+    view.targetGuard = expectedMtime
     view.targetText = text
     saveState = "Saving…"
     view.setText(text)
@@ -1606,17 +1627,32 @@ Item {
     // Captured when the save started: afterWrite compares it with the current
     // writeGeneration to spot a save that a reload superseded.
     var generation = view.targetGeneration
+    var guard = view.targetGuard
     var contentPath = view.path
     var savedText = String(view.targetText || "")
     view.destroy()
+    var writeArgs = ["write", noteId, "--content-file", contentPath]
+    if (guard > 0) writeArgs.push("--if-mtime", String(guard))
     enqueue({
-      args: ["write", noteId, "--content-file", contentPath],
+      args: writeArgs,
       silent: true,
       noteId: noteId,
       version: version,
       onSuccess: function(result) { root.afterWrite(noteId, version, result, savedText, generation) },
       onError: function(message) {
         if (root.inFlightSaveText === savedText) root.inFlightSaveText = ""
+        if (root.lastErrorCode === "stale" && noteId === root.selectedId) {
+          // Another window saved first. Offer the same reload-or-keep choice a
+          // watcher conflict offers, and leave the buffer dirty.
+          root.diskChangePending = true
+          root.diskChangeText = ""
+          root.dismissedDiskText = ""
+          root.saveState = "Conflict"
+          root.dirty = true
+          root.statusText = "Note changed on disk — choose Reload or Keep mine"
+          root.pendingEditorOpen = false
+          return
+        }
         root.pendingEditorOpen = false
         if (root.pendingNoteAction
             && String(root.pendingNoteAction.id) === String(noteId)) {
@@ -2100,6 +2136,9 @@ Item {
     // conflict. A failed save clears it again (see the save error paths).
     if (id !== "") root.dismissedDiskText = diskText
     root.statusText = "Keeping your version"
+    // The disk copy lost: write ours over it without the guard that would
+    // refuse for exactly the same reason.
+    root.ignoreStaleWrite = true
     if (root.dirty) saveTimer.restart()
   }
 

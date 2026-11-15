@@ -281,6 +281,44 @@ class TestEncodingIntegrity(StoreTestCase):
         self.assertEqual(self.note_path(identifier).read_bytes(), raw)
 
 
+
+class TestCompareAndSwap(StoreTestCase):
+    """write --if-mtime: a second window must not clobber a newer save."""
+
+    def test_matching_mtime_writes_and_reports_the_new_one(self):
+        identifier = self.create("Shared", content="# Shared\n\none\n")
+        modified = self.read(identifier)["modified"]
+        written = self.success(
+            "write", identifier, "--stdin", "--if-mtime", str(modified),
+            stdin="# Shared\n\ntwo\n")
+        self.assertEqual(self.read(identifier)["content"], "# Shared\n\ntwo\n")
+        self.assertGreaterEqual(written["modified"], modified)
+
+    def test_a_stale_mtime_is_refused_and_the_file_is_untouched(self):
+        identifier = self.create("Shared", content="# Shared\n\none\n")
+        stale = self.read(identifier)["modified"]
+        self.success("write", identifier, "--stdin", stdin="# Shared\n\nnewer\n")
+        error = self.failure(
+            "write", identifier, "--stdin", "--if-mtime", str(stale),
+            stdin="# Shared\n\nolder window\n")
+        self.assertEqual(error["code"], "stale")
+        self.assertIn("changed on disk", error["error"])
+        self.assertEqual(self.read(identifier)["content"], "# Shared\n\nnewer\n")
+
+    def test_without_the_flag_a_write_still_overwrites(self):
+        identifier = self.create("Plain", content="# Plain\n\none\n")
+        self.success("write", identifier, "--stdin", stdin="# Plain\n\ntwo\n")
+        self.assertEqual(self.read(identifier)["content"], "# Plain\n\ntwo\n")
+
+    def test_a_deleted_note_is_reported_as_missing(self):
+        identifier = self.create("Gone", content="# Gone\n\n")
+        modified = self.read(identifier)["modified"]
+        self.note_path(identifier).unlink()
+        error = self.failure(
+            "write", identifier, "--stdin", "--if-mtime", str(modified),
+            stdin="# Gone\n\nback\n")
+        self.assertIn("not found", error["error"])
+
 class TestTrash(StoreTestCase):
     def test_trash_restore_delete_and_empty(self):
         first = self.create("First", content="# First\n\nzebra\n")

@@ -66,6 +66,11 @@ ShellRoot {
   // Last content known to be on disk, used to recognise our own saves and
   // stale change notifications.
   property string savedText: ""
+  // Disk mtime of the buffer, handed to `write --if-mtime` so this window
+  // cannot overwrite a newer save from the library or another window.
+  property double loadedModified: 0
+  // One-shot: the next save skips that guard (Keep mine).
+  property bool ignoreStaleWrite: false
   readonly property string watchPath: (root.loaded && !root.tooLarge && root.noteId !== "")
     ? root.dataRoot + "/notes/" + root.noteId : ""
 
@@ -204,6 +209,7 @@ ShellRoot {
     loaded = !tooLarge
     dirty = false
     savedText = tooLarge ? "" : String(result.content || "")
+    loadedModified = Number(result.modified || 0)
     diskChangePending = false
     diskChangeText = ""
     pendingEditorOpen = false
@@ -393,6 +399,9 @@ ShellRoot {
     root.diskChangePending = false
     root.diskChangeText = ""
     root.statusText = "Keeping your version"
+    // The disk copy lost: write ours over it without the guard that would
+    // refuse for the same reason.
+    root.ignoreStaleWrite = true
     if (root.dirty) saveTimer.restart()
   }
 
@@ -431,7 +440,12 @@ ShellRoot {
     var contentPath = view.path
     var savedText = view.targetText
     view.destroy()
-    writeProcess.command = [storePath, "write", noteId, "--content-file", contentPath]
+    var args = [storePath, "write", noteId, "--content-file", contentPath]
+    if (!root.ignoreStaleWrite && root.loadedModified > 0) {
+      args.push("--if-mtime", String(Math.round(root.loadedModified)))
+    }
+    root.ignoreStaleWrite = false
+    writeProcess.command = args
     writeProcess.savedText = savedText
     writeProcess.running = true
   }
@@ -450,13 +464,34 @@ ShellRoot {
     saving = false
     if (inFlightSaveText === writeProcess.savedText) inFlightSaveText = ""
     if (exitCode !== 0) {
+      var message = String(errorText || "").trim() || "Save failed"
+      var code = ""
+      try {
+        var failure = JSON.parse(message)
+        if (failure && failure.error) {
+          code = String(failure.code || "")
+          message = String(failure.error)
+        }
+      } catch (parseError) { /* plain text */ }
       dirty = true
       pendingEditorOpen = false
-      statusText = String(errorText || "").trim() || "Save failed"
       quitAfterSave = false
+      if (code === "stale") {
+        // Another window saved first. Do not retry on the timer: ask, exactly
+        // as a watcher conflict does.
+        diskChangePending = true
+        diskChangeText = ""
+        statusText = "Note changed on disk — choose Reload or Keep mine"
+        return
+      }
+      statusText = message
       saveTimer.restart()
       return
     }
+    try {
+      var saved = JSON.parse(String(writeOut.text || "{}"))
+      if (saved && saved.modified) loadedModified = Number(saved.modified)
+    } catch (parseError) { /* the note is on disk; the mtime is just unknown */ }
     savedOnce = true
     savedText = String(writeProcess.savedText)
     notifyJoplinSync()
@@ -617,7 +652,7 @@ ShellRoot {
   Process {
     id: writeProcess
     property string savedText: ""
-    stdout: StdioCollector { waitForEnd: true }
+    stdout: StdioCollector { id: writeOut; waitForEnd: true }
     stderr: StdioCollector { id: writeError; waitForEnd: true }
     onExited: function(exitCode) {
       root.afterWrite(exitCode, String(writeError.text || ""))

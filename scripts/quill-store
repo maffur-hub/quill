@@ -180,6 +180,25 @@ class StoreError(Exception):
     pass
 
 
+class StaleWriteError(StoreError):
+    """The note changed on disk after the caller read it.
+
+    Carries a machine-readable code so the UI can offer its normal
+    reload-or-keep banner instead of a plain save failure.
+    """
+
+    code = "stale"
+
+
+def error_json(error) -> str:
+    """One JSON error object, plus a code when the error class defines one."""
+    payload = {"error": str(error)}
+    code = getattr(error, "code", "")
+    if isinstance(code, str) and code:
+        payload["code"] = code
+    return json.dumps(payload, ensure_ascii=False) + "\n"
+
+
 def read_stdin(limit: int) -> bytes:
     """Read at most `limit + 1` bytes from stdin or a served request payload."""
     if SERVE_STDIN is not None:
@@ -1889,7 +1908,18 @@ def write_note(args, content_path: Path | None) -> dict:
     except UnicodeDecodeError as error:
         raise StoreError("note content is not valid UTF-8") from error
     draft_deleted = False
+    expected_mtime = getattr(args, "if_mtime", None)
     with locked():
+        if expected_mtime is not None and path.is_file():
+            # Compare-and-swap: a second window that still holds older text
+            # must not overwrite a newer save from the first one.
+            try:
+                current_mtime = int(path.stat().st_mtime * 1000)
+            except OSError as error:
+                raise StoreError(f"could not stat the note: {error}") from error
+            if current_mtime != int(expected_mtime):
+                raise StaleWriteError(
+                    "note changed on disk since it was opened; reload before saving")
         newline = "\n"
         if path.is_file():
             try:
@@ -5168,23 +5198,19 @@ def run_command(
             result = args.func(args)
             return 0, json.dumps(result, ensure_ascii=False) + "\n", ""
         except StoreError as error:
-            return 1, "", json.dumps({"error": str(error)}, ensure_ascii=False) + "\n"
+            return 1, "", error_json(error)
         except FileNotFoundError as error:
-            return 1, "", json.dumps({"error": str(error)}, ensure_ascii=False) + "\n"
+            return 1, "", error_json(error)
         except PermissionError as error:
-            return 1, "", json.dumps({"error": str(error)}, ensure_ascii=False) + "\n"
+            return 1, "", error_json(error)
         except sqlite3.Error as error:
-            return 1, "", json.dumps(
-                {"error": f"index error: {error}"}, ensure_ascii=False
-            ) + "\n"
+            return 1, "", error_json(f"index error: {error}")
         except ValueError as error:
-            return 1, "", json.dumps({"error": str(error)}, ensure_ascii=False) + "\n"
+            return 1, "", error_json(error)
         except OSError as error:
-            return 1, "", json.dumps({"error": str(error)}, ensure_ascii=False) + "\n"
+            return 1, "", error_json(error)
         except Exception as error:  # keep the shell contract: JSON on stderr
-            return 1, "", json.dumps(
-                {"error": f"{type(error).__name__}: {error}"}, ensure_ascii=False
-            ) + "\n"
+            return 1, "", error_json(f"{type(error).__name__}: {error}")
         finally:
             SERVE_STDIN = previous
 
@@ -5316,6 +5342,8 @@ def build_parser() -> argparse.ArgumentParser:
     write.add_argument("--content-file", help="read the new body from a file (UI convenience)")
     write.add_argument("--create", action="store_true",
                        help="create the note at this exact id when it is missing")
+    write.add_argument("--if-mtime", dest="if_mtime", type=int, default=None,
+                       help="refuse the write unless the note still has this mtime (ms)")
     write.set_defaults(func=command_write)
 
     draft = sub.add_parser("draft")
