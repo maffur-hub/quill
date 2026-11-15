@@ -423,6 +423,34 @@ esac
         self.assertEqual(self.lp_calls(), [])
         self.assertEqual(self.renderer_calls(), [])
 
+    def test_dry_run_equals_true_is_still_a_dry_run(self):
+        result = self.success("--input", self.note_path, "--dry-run=true")
+        self.assertTrue(result["dryRun"])
+        self.assertEqual(self.lp_calls(), [])
+        self.assertEqual(self.renderer_calls(), [])
+
+    def test_render_only_equals_true_never_submits(self):
+        result = self.success(
+            "--input", self.note_path, "--renderer", str(self.renderer),
+            "--render-only=true",
+        )
+        try:
+            self.assertEqual(result["job"], "")
+            self.assertTrue(Path(result["pdf"]).read_bytes().startswith(b"%PDF-"))
+        finally:
+            shutil.rmtree(Path(result["pdf"]).parent, ignore_errors=True)
+        self.assertEqual(self.lp_calls(), [])
+
+    def test_dry_run_equals_false_is_not_dry(self):
+        result = self.success("--input", self.note_path, "--dry-run=false")
+        self.assertFalse(result.get("dryRun", False))
+        self.assertEqual(len(self.lp_calls()), 1)
+
+    def test_a_malformed_boolean_fails_before_submitting(self):
+        stderr = self.failure("--input", self.note_path, "--dry-run=maybe")
+        self.assertIn("expects true or false", stderr)
+        self.assertEqual(self.lp_calls(), [])
+
     def test_render_only_keeps_the_pdf_and_never_submits(self):
         result = self.success(
             "--input", self.note_path, "--title", "Preview",

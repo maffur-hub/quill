@@ -98,6 +98,9 @@ function parseArguments(argv) {
     if (equals >= 0) {
       value = key.slice(equals + 1)
       key = key.slice(0, equals)
+      // `--dry-run=true` used to arrive as the string "true", which is never
+      // `=== true`, so the flag was silently ignored and a real job was sent.
+      if (BOOLEAN_FLAGS.includes(key)) value = parseBooleanFlag(key, value)
     } else if (BOOLEAN_FLAGS.includes(key)) {
       value = true
     } else {
@@ -116,6 +119,16 @@ function parseArguments(argv) {
     }
   }
   return values
+}
+
+const TRUE_WORDS = ["true", "1", "yes", "on"]
+const FALSE_WORDS = ["false", "0", "no", "off"]
+
+function parseBooleanFlag(key, value) {
+  const word = String(value).trim().toLowerCase()
+  if (TRUE_WORDS.includes(word)) return true
+  if (FALSE_WORDS.includes(word)) return false
+  fail("--" + key + " expects true or false")
 }
 
 function stringOption(value) {
