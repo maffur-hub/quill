@@ -406,10 +406,43 @@ TextArea {
       .replace(/\"/g, "&quot;")
   }
 
-  function preserveIndent(value) {
-    var match = String(value || "").match(/^[ \t]+/)
-    if (!match) return value
-    return match[0].replace(/\t/g, "    ").replace(/ /g, "&nbsp;") + value.slice(match[0].length)
+  // Qt's rich text collapses runs of spaces and draws a tab as one space, so
+  // the mirror came out narrower than the TextArea on any line with aligned
+  // text or tab-indented code, and the caret drifted by the difference.
+  // Protect every run of spaces outside markup; the last space of an internal
+  // run stays ordinary so long lines still wrap where the TextArea wraps.
+  function preserveSpaces(value) {
+    var text = String(value === undefined || value === null ? "" : value)
+    var output = ""
+    var index = 0
+    // Whitespace before any visible character is indentation, which Qt trims
+    // outright, so every space of that run has to be protected.
+    var visible = false
+    while (index < text.length) {
+      var char = text.charAt(index)
+      if (char === "<") {
+        var close = text.indexOf(">", index)
+        if (close < 0) {
+          output += text.slice(index)
+          break
+        }
+        output += text.slice(index, close + 1)
+        index = close + 1
+        continue
+      }
+      if (char !== " " && char !== "\t") {
+        output += char
+        visible = true
+        index += 1
+        continue
+      }
+      var start = index
+      while (index < text.length && (text.charAt(index) === " " || text.charAt(index) === "\t")) index += 1
+      var run = text.slice(start, index).replace(/\t/g, "    ")
+      var keep = visible ? run.length - 1 : run.length
+      output += run.slice(0, keep).replace(/ /g, "&nbsp;") + run.slice(keep)
+    }
+    return output
   }
 
   // Accept both the rgb() form Joplin stores and older Quill hex spans;
@@ -668,7 +701,7 @@ TextArea {
       cursor = index + token.length
     }
     output += escapeHtml(source.slice(cursor))
-    return preserveIndent(restoreInlineHtml(output, replacements))
+    return preserveSpaces(restoreInlineHtml(output, replacements))
   }
 
   function highlightedMarkdown(value) {
@@ -683,21 +716,21 @@ TextArea {
       var line = lines[i]
       var fence = line.match(/^(\s*)(```|~~~)/)
       if (fence) {
-        output.push(preserveIndent(escapeHtml(fence[1]))
+        output.push(preserveSpaces(escapeHtml(fence[1]))
           + "<span style=\"color:" + accent + ";\">" + escapeHtml(line.slice(fence[1].length)) + "</span>")
         inCode = !inCode
         continue
       }
       if (inCode) {
-        output.push("<span style=\"color:" + muted + ";\">" + preserveIndent(escapeHtml(line)) + "</span>")
+        output.push("<span style=\"color:" + muted + ";\">" + preserveSpaces(escapeHtml(line)) + "</span>")
         continue
       }
 
       var heading = line.match(/^(\s{0,3})(#{1,6})(\s+)(.*)$/)
       if (heading) {
-        output.push(preserveIndent(escapeHtml(heading[1]))
+        output.push(preserveSpaces(escapeHtml(heading[1]))
           + "<span style=\"color:" + accent + ";\">" + escapeHtml(heading[2]) + "</span>"
-          + escapeHtml(heading[3])
+          + preserveSpaces(escapeHtml(heading[3]))
           + "<span style=\"color:" + foreground + "; font-weight:600;\">" + inlineHtml(heading[4]) + "</span>")
         continue
       }
@@ -705,9 +738,9 @@ TextArea {
       var task = line.match(/^(\s*[-*+]\s+)(\[[ xX]\])(\s*)/)
       if (task) {
         var taskLength = task[1].length + task[2].length + task[3].length
-        output.push(preserveIndent(escapeHtml(task[1]))
+        output.push(preserveSpaces(escapeHtml(task[1]))
           + "<span style=\"color:" + accent + "; font-weight:600;\">" + escapeHtml(task[2]) + "</span>"
-          + escapeHtml(task[3]) + inlineHtml(line.slice(taskLength)))
+          + preserveSpaces(escapeHtml(task[3])) + inlineHtml(line.slice(taskLength)))
         continue
       }
 
@@ -721,9 +754,9 @@ TextArea {
       var marker = line.match(/^(\s*)([-*+]|\d+[.)])(\s+)/)
       if (marker) {
         var markerLength = marker[1].length + marker[2].length + marker[3].length
-        output.push(preserveIndent(escapeHtml(marker[1]))
+        output.push(preserveSpaces(escapeHtml(marker[1]))
           + "<span style=\"color:" + accent + ";\">" + escapeHtml(marker[2]) + "</span>"
-          + escapeHtml(marker[3]) + inlineHtml(line.slice(markerLength)))
+          + preserveSpaces(escapeHtml(marker[3])) + inlineHtml(line.slice(markerLength)))
         continue
       }
 
