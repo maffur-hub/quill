@@ -220,6 +220,9 @@ Popup {
     if (next < 0) next = 0
     if (next > root.templateEntries.length - 1) next = root.templateEntries.length - 1
     root.selectTemplate(next)
+    // Keyboard steps do not move the view on their own, so the highlight
+    // could walk off the bottom of a long list without a visible selection.
+    templateList.positionViewAtIndex(next, ListView.Contain)
   }
 
   function startNew() {
@@ -315,6 +318,14 @@ Popup {
       root.errorText = root.isNew
         ? "Enter a slug for the new template" : "Select a template to save"
       if (root.isNew) idField.forceActiveFocus()
+      return
+    }
+    if (root.isNew && root.indexOfId(id) >= 0) {
+      // The store upserts by slug, so a "new" template that reuses one would
+      // replace it without a word.
+      root.errorText = "A template already uses the slug “" + id
+        + "”; select it in the list to edit it"
+      idField.forceActiveFocus()
       return
     }
 
