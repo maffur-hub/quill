@@ -133,6 +133,22 @@ test('link at a caret inserts a Link placeholder', () => {
   assert.equal(result.text, '[Link](https://example.test)')
 })
 
+test('a link destination with balanced parentheses is edited whole', () => {
+  const text = 'see [Foo](https://en.wikipedia.org/wiki/Foo_(bar)) now'
+  const caret = text.indexOf('Foo')
+  assert.equal(load('MarkdownFormat.js').currentLinkURL(text, caret, caret),
+    'https://en.wikipedia.org/wiki/Foo_(bar)')
+  const result = plan(text, caret, caret + 3, 'link', 'https://x.test/Foo_(baz)')
+  assert.equal(result.ok, true)
+  assert.equal(result.text, 'see [Foo](https://x.test/Foo_(baz)) now')
+})
+
+test('a second link is not confused with the first', () => {
+  const text = '[one](a) and [two](b_(c))'
+  const caret = text.indexOf('two')
+  assert.equal(load('MarkdownFormat.js').currentLinkURL(text, caret, caret), 'b_(c)')
+})
+
 test('an empty link URL is rejected', () => {
   const result = plan('hello', 0, 5, 'link', '')
   assert.equal(result.ok, false)

@@ -1080,16 +1080,45 @@ function escapeLabel(value) {
   return textOf(value).replace(/\\/g, "\\\\").replace(/\[/g, "\\[").replace(/\]/g, "\\]")
 }
 
+// Find the link that owns a caret or selection. The destination may contain
+// balanced parentheses (valid Markdown, common in wiki URLs), so it is scanned
+// with a depth counter rather than stopping at the first `)`.
 function linkAt(text, start, end) {
-  var pattern = /\[([^\]]*)\]\(([^)\n]*)\)/g
-  var match
-  while ((match = pattern.exec(text)) !== null) {
-    var open = match.index
-    var labelStart = open + 1
-    var labelEnd = open + 1 + match[1].length
+  var source = String(text || "")
+  var index = 0
+  while (index < source.length) {
+    var open = source.indexOf("[", index)
+    if (open < 0) return null
+    index = open + 1
+    if (open > 0 && source.charAt(open - 1) === "\\") continue
+    var labelEnd = open + 1
+    var closedLabel = false
+    while (labelEnd < source.length) {
+      var labelChar = source.charAt(labelEnd)
+      if (labelChar === "\\") { labelEnd += 2; continue }
+      if (labelChar === "\n") break
+      if (labelChar === "]") { closedLabel = true; break }
+      labelEnd += 1
+    }
+    if (!closedLabel || source.charAt(labelEnd + 1) !== "(") continue
     var urlStart = labelEnd + 2
-    var urlEnd = urlStart + match[2].length
+    var depth = 1
+    var cursor = urlStart
+    var urlEnd = -1
+    while (cursor < source.length) {
+      var urlChar = source.charAt(cursor)
+      if (urlChar === "\\") { cursor += 2; continue }
+      if (urlChar === "\n") break
+      if (urlChar === "(") depth += 1
+      else if (urlChar === ")") {
+        depth -= 1
+        if (depth === 0) { urlEnd = cursor; break }
+      }
+      cursor += 1
+    }
+    if (urlEnd < 0) continue
     var closeEnd = urlEnd + 1
+    var labelStart = open + 1
     var inside = start >= labelStart && end <= labelEnd
     // A caret or selection in the destination belongs to the same link. It is
     // still the link, so editing the URL must replace it rather than nest a
@@ -1101,9 +1130,10 @@ function linkAt(text, start, end) {
         open: open, closeEnd: closeEnd,
         labelStart: labelStart, labelEnd: labelEnd,
         urlStart: urlStart, urlEnd: urlEnd,
-        url: match[2]
+        url: source.slice(urlStart, urlEnd)
       }
     }
+    index = closeEnd
   }
   return null
 }
