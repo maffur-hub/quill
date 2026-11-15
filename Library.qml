@@ -1946,7 +1946,7 @@ Item {
 
   function applySuggestedTags(tags) {
     var id = root.tagSuggestNoteId
-    // A window shortcut (Ctrl+N, Ctrl+Delete, refresh removing the note) can
+    // A window shortcut (Ctrl+N, Ctrl+Shift+Delete, refresh removing the note) can
     // change the selection while the modal popup is open. Suggestions built
     // for note A must never be written to note B.
     if (id === "" || id !== String(root.selectedId)) {
@@ -3732,12 +3732,12 @@ Item {
     armTimer.restart()
     if (deleteForever) {
       statusText = total > 1
-        ? "Press Ctrl+Delete again to delete " + total + " notes forever"
-        : "Press Ctrl+Delete again to delete forever"
+        ? "Press Ctrl+Shift+Delete again to delete " + total + " notes forever"
+        : "Press Ctrl+Shift+Delete again to delete forever"
     } else {
       statusText = total > 1
-        ? "Press Ctrl+Delete again to move " + total + " notes to Trash"
-        : "Press Ctrl+Delete again to move to Trash"
+        ? "Press Ctrl+Shift+Delete again to move " + total + " notes to Trash"
+        : "Press Ctrl+Shift+Delete again to move to Trash"
     }
   }
 
@@ -4496,7 +4496,7 @@ Item {
   }
   Shortcut { sequence: "Ctrl+Shift+Return"; enabled: root.active; onActivated: root.openLibraryWindow() }
   Shortcut { sequence: "Ctrl+Return"; enabled: root.active; onActivated: root.detachSelectedNote() }
-  Shortcut { sequence: "Ctrl+Delete"; enabled: root.active; onActivated: root.trashSelected() }
+  Shortcut { sequence: "Ctrl+Shift+Delete"; enabled: root.active; onActivated: root.trashSelected() }
   Shortcut { sequence: "Escape"; enabled: root.active; onActivated: root.handleEscape() }
   Shortcut { sequence: "Ctrl+1"; enabled: root.active; onActivated: root.focusSidebar() }
   Shortcut { sequence: "Ctrl+2"; enabled: root.active; onActivated: root.focusNotes() }

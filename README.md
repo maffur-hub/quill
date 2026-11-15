@@ -171,7 +171,7 @@ Draft writes never wake the Joplin sync. Only the normal note save does.
 | `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo |
 | `Ctrl+Shift+Enter` | Open the library in its own window |
 | `Ctrl+Return` | Open the selected note in a detached window |
-| `Ctrl+Delete` | Trash the selection (press twice; again to delete forever in Trash) |
+| `Ctrl+Shift+Delete` | Trash the selection (press twice; again to delete forever in Trash) |
 | `Shift+F10`, `Menu` | Note actions menu for the selected note |
 | `Ctrl+1` / `Ctrl+2` / `Ctrl+3` | Focus sidebar / list / editor |
 | `Esc` | Clear search, then close |
@@ -253,8 +253,8 @@ the active note and follows the end of a Shift range.
 
 The context menu and keyboard shortcuts then act on the whole selection:
 **Pin 3 notes**, **Move 3 notes to folder…**, **Move 3 notes to Trash**,
-**Add tag…**, **Remove tag…**, and **Ctrl+Shift+P** / **Ctrl+Delete** /
-**Ctrl+Shift+T** do the same without opening the menu. `Ctrl+Delete` still asks
+**Add tag…**, **Remove tag…**, and **Ctrl+Shift+P** / **Ctrl+Shift+Delete** /
+**Ctrl+Shift+T** do the same without opening the menu. **Ctrl+Shift+Delete** still asks
 for a second press. In Trash the same selection can be restored or deleted
 forever in one action. The bulk tag prompt takes one space- or
 comma-separated list.
