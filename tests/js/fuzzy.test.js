@@ -56,6 +56,11 @@ test('empty and whitespace queries return the entries unchanged', () => {
   assert.deepEqual(plain(fuzzy.rank(entries, '   ', null)), ['b', 'a', 'c'])
 })
 
+test('a trailing space does not stop the query matching', () => {
+  assert.equal(fuzzy.score('quick ', 'Quick'), fuzzy.score('quick', 'Quick'))
+  assert.deepEqual(plain(fuzzy.rank(['Plan', 'Quick'], 'qu ', null)), ['Quick'])
+})
+
 test('null and undefined inputs do not throw', () => {
   assert.equal(fuzzy.score(null, null), 0)
   assert.equal(fuzzy.score(undefined, 'text'), 0)

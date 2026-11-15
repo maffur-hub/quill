@@ -80,7 +80,7 @@ function fuzzyScan(needle, haystack, preferBoundaries) {
 // gaps and for a late first match or a long haystack. A long title should not
 // outrank a short, precise one just because it contains more characters.
 function score(query, text) {
-  var needle = fuzzyLower(query)
+  var needle = fuzzyLower(query).trim()
   if (needle === "") return 0
   var haystack = fuzzyLower(text)
   if (haystack === "") return -1
@@ -96,13 +96,16 @@ function rank(entries, query, textFor) {
   var source = entries && typeof entries.length === "number" ? entries : []
   var output = []
   for (var i = 0; i < source.length; i++) output.push(source[i])
-  if (fuzzyText(query).trim() === "") return output
+  // Trim once and score the trimmed query: a trailing space would otherwise
+  // become a needle character nothing can match.
+  var needle = fuzzyText(query).trim()
+  if (needle === "") return output
 
   var scored = []
   for (var j = 0; j < output.length; j++) {
     var entry = output[j]
     var text = typeof textFor === "function" ? textFor(entry) : entry
-    var value = score(query, text)
+    var value = score(needle, text)
     if (value >= 0) scored.push({ entry: entry, score: value, index: j })
   }
   scored.sort(function(left, right) {
