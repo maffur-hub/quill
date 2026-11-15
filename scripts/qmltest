@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# Drive real components through real behaviour in a disposable, headless
+# Quickshell, and fail on any assertion the case reports.
+#
+# scripts/qmlcheck proves the components *load*. This proves they still *work*:
+# a case instantiates a component, calls into it and checks the result. That is
+# the class of bug the load check cannot see (a save callback throwing on an
+# out-of-scope variable, a conflict banner that never appears).
+#
+# Each case gets its own temp data root and its own offscreen instance, so no
+# live note is ever read or written. A case is a QML Item exposing start(harness)
+# and reporting through harness.check(name, ok, detail) / harness.done().
+set -u
+
+cd "$(dirname "$0")/.." || exit 1
+root=$(pwd)
+
+shell_root="${OMARCHY_PATH:-/usr/share/omarchy}/shell"
+if [[ ! -f "$shell_root/shell.qml" ]]; then
+  echo "skip: Omarchy shell not found at $shell_root"
+  exit 0
+fi
+if ! command -v quickshell >/dev/null 2>&1; then
+  echo "skip: quickshell is not installed"
+  exit 0
+fi
+
+cases=(
+  tests/qml/library-save.qml
+)
+
+status=0
+for case in "${cases[@]}"; do
+  name=$(basename "$case" .qml)
+  stage=$(mktemp -d "${TMPDIR:-/tmp}/quill-qmltest.XXXXXX")
+  mkdir -p "$stage/imports" "$stage/data"
+  ln -sfn "$shell_root" "$stage/imports/qs"
+
+  export QUILL_DATA_DIR="$stage/data"
+  export QUILL_TEST_DATA="$stage/data"
+  export QUILL_TEST_STORE="$root/scripts/quill-store"
+  export QUILL_TEST_NOTE_ID
+  QUILL_TEST_NOTE_ID=$("$root/scripts/quill-store" create \
+    --title "Save harness" \
+    --content-stdin <<'NOTE' | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])'
+# Save harness
+
+original body
+NOTE
+  ) || { echo "not ok - $name: could not seed a note"; rm -rf "$stage"; status=1; continue; }
+
+  cat > "$stage/shell.qml" <<EOF
+import QtQuick
+import Quickshell
+
+ShellRoot {
+  id: harness
+  property string dataRoot: Quickshell.env("QUILL_TEST_DATA") || ""
+  property string storePath: Quickshell.env("QUILL_TEST_STORE") || ""
+  property int passed: 0
+  property int failed: 0
+
+  function check(name, ok, detail) {
+    if (ok) {
+      harness.passed += 1
+      console.log("ok - " + name)
+    } else {
+      harness.failed += 1
+      console.log("not ok - " + name + (detail ? ": " + detail : ""))
+    }
+  }
+  function done() {
+    console.log("SUMMARY passed=" + harness.passed + " failed=" + harness.failed)
+    Qt.exit(harness.failed === 0 ? 0 : 1)
+  }
+
+  Loader {
+    id: caseLoader
+    source: "file://$root/$case"
+    onStatusChanged: {
+      if (status === Loader.Error) {
+        harness.check("$name loads", false, "QML error")
+        harness.done()
+      } else if (status === Loader.Ready) {
+        caseLoader.item.start(harness)
+      }
+    }
+  }
+
+  Timer {
+    interval: 45000
+    running: true
+    onTriggered: {
+      harness.check("$name finished", false, "timed out")
+      harness.done()
+    }
+  }
+}
+EOF
+
+  echo "== $name =="
+  output=$(QML_IMPORT_PATH="$stage/imports" \
+    QT_QPA_PLATFORM=offscreen \
+    QUILL_E2E=1 \
+    timeout 90 quickshell -n -p "$stage" 2>&1)
+  # Quickshell prefixes each console line with a coloured "DEBUG qml:" tag, so
+  # strip the escape codes and the tag before looking for assertions.
+  clean=$(printf '%s\n' "$output" | sed -e 's/\x1b\[[0-9;]*m//g' -e 's/^.*qml: //')
+  printf '%s\n' "$clean" | grep -E "^(ok|not ok|SUMMARY)" || true
+  if printf '%s\n' "$clean" | grep -q "^not ok" \
+     || ! printf '%s\n' "$clean" | grep -q "^SUMMARY passed="; then
+    status=1
+    # Keep the rest of the log when something failed, it is the evidence.
+    printf '%s\n' "$clean" | grep -vE "^(ok|not ok|SUMMARY)" | tail -20
+  fi
+  rm -rf "$stage"
+done
+
+if [[ "$status" -eq 0 ]]; then
+  echo "QML behaviour: all cases passed"
+else
+  echo "QML behaviour: failures above"
+fi
+exit "$status"

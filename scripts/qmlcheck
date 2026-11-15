@@ -28,7 +28,7 @@ fi
 # commit under the offscreen platform and would fail for reasons unrelated to
 # our code. Library.qml is the component the panel hosts, and a broken
 # dependency shows up there.
-components=(Library.qml NoteList.qml Sidebar.qml MarkdownEditor.qml QuickSwitcher.qml VersionHistory.qml TagManager.qml TemplateManager.qml)
+components=(Library.qml NoteList.qml Sidebar.qml MarkdownEditor.qml QuickSwitcher.qml VersionHistory.qml TagManager.qml TemplateManager.qml Detached.qml)
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/quill-qmlcheck.XXXXXX") || exit 1
 trap 'rm -rf "$tmp"' EXIT

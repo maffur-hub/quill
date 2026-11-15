@@ -50,6 +50,9 @@ backlinks. Deleting `index.db` is safe; it is rebuilt automatically.
   scripts/quill-export-pdf   Markdown → PDF via that renderer + headless Chromium
   scripts/quill-reveal       show a note's file in the file manager, selected if possible
   scripts/quill-window launcher for Detached.qml (stages it for `qs -p`)
+  scripts/qmlcheck     load every component in a headless shell (part of `scripts/test`)
+  scripts/qmltest      drive a real component through a scenario, offscreen
+  tests/               JS unit tests, store contract tests, QML behaviour cases
   vendor/              vendored MathJax 3.2.2 (Apache-2.0), see vendor/README.md
   tools/               Joplin mirror scripts + systemd units (reference copies)
   README.md
@@ -1253,6 +1256,30 @@ scripts/quill-store import-omanano
 It copies `~/.local/share/omanano/notes/**/*.md` into `notes/`, keeps the
 original filenames and mtimes, carries over pinned ids that exist, and never
 overwrites an existing note. OmaNano's files are never moved or modified.
+
+## Testing
+
+`./scripts/test` runs all four suites and exits non-zero if any fails:
+
+1. `node --test tests/js` — the pure modules (formatting, tables, maths, fuzzy
+   ranking, URLs, tag suggestions) plus golden HTML files.
+2. `python3 -m unittest discover -s tests/store` — the store CLI and the helper
+   scripts, against a throwaway `QUILL_DATA_DIR`.
+3. `./scripts/qmlcheck` — loads every component in a headless Quickshell so a
+   broken attached property or import fails here instead of on the desktop.
+4. `./scripts/qmltest` — behaviour cases: each one creates a real component
+   (today, the library), drives it, and asserts on what reached the disk.
+
+The behaviour cases exist because loading is not enough. A component can load
+cleanly and still be broken at runtime — a variable captured in the wrong scope
+once stopped every save from being written while the UI cheerfully said
+"Saving…". `tests/qml/library-save.qml` now covers exactly that: a save reaches
+the disk, a stale save is refused, the conflict is reported, and "Keep mine"
+then wins.
+
+Nothing here touches your notes: every suite runs with a temporary
+`QUILL_DATA_DIR` and `QUILL_E2E=1`, and the store refuses to serve the real data
+root under that flag.
 
 ## Performance
 

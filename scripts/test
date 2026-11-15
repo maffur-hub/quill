@@ -24,4 +24,10 @@ if ! ./scripts/qmlcheck; then
   status=1
 fi
 
+echo
+echo "== QML behaviour tests =="
+if ! ./scripts/qmltest; then
+  status=1
+fi
+
 exit "$status"
