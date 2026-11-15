@@ -1704,6 +1704,39 @@ class TestSettings(StoreTestCase):
         self.assertEqual(written, {"ui": {key: True}})
 
 
+
+class TestStateIntegrity(StoreTestCase):
+    """A damaged state.json must never be replaced by a partial rewrite."""
+
+    def corrupt(self):
+        path = self.root / "state.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'{"version": 1, "pinned": [\n')
+        return path
+
+    def test_mutations_refuse_a_damaged_state_file(self):
+        identifier = self.create("Pinned")
+        path = self.corrupt()
+        damaged = path.read_bytes()
+        for args in (
+            ("pin", identifier),
+            ("searches", "add", "tag:alpha"),
+            ("settings", "set", "--json", '{"theme":"dark"}'),
+        ):
+            with self.subTest(args=args):
+                error = self.failure(*args)
+                self.assertIn("state.json", error["error"])
+                self.assertEqual(path.read_bytes(), damaged)
+
+    def test_reads_still_work_with_a_damaged_state_file(self):
+        identifier = self.create("Still listed")
+        self.corrupt()
+        listing = self.success("list")
+        self.assertEqual([note["id"] for note in listing["notes"]], [identifier])
+        self.assertFalse(listing["notes"][0]["pinned"])
+        self.assertEqual(self.success("settings", "get"), {"ui": {}})
+        self.assertEqual(self.success("searches", "list"), {"searches": []})
+
 class TestTagRenameMerge(StoreTestCase):
     """tag-rename onto an existing tag is a merge, with dedupe and `merged`."""
 

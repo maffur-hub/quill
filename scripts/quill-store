@@ -1385,15 +1385,37 @@ def read_state() -> dict:
     """Return state.json as a dict, preserving unknown keys.
 
     A missing or malformed file reads as an empty state; callers supply their
-    own defaults so pins and saved searches survive independently.
+    own defaults so pins and saved searches survive independently. Commands
+    that write the file back use read_state_strict() instead.
     """
     state = read_json(STATE, {})
     return state if isinstance(state, dict) else {}
 
 
+def read_state_strict() -> dict:
+    """Return state.json, refusing to read a damaged file as empty.
+
+    update_state() merges into this and writes it back, so falling back here
+    would replace every pin, saved search and setting with the defaults the
+    calling command happens to supply.
+    """
+    try:
+        exists = STATE.exists()
+    except OSError:
+        exists = False
+    if not exists:
+        return {}
+    state = read_json(STATE, None)
+    if not isinstance(state, dict):
+        raise StoreError(
+            "state.json is damaged; move it aside to reset the pins, saved "
+            "searches and settings it stores")
+    return state
+
+
 def update_state(**changes) -> dict:
     """Merge changes into state.json without dropping unrelated keys."""
-    state = read_state()
+    state = read_state_strict()
     state.update(changes)
     state.setdefault("version", 1)
     write_json(STATE, state)
