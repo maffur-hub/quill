@@ -501,6 +501,9 @@ TextArea {
       if (!closing && name === "u" && attrs.trim() === "") {
         stack.push({ name: "u", start: match.index, end: regex.lastIndex, tag: match[0],
           open: true })
+      } else if (!closing && (name === "sup" || name === "sub") && attrs.trim() === "") {
+        stack.push({ name: name, start: match.index, end: regex.lastIndex, tag: match[0],
+          open: true })
       } else if (!closing && name === "span") {
         var props = safeInlineSpanStyle(attrs)
         if (props === null) continue
