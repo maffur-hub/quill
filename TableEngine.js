@@ -42,11 +42,55 @@ function isFence(line, state) {
   return marker.charAt(0) === state.character && marker.length >= state.length
 }
 
+// Index the backtick runs that actually pair up. A run only opens an inline
+// code span when another run of exactly the same length closes it; a stray
+// backtick is literal text and must not swallow the pipes after it.
+function balancedBacktickRuns(text) {
+  var runs = []
+  var escaped = false
+  var i = 0
+  while (i < text.length) {
+    var ch = text.charAt(i)
+    if (escaped) {
+      escaped = false
+      i += 1
+      continue
+    }
+    if (ch === "\\") {
+      escaped = true
+      i += 1
+      continue
+    }
+    if (ch !== "`") {
+      i += 1
+      continue
+    }
+    var start = i
+    while (i < text.length && text.charAt(i) === "`") i += 1
+    runs.push({ start: start, length: i - start, paired: false })
+  }
+  for (var a = 0; a < runs.length; a++) {
+    if (runs[a].paired) continue
+    for (var b = a + 1; b < runs.length; b++) {
+      if (runs[b].paired || runs[b].length !== runs[a].length) continue
+      runs[a].paired = true
+      runs[b].paired = true
+      break
+    }
+  }
+  var paired = {}
+  for (var r = 0; r < runs.length; r++) {
+    if (runs[r].paired) paired[runs[r].start] = true
+  }
+  return paired
+}
+
 // Split one table line into raw cell text. Escaped pipes and pipes inside
 // inline code spans do not separate cells. The returned values keep their
 // escapes and code markers so serialisation can round-trip them.
 function splitCells(line) {
   var text = stripCR(line)
+  var paired = balancedBacktickRuns(text)
   var cells = []
   var current = ""
   var escaped = false
@@ -65,14 +109,17 @@ function splitCells(line) {
       continue
     }
     if (ch === "`") {
+      var runStart = i
       var run = 1
       while (i + 1 < text.length && text.charAt(i + 1) === "`") {
         run += 1
         i += 1
       }
       current += repeat("`", run)
-      if (codeRun === 0) codeRun = run
-      else if (run === codeRun) codeRun = 0
+      if (paired[runStart]) {
+        if (codeRun === 0) codeRun = run
+        else if (run === codeRun) codeRun = 0
+      }
       continue
     }
     if (ch === "|" && codeRun === 0) {
@@ -94,6 +141,7 @@ function splitCells(line) {
 
 function hasDelimiterPipe(line) {
   var text = stripCR(line)
+  var paired = balancedBacktickRuns(text)
   var escaped = false
   var codeRun = 0
   for (var i = 0; i < text.length; i++) {
@@ -107,13 +155,16 @@ function hasDelimiterPipe(line) {
       continue
     }
     if (ch === "`") {
+      var runStart = i
       var run = 1
       while (i + 1 < text.length && text.charAt(i + 1) === "`") {
         run += 1
         i += 1
       }
-      if (codeRun === 0) codeRun = run
-      else if (run === codeRun) codeRun = 0
+      if (paired[runStart]) {
+        if (codeRun === 0) codeRun = run
+        else if (run === codeRun) codeRun = 0
+      }
       continue
     }
     if (ch === "|" && codeRun === 0) return true
@@ -305,6 +356,7 @@ function indexToRef(row, col) {
 // Escape bare pipes outside inline code and leave existing `\|` escapes alone.
 function escapePipes(value) {
   var text = String(value === undefined || value === null ? "" : value)
+  var paired = balancedBacktickRuns(text)
   var output = ""
   var escaped = false
   var codeRun = 0
@@ -321,14 +373,17 @@ function escapePipes(value) {
       continue
     }
     if (ch === "`") {
+      var runStart = i
       var run = 1
       while (i + 1 < text.length && text.charAt(i + 1) === "`") {
         run += 1
         i += 1
       }
       output += repeat("`", run)
-      if (codeRun === 0) codeRun = run
-      else if (run === codeRun) codeRun = 0
+      if (paired[runStart]) {
+        if (codeRun === 0) codeRun = run
+        else if (run === codeRun) codeRun = 0
+      }
       continue
     }
     if (ch === "|" && codeRun === 0) {

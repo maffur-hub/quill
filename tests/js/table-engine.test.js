@@ -67,6 +67,20 @@ test('escaped pipes survive parse and serialise', () => {
   deepEqual(engine.serializeTable(table), lines)
 })
 
+test('an unpaired backtick does not swallow the cells after it', () => {
+  const lines = ['| A | B |', '| --- | --- |', '| a `b | c |']
+  const table = engine.findTables(lines)[0]
+  deepEqual(table.rows, [['a `b', 'c']])
+  deepEqual(engine.serializeTable(table), lines)
+})
+
+test('pipes inside a paired code span stay in one cell', () => {
+  const lines = ['| A | B |', '| --- | --- |', '| `x | y` | z |']
+  const table = engine.findTables(lines)[0]
+  deepEqual(table.rows, [['`x | y`', 'z']])
+  deepEqual(engine.serializeTable(table), lines)
+})
+
 test('insertRow and deleteRow change only the data rows', () => {
   const base = model([['1'], ['2']], ['A'])
   const inserted = engine.insertRow(base, 1)
