@@ -4760,8 +4760,9 @@ Item {
     stderr: StdioCollector { waitForEnd: true }
     onExited: function(exitCode) {
       if (exitCode !== 0) {
+        // Leave the loaded flag alone so opening the dialog again retries
+        // instead of showing an empty printer list until the shell restarts.
         root.printersLoading = false
-        root.printersLoaded = true
         root.statusText = "Could not run the print script"
         return
       }
