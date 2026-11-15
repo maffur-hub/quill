@@ -92,7 +92,8 @@ Item {
     }
     sendWhenReady = false
     agentService.sendPrompt(value)
-    composer.text = ""
+    // The composer is cleared by onPromptSent: until the bridge has the text
+    // (a new session's `opened` may never arrive) it is the only copy.
     root.atBottom = true
     scrollToEnd()
   }
@@ -197,6 +198,12 @@ Item {
 
     function onReadyChanged() {
       if (agentService.ready && root.sendWhenReady) root.submit()
+    }
+
+    function onPromptSent(text) {
+      // Leave anything the user typed after pressing Enter alone.
+      if (String(composer.text || "").trim() !== String(text || "").trim()) return
+      composer.text = ""
     }
   }
 

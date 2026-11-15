@@ -35,6 +35,10 @@ Item {
 
   signal sessionsUpdated()
   signal historyLoaded()
+  // Emitted when a prompt has actually reached the bridge, including one that
+  // waited for its new session to open. The dock clears the composer from
+  // this rather than from the keystroke that asked for the send.
+  signal promptSent(string text)
 
   // Wanted means "the dock wants a live bridge", independent of whether one is
   // running right now. The supervisor only ever revives a wanted bridge, so a
@@ -147,6 +151,7 @@ Item {
     }
     appendUser(value)
     busy = true
+    promptSent(value)
   }
 
   function interrupt() {
