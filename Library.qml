@@ -87,6 +87,10 @@ Item {
   property bool suppressDirty: false
   property bool dirty: false
   property int editVersion: 0
+  // Bumped whenever the buffer is replaced from outside the editor (a load or
+  // an external reload). A save that started before the bump still lands on
+  // disk, so its result must not be adopted as the buffer's saved state.
+  property int writeGeneration: 0
   property double loadedModified: 0
   property string saveState: "Ready"
   property string statusText: "Ready"
@@ -97,6 +101,9 @@ Item {
   property string diskChangeText: ""
   property bool pendingEditorOpen: false
   property string inFlightSaveText: ""
+  // Text written by a save that a reload superseded. The file watcher sees
+  // that write land and must not adopt it back into the buffer.
+  property string staleWriteText: ""
   readonly property string watchPath: (root.selectedNote && root.loaded
     && !root.tooLarge && !root.loadingNote)
     ? root.notePath(root.selectedNote) : ""
@@ -1260,6 +1267,7 @@ Item {
     diskChangeText = ""
     pendingEditorOpen = false
     inFlightSaveText = ""
+    staleWriteText = ""
     // Remove the outgoing note's buffer preview before the selection moves,
     // so any render still in flight can never land on the new note.
     root.clearPreviewTemp()
@@ -1290,6 +1298,7 @@ Item {
     diskChangeText = ""
     pendingEditorOpen = false
     inFlightSaveText = ""
+    staleWriteText = ""
     suppressDirty = true
     editor.text = ""
     editor.resetFormatHistory()
@@ -1353,7 +1362,9 @@ Item {
         root.suppressDirty = false
         root.loadingNote = false
         root.tooLarge = !!result.tooLarge
-        root.loaded = !result.tooLarge
+        root.loaded = !root.tooLarge
+        // Any save that was in flight when this buffer arrived is superseded.
+        root.writeGeneration += 1
         root.loadedModified = Number(result.modified || 0)
         root.savedTextById[requestedId] = root.tooLarge ? "" : String(result.content || "")
         root.dirty = false
@@ -1544,7 +1555,7 @@ Item {
     }
   }
 
-  function flushSave() {
+  function flushSave(force) {
     saveTimer.stop()
     if (!root.writesAllowed) {
       saveState = "Read-only"
@@ -1552,12 +1563,16 @@ Item {
       return
     }
     if (tableOpen && tableEditor) tableEditor.flushWrite()
-    if (dirty && diskChangePending) {
-      // Never overwrite the external text that the banner is asking about.
-      statusText = "Note changed on disk — choose Reload or Keep mine"
-      return
+    if (!root.loaded || !root.selectedNote || root.tooLarge
+        || root.selectedNote.trashed) return
+    if (force !== true) {
+      if (dirty && diskChangePending) {
+        // Never overwrite the external text that the banner is asking about.
+        statusText = "Note changed on disk — choose Reload or Keep mine"
+        return
+      }
+      if (!dirty) return
     }
-    if (!dirty || !loaded || tooLarge || !selectedNote || selectedNote.trashed) return
     saveSeq += 1
     var path = dataRoot + "/.quill-save-" + saveSeq + "-" + Date.now() + ".md"
     var view = saveFileComponent.createObject(root, { path: path })
@@ -1566,6 +1581,7 @@ Item {
       return
     }
     var text = String(editor.text)
+    var generation = root.writeGeneration
     inFlightSaveText = text
     view.targetNoteId = selectedId
     view.targetVersion = editVersion
@@ -1585,7 +1601,7 @@ Item {
       silent: true,
       noteId: noteId,
       version: version,
-      onSuccess: function(result) { root.afterWrite(noteId, version, result, savedText) },
+      onSuccess: function(result) { root.afterWrite(noteId, version, result, savedText, generation) },
       onError: function(message) {
         if (root.inFlightSaveText === savedText) root.inFlightSaveText = ""
         root.pendingEditorOpen = false
@@ -1623,10 +1639,24 @@ Item {
     }
   }
 
-  function afterWrite(noteId, version, result, savedText) {
+  function afterWrite(noteId, version, result, savedText, generation) {
     // Only the matching save clears the in-flight text: a newer edit may have
     // started another save while this one was running.
     if (inFlightSaveText === savedText) inFlightSaveText = ""
+    if (generation !== undefined && Number(generation) !== root.writeGeneration) {
+      // The buffer was replaced (reload, or the note was reloaded while this
+      // save was in flight), so the text that just landed on disk is the one
+      // the user abandoned. Do not adopt it: write the current buffer back,
+      // without letting the stale bytes count as an external change.
+      if (noteId === root.selectedId) {
+        root.staleWriteText = savedText
+        root.diskChangePending = false
+        root.diskChangeText = ""
+        if (root.writesAllowed) root.flushSave(true)
+      }
+      return
+    }
+    root.staleWriteText = ""
     // A write that did not change the stored bytes is a no-op. Only a real
     // change wakes the Joplin sync, and only after the write succeeded.
     var previousText = root.savedTextById[noteId]
@@ -1831,6 +1861,11 @@ Item {
       }
       return
     }
+    if (root.staleWriteText !== "" && value === root.staleWriteText) {
+      // A save that the reload already superseded landed late. The buffer was
+      // rewritten after it, so this text is not news.
+      return
+    }
     var known = root.savedTextById[root.selectedId]
     if (known !== undefined && value === known) {
       // Stale notification for content we already have (for example the
@@ -1859,6 +1894,9 @@ Item {
     editor.resetFormatHistory()
     editor.cursorPosition = Math.min(caret, value.length)
     root.suppressDirty = false
+    // The buffer now holds the disk text: a save that was in flight when the
+    // reload started must not be adopted as this buffer's saved state.
+    root.writeGeneration += 1
     root.savedTextById[id] = value
     root.dirty = false
     root.editVersion = 0
