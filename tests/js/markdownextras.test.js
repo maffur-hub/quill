@@ -23,6 +23,11 @@ test('tilde and backtick fences only close against their own character', () => {
     [true, true, true, true, false])
 })
 
+test('an info string does not close a fence early', () => {
+  deepEqual(extras.scanFences(['```js', 'a', '```val', 'b', '```', 'after']),
+    [true, true, true, true, true, false])
+})
+
 test('an unclosed fence runs to the end of the note', () => {
   deepEqual(extras.scanFences(['```', 'a', 'b']), [true, true, true])
 })

@@ -62,19 +62,18 @@ function indentWidth(value) {
 function scanFences(lines) {
   var source = arrayOf(lines)
   var mask = []
-  var fence = ""
+  var marker = ""
   for (var i = 0; i < source.length; i++) {
-    var match = FENCE_RE.exec(stripCR(source[i]))
-    if (fence === "") {
-      mask[i] = !!match
-      if (match) fence = match[1]
+    if (marker === "") {
+      var open = FENCE_RE.exec(stripCR(source[i]))
+      mask[i] = !!open
+      if (open) marker = open[1]
       continue
     }
     mask[i] = true
-    if (match && match[1].charAt(0) === fence.charAt(0)
-      && match[1].length >= fence.length) {
-      fence = ""
-    }
+    // closesFence() is the same rule codeBlocks() uses: a closing fence has
+    // no info string, so "```js" inside a block cannot end it early.
+    if (closesFence(source[i], marker)) marker = ""
   }
   return mask
 }

@@ -38,22 +38,26 @@ function hasMarkdownLink(value) {
 
 // Kept as a local fallback so PreviewBlocks works with partial deps. build()
 // prefers deps.extras.scanFences — one implementation of fence matching.
+function localClosesFence(line, marker) {
+  var character = marker.charAt(0)
+  var re = new RegExp("^\\s{0,3}" + (character === "`" ? "`" : "~")
+    + "{" + marker.length + ",}\\s*$")
+  return re.test(stripCR(line))
+}
+
 function localScanFences(lines) {
   var source = lines === undefined || lines === null ? [] : lines
   var mask = []
-  var fence = ""
+  var marker = ""
   for (var i = 0; i < source.length; i++) {
-    var match = FENCE_RE.exec(stripCR(source[i]))
-    if (fence === "") {
-      mask[i] = !!match
-      if (match) fence = match[1]
+    if (marker === "") {
+      var open = FENCE_RE.exec(stripCR(source[i]))
+      mask[i] = !!open
+      if (open) marker = open[1]
       continue
     }
     mask[i] = true
-    if (match && match[1].charAt(0) === fence.charAt(0)
-      && match[1].length >= fence.length) {
-      fence = ""
-    }
+    if (localClosesFence(source[i], marker)) marker = ""
   }
   return mask
 }
