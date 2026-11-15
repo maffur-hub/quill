@@ -155,3 +155,11 @@ test('hasFormatting routes the new HTML and footnote syntax through RichText', (
   assert.equal(MathText.hasFormatting('> ```js'), true)
   assert.equal(MathText.hasFormatting('plain prose'), false)
 })
+
+test('an ordered list keeps the number it starts from', () => {
+  const started = MathText.toHtml('5. five\n6. six', null, MathSyntax)
+  assert.match(started, /^<ol start="5"/)
+  const natural = MathText.toHtml('1. one\n2. two', null, MathSyntax)
+  assert.match(natural, /^<ol/)
+  assert.doesNotMatch(natural, /start=/)
+})

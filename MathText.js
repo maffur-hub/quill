@@ -565,6 +565,9 @@ function renderBlocks(lines, resolve, syntax, depth, options) {
     var item = line.match(ITEM_RE)
     if (item) {
       var ordered = /^[0-9]/.test(item[1])
+      // A list that starts at 5 should still start at 5 once rendered.
+      var start = ordered ? parseInt(item[1], 10) : 1
+      if (!(start > 0)) start = 1
       var items = []
       while (i < lines.length) {
         var current = lines[i].match(ITEM_RE)
@@ -579,7 +582,9 @@ function renderBlocks(lines, resolve, syntax, depth, options) {
         i += 1
       }
       var tag = ordered ? "ol" : "ul"
-      output.push("<" + tag + ">" + items.join("") + "</" + tag + ">")
+      var opening = start !== 1 ? '<ol start="' + start + '">' : "<ol>"
+      output.push((ordered ? opening : "<ul>") + items.join("")
+        + "</" + tag + ">")
       continue
     }
 
