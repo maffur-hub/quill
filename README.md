@@ -144,6 +144,11 @@ note with editing (and the format bar) disabled, plus a banner such as
 
 Draft writes never wake the Joplin sync. Only the normal note save does.
 
+A draft follows its note through a move, a trash, a restore, a folder rename
+and a `folder delete --force`, so renaming or reorganising while a recovery is
+pending does not lose it. A draft is never moved onto an existing one: the
+destination wins and the older file is left where it is.
+
 ## Shortcuts
 
 | Key | Action |
@@ -1264,9 +1269,9 @@ overwrites an existing note. OmaNano's files are never moved or modified.
 - Preview updates as you type (200 ms after the last keystroke) through
   `preview --content-file`; trashed, read-only and draft-pending notes render
   the saved body instead.
-- Crash drafts follow the note's current path. Renaming, moving or trashing a
-  note does not move an existing `.draft`, so recovery is offered again only if
-  the note returns to the same path before the draft is removed.
+- Crash drafts follow the note's path on move, trash, restore, folder rename
+  and folder delete. Two drafts for the same note (a crash and a manual copy)
+  are never merged: the destination file wins.
 - The library and a detached window can both edit the same note. Draft files
   are last-writer-wins; close one window before switching to the other if both
   have the note dirty.

@@ -868,6 +868,34 @@ class TestDrafts(StoreTestCase):
         self.assertFalse(draft.exists())
         self.assertFalse(self.success("draft", "discard", identifier)["discarded"])
 
+    def draft_for(self, identifier, text="# Draft\n\nunsaved\n"):
+        path = self.note_path(identifier)
+        draft = path.with_name(path.name + ".draft")
+        draft.write_text(text, encoding="utf-8")
+        return draft
+
+    def test_move_trash_and_restore_carry_the_draft(self):
+        identifier = self.create("Portable", content="# Portable\n\nsaved\n")
+        draft = self.draft_for(identifier)
+        moved = self.success("move", identifier, "--folder", "Archive")["id"]
+        self.assertFalse(draft.exists())
+        self.assertTrue(self.read(moved)["draft"])
+
+        trashed = self.success("trash", moved)["id"]
+        restored = self.success("restore", trashed)["id"]
+        self.assertEqual(restored, moved)
+        self.assertTrue(self.read(restored)["draft"])
+
+    def test_folder_delete_carries_the_draft_with_the_note(self):
+        identifier = self.create(
+            "Flattened", content="# Flattened\n\nsaved\n", folder="Deep/Nested")
+        draft = self.draft_for(identifier)
+        result = self.success("folder", "delete", "Deep", "--force")
+        self.assertEqual(result["moved"], 1)
+        self.assertFalse(draft.exists())
+        flattened = Path(identifier).name
+        self.assertTrue(self.read(flattened)["draft"])
+
 
 class TestPreviewFromBuffer(StoreTestCase):
     """Previewing editor buffer text without touching notes or the index."""

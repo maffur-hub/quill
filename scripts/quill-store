@@ -2821,6 +2821,10 @@ def command_folder(args) -> dict:
                 root = NOTES
                 for path in files:
                     if path.suffix.lower() != ".md":
+                        if path.name.endswith(".md.draft"):
+                            # Carried out with its note below; deleting it here
+                            # would lose the unsaved text it holds.
+                            continue
                         with contextlib.suppress(OSError):
                             path.unlink()
                         continue
@@ -2829,6 +2833,9 @@ def command_folder(args) -> dict:
                     if destination.exists():
                         destination = unique_target(root, path.name, "moved")
                     shutil.move(str(path), str(destination))
+                    # The folder is removed below, so an unmoved draft would be
+                    # deleted with it and the user's unsaved text lost.
+                    move_draft(path, destination)
                     move_version_dir(
                         identifier, destination.relative_to(NOTES).as_posix())
                     moved += 1
