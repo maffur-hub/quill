@@ -154,6 +154,37 @@ class TestNotes(StoreTestCase):
         note = [item for item in self.success("list")["notes"] if item["id"] == identifier][0]
         self.assertEqual(note["title"], "Front Matter")
 
+    def test_rename_leaves_hash_lines_inside_fences_alone(self):
+        identifier = self.create(
+            content="```bash\n# not a heading\nls -la\n```\n\n# Old\n\nbody\n"
+        )
+        self.success("rename", identifier, "--title", "Renamed")
+        content = self.read(identifier)["content"]
+        self.assertIn("```bash\n# not a heading\nls -la\n```\n", content)
+        self.assertIn("\n# Renamed\n", content)
+        self.assertNotIn("# Old", content)
+
+        # A note whose only `#` lines are comments gets a new heading, and the
+        # fence still survives byte for byte.
+        fenced = self.create(content="```\n# still a comment\n```\n")
+        self.success("rename", fenced, "--title", "Fenced")
+        self.assertEqual(
+            self.read(fenced)["content"], "# Fenced\n\n```\n# still a comment\n```\n")
+
+    def test_rename_roundtrips_a_quoted_frontmatter_title(self):
+        identifier = self.create(content="---\ntitle: Old\n---\n\nbody\n")
+        quoted = 'He said "hi"'
+        self.success("rename", identifier, "--title", quoted)
+        content = self.read(identifier)["content"]
+        self.assertIn('title: "He said \\"hi\\""', content)
+        note = [item for item in self.success("list")["notes"] if item["id"] == identifier][0]
+        self.assertEqual(note["title"], quoted)
+
+        # Single-quoted YAML survives too, including its doubled apostrophe.
+        self.write_note_file(identifier, b"---\ntitle: 'It''s fine'\n---\n\nbody\n")
+        note = [item for item in self.success("list")["notes"] if item["id"] == identifier][0]
+        self.assertEqual(note["title"], "It's fine")
+
     def test_write_stdin_and_content_file(self):
         identifier = self.create("Write")
         written = self.success("write", identifier, "--stdin", stdin="body one\n")
@@ -215,6 +246,39 @@ class TestNotes(StoreTestCase):
     def test_create_requires_content_stdin_or_title(self):
         identifier = self.create()
         self.assertEqual(self.read(identifier)["content"], "# Untitled\n\n")
+
+
+class TestEncodingIntegrity(StoreTestCase):
+    """Commands that rewrite a note must refuse to touch invalid UTF-8."""
+
+    def test_rename_refuses_a_non_utf8_note(self):
+        identifier = self.create("Legacy")
+        raw = b"# Legacy\n\ncaf\xe9\n"
+        self.write_note_file(identifier, raw)
+        error = self.failure("rename", identifier, "--title", "Renamed")
+        self.assertIn("UTF-8", error["error"])
+        self.assertEqual(self.note_path(identifier).read_bytes(), raw)
+
+    def test_duplicate_refuses_a_non_utf8_note(self):
+        identifier = self.create("Legacy")
+        raw = b"# Legacy\n\ncaf\xe9\n"
+        self.write_note_file(identifier, raw)
+        before = len(self.success("list")["notes"])
+        error = self.failure("duplicate", identifier)
+        self.assertIn("UTF-8", error["error"])
+        self.assertEqual(len(self.success("list")["notes"]), before)
+
+    def test_tag_commands_skip_a_non_utf8_note(self):
+        identifier = self.create(
+            "Legacy", content="---\ntags: [alpha]\n---\n\n# Legacy\n")
+        raw = b"---\ntags: [alpha]\n---\n\ncaf\xe9\n"
+        self.write_note_file(identifier, raw)
+        renamed = self.success("tag-rename", "alpha", "beta")
+        self.assertEqual(renamed["updated"], 0)
+        self.assertEqual(self.note_path(identifier).read_bytes(), raw)
+        deleted = self.success("tag-delete", "alpha")
+        self.assertEqual(deleted["updated"], 0)
+        self.assertEqual(self.note_path(identifier).read_bytes(), raw)
 
 
 class TestTrash(StoreTestCase):

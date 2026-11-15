@@ -906,6 +906,26 @@ def render_template(template_id, now=None) -> str:
     return render_template_body(body, now)
 
 
+def unquote_frontmatter_scalar(value: str) -> str:
+    """Undo the quoting `rewrite_title` applies to a frontmatter title.
+
+    Titles are written with JSON/SQL-style double quotes, so reading one back
+    must decode those escapes rather than strip the outer characters: a title
+    containing `"` otherwise keeps its backslashes and stops matching
+    `[[wiki links]]`. Single-quoted YAML values escape `'` by doubling it.
+    """
+    text = str(value or "").strip()
+    if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            return text[1:-1]
+        return parsed if isinstance(parsed, str) else text[1:-1]
+    if len(text) >= 2 and text[0] == "'" and text[-1] == "'":
+        return text[1:-1].replace("''", "'")
+    return text
+
+
 def frontmatter_title(frontmatter: str | None) -> str:
     if not frontmatter:
         return ""
@@ -913,10 +933,7 @@ def frontmatter_title(frontmatter: str | None) -> str:
         match = re.match(r"^\s*title\s*:\s*(.*)$", line, re.IGNORECASE)
         if not match:
             continue
-        value = match.group(1).strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-            value = value[1:-1]
-        return value[:120]
+        return unquote_frontmatter_scalar(match.group(1))[:120]
     return ""
 
 
@@ -2007,6 +2024,19 @@ def save_template(args) -> dict:
         return template_result(path, fields, body)
 
 
+def decode_note_utf8(raw: bytes) -> str:
+    """Decode stored note bytes, refusing anything that is not UTF-8.
+
+    Commands that rewrite a note must not fall back to replacement characters:
+    writing the result back would silently corrupt every non-UTF-8 byte. Reads
+    that never write can keep using errors="replace".
+    """
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise StoreError("note is not valid UTF-8") from error
+
+
 def rewrite_title(content: str, title: str) -> str:
     clean = clean_title(title)
     newline = detect_newline(content)
@@ -2026,7 +2056,20 @@ def rewrite_title(content: str, title: str) -> str:
                     return "".join(lines)
             lines.insert(closing, f"title: {json.dumps(clean, ensure_ascii=False)}{newline}")
             return "".join(lines)
+    fence = ""
     for index, line in enumerate(lines):
+        marker = FENCE_RE.match(line)
+        if marker:
+            # Track fences so a `# comment` inside a code block is not taken
+            # for the note's heading.
+            char = marker.group(1)[0]
+            if fence == "":
+                fence = char
+            elif fence == char:
+                fence = ""
+            continue
+        if fence:
+            continue
         if HEADING_RE.match(line):
             ending = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
             lines[index] = f"# {clean}{ending}"
@@ -2074,7 +2117,7 @@ def command_duplicate(args) -> dict:
             raise StoreError(f"could not read the note: {error}") from error
         if len(data) > MAX_NOTE_BYTES:
             raise StoreError(f"note exceeds {MAX_NOTE_BYTES} bytes")
-        content = data.decode("utf-8", errors="replace")
+        content = decode_note_utf8(data)
         folder_path = source.parent.relative_to(NOTES)
         folder = "" if str(folder_path) == "." else folder_path.as_posix()
         conn = index_connect()
@@ -2128,7 +2171,7 @@ def command_rename(args) -> dict:
             previous_raw = path.read_bytes()
         except OSError as error:
             raise StoreError(f"could not read the existing note: {error}") from error
-        content = previous_raw.decode("utf-8", errors="replace")
+        content = decode_note_utf8(previous_raw)
         # Open the index first so a stale cache cannot hide inbound links.
         old_norms: set[str] = set()
         conn = with_index()
@@ -3791,8 +3834,12 @@ def delete_tag_everywhere(tag) -> dict:
                 continue
             try:
                 previous_raw = path.read_bytes()
-                content = previous_raw.decode("utf-8", errors="replace")
             except OSError:
+                continue
+            try:
+                content = previous_raw.decode("utf-8")
+            except UnicodeDecodeError:
+                # Rewriting this note would replace its invalid bytes.
                 continue
             updated_content, changes = remove_tags(content, {key})
             if not changes:
@@ -3897,8 +3944,12 @@ def command_tag_rename(args) -> dict:
                 continue
             try:
                 previous_raw = path.read_bytes()
-                content = previous_raw.decode("utf-8", errors="replace")
             except OSError:
+                continue
+            try:
+                content = previous_raw.decode("utf-8")
+            except UnicodeDecodeError:
+                # Rewriting this note would replace its invalid bytes.
                 continue
             # `merged` is true when the destination tag already existed
             # anywhere, because then the rename merges two tags into one.
