@@ -2855,6 +2855,12 @@ TextArea {
       if ((event.modifiers & Qt.ShiftModifier) !== 0) root.redoFormat()
       else root.undoFormat()
       event.accepted = true
+    } else if (control && event.key === Qt.Key_Y) {
+      // The native redo would replay the TextArea's own stack and drop the
+      // redo groups a formatting action cancelled. Route it through redoFormat,
+      // which falls back to root.redo() when no format group is pending.
+      root.redoFormat()
+      event.accepted = true
     } else if (control && event.key === Qt.Key_V) {
       // Ctrl+V (and Ctrl+Shift+V) always goes through the image helper first;
       // accepting the event immediately prevents a double text paste.
