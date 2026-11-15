@@ -90,7 +90,14 @@ class Joplin:
         query = dict(params or {})
         query["token"] = self.token
         return f"{self.base}{path}?{urllib.parse.urlencode(query)}"
-    def request(self, method, path, params=None, body=None):
+    def request(self, method, path, params=None, body=None, verify=None):
+        """One API call, retried once on 5xx or a dropped connection.
+
+        ``verify`` makes a create idempotent: a POST whose response is lost may
+        still have been applied, so before retrying (or giving up) the callable
+        is asked whether the object now exists. Returning it adopts the first
+        attempt's result instead of creating a duplicate.
+        """
         payload = json.dumps(body).encode("utf-8") if body is not None else None
         for attempt in (1, 2):   # retry once on 5xx / connection reset
             req = urllib.request.Request(
@@ -102,11 +109,20 @@ class Joplin:
                     return json.loads(raw) if raw else {}
             except urllib.error.HTTPError as exc:
                 text = exc.read().decode("utf-8", "replace")[:300]
-                if exc.code >= 500 and attempt == 1:
-                    time.sleep(0.5); continue
+                if exc.code >= 500:
+                    if verify is not None:
+                        recovered = verify()
+                        if recovered is not None:
+                            return recovered
+                    if attempt == 1:
+                        time.sleep(0.5); continue
                 raise JoplinError(
                     f"HTTP {exc.code} on {method} {path}: {text}", exc.code) from exc
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                if verify is not None:
+                    recovered = verify()
+                    if recovered is not None:
+                        return recovered
                 if attempt == 1:
                     time.sleep(0.5); continue
                 raise JoplinError(f"{method} {path}: {exc}") from exc
@@ -505,6 +521,14 @@ class Syncer:
         for folder in self.api.get_all("/folders", {"fields": "id,title,parent_id"}):
             key = (folder.get("parent_id") or "", folder.get("title") or "")
             self.folder_index.setdefault(key, folder["id"])
+    def folder_verify(self, key):
+        """Look the notebook up again after a lost POST /folders response."""
+        def verify():
+            self.folder_index = {}
+            self.load_folder_index()
+            found = self.folder_index.get(key)
+            return {"id": found} if found else None
+        return verify
     def ensure_root(self):
         title = self.cfg["notebook"].strip()
         folder_id = self.folder_index.get(("", title))
@@ -513,7 +537,8 @@ class Syncer:
                 folder_id = "dry-run-root"
             else:
                 folder_id = self.api.request(
-                    "POST", "/folders", body={"title": title})["id"]
+                    "POST", "/folders", body={"title": title},
+                    verify=self.folder_verify(("", title)))["id"]
                 self.folder_index[("", title)] = folder_id
                 self.reporter.detail(f"notebook created: {title}")
         self.dirty = self.dirty or self.folders.get("") != folder_id
@@ -534,7 +559,8 @@ class Syncer:
                     folder_id = f"dry-run-folder-{key}"
                 else:
                     folder_id = self.api.request("POST", "/folders", body={
-                        "title": part, "parent_id": parent})["id"]
+                        "title": part, "parent_id": parent},
+                        verify=self.folder_verify((parent, part)))["id"]
                     self.folder_index[(parent, part)] = folder_id
                     self.reporter.detail(f"notebook created: {key}")
                 self.dirty = True
@@ -680,7 +706,8 @@ class Syncer:
         if self.dry_run: return
         result = self.api.request("POST", "/notes", body={
             "title": title, "body": body, "parent_id": parent_id,
-            "source_url": SOURCE_PREFIX + rel})
+            "source_url": SOURCE_PREFIX + rel},
+            verify=lambda: self.find_by_source_url(rel))
         if not result.get("id"):
             raise JoplinError(f"POST /notes returned no id for {rel}")
         self.notes[rel] = {"id": result["id"], "hash": digest, "title": title,
