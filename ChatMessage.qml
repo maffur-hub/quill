@@ -297,6 +297,10 @@ Item {
                 loops: Animation.Infinite
                 NumberAnimation { to: 0.35; duration: 550 }
                 NumberAnimation { to: 1; duration: 550 }
+                // Stopping an infinite loop leaves the property wherever the
+                // last frame put it, so a tool that finished mid-fade kept a
+                // half-transparent dot. Settle back to solid.
+                onStopped: statusDot.opacity = 1
               }
             }
 
