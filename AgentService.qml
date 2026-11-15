@@ -497,12 +497,14 @@ Item {
   }
 
   // Self-heal: ChatDock only calls start() when it becomes visible, so a child
-  // that died while the dock stayed open would otherwise stay dead.
+  // that died while the dock stayed open would otherwise stay dead. It only
+  // needs to tick while there is something to heal, so a closed dock or a
+  // healthy bridge leaves the module idle.
   Timer {
     id: supervisor
     interval: 3000
     repeat: true
-    running: true
+    running: root.wanted && (!root.ready || !process.running)
     onTriggered: {
       if (!root.wanted) return
       if (root.ready) return
