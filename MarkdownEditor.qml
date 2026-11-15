@@ -790,6 +790,29 @@ TextArea {
   // native undo land on the state this group recorded?". Each group also keeps
   // the before/after snapshots purely as a content-safety fallback for cases
   // where Qt merges or trims native commands.
+  //
+  // Both the group count and the snapshots need a ceiling: a group holds two
+  // whole documents for a note that may be a megabyte long, and a toolbar-heavy
+  // session would keep every one of them for as long as the note is open.
+  // Groups older than the snapshot window keep their hashes and step counts so
+  // undo still works; they just lose the last-resort content restore.
+  readonly property int formatHistoryLimit: 40
+  readonly property int formatSnapshotLimit: 10
+
+  function trimFormatHistory(groups) {
+    var output = (groups || []).slice()
+    if (output.length > root.formatHistoryLimit) {
+      output = output.slice(output.length - root.formatHistoryLimit)
+    }
+    var cold = output.length - root.formatSnapshotLimit
+    for (var i = 0; i < cold; i++) {
+      var group = output[i]
+      if (group.beforeText === undefined) continue
+      // Copy rather than mutate: the redo stack may hold the same object.
+      output[i] = Object.assign({}, group, { beforeText: undefined, afterText: undefined })
+    }
+    return output
+  }
   function formatTextHash(value) {
     var source = String(value === undefined || value === null ? "" : value)
     var hash = 5381
@@ -834,7 +857,7 @@ TextArea {
     }
     var undo = (root.formatUndoGroups || []).slice()
     undo.push(group)
-    root.formatUndoGroups = undo
+    root.formatUndoGroups = root.trimFormatHistory(undo)
     root.formatRedoGroups = []
     return true
   }
