@@ -32,9 +32,21 @@ STORE = os.environ.get("QUILL_STORE_PATH") or os.path.join(
 )
 
 
-LOG_PATH = os.path.join(
-    os.path.expanduser("~"), ".local", "state", "quill", "paste.log"
-)
+def log_path() -> str:
+    """Diagnostics follow the root in use.
+
+    A probe or test that sets QUILL_DATA_DIR must not append to the live log,
+    and XDG_STATE_HOME is the standard place for state outside the data root.
+    """
+    data_root = os.environ.get("QUILL_DATA_DIR")
+    if data_root:
+        return os.path.join(data_root, "state", "paste.log")
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(
+        os.path.expanduser("~"), ".local", "state")
+    return os.path.join(base, "quill", "paste.log")
+
+
+LOG_PATH = log_path()
 
 
 def log(event: dict) -> None:
