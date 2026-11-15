@@ -3842,7 +3842,9 @@ Item {
 
   function emptyTrash() {
     if (trashCount === 0) return
-    if (!deleteArmed) {
+    // An armed note delete must not stand in for the confirmation here, or
+    // clicking Empty trash within the arm window wipes the lot.
+    if (!deleteArmed || deleteArmId !== "@trash") {
       deleteArmed = true
       deleteArmId = "@trash"
       armTimer.restart()
