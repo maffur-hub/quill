@@ -3490,7 +3490,7 @@ Item {
       args: root.bulkArgs("pin", list, ["--state", state]),
       silent: true,
       onSuccess: function(result) {
-        var count = Number(result.count || list.length)
+        var count = result.updated !== undefined ? Number(result.updated) : list.length
         root.statusText = result.pinned
           ? (count === 1 ? "Pinned" : "Pinned " + count + " notes")
           : (count === 1 ? "Unpinned" : "Unpinned " + count + " notes")
