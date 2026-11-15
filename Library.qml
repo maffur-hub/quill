@@ -757,6 +757,11 @@ Item {
     PopupAnchor.anchor(popup, Overlay.overlay)
   }
 
+  function openShortcuts() {
+    root.anchorPopup(shortcutsPopup)
+    shortcutsPopup.openSheet()
+  }
+
   function openQuickSwitcher() {
     // Open at once with whatever is cached; a cold cache shows the switcher's
     // loading state while the first title list arrives.
@@ -4705,6 +4710,19 @@ Item {
       && !quickSwitcher.opened
     onActivated: root.focusSearch()
   }
+  // "?" has to stay out of the way of typing: the editor keeps it, so the
+  // sheet only answers when no text field has focus. F1 works anywhere.
+  Shortcut {
+    sequence: "?"
+    enabled: root.active && !root.editorActive && !root.searchActive && !root.chatInputActive
+      && !quickSwitcher.opened && !shortcutsPopup.opened
+    onActivated: root.openShortcuts()
+  }
+  Shortcut {
+    sequence: "F1"
+    enabled: root.active && !shortcutsPopup.opened
+    onActivated: root.openShortcuts()
+  }
   Shortcut { sequence: "Ctrl+P"; enabled: root.active; onActivated: root.openQuickSwitcher() }
   Shortcut { sequence: "Ctrl+Shift+P"; enabled: root.active; onActivated: root.togglePin() }
   Shortcut { sequence: "Ctrl+Shift+T"; enabled: root.active; onActivated: root.openBulkTagPrompt("add") }
@@ -6689,6 +6707,10 @@ Item {
   // Restoring is only offered while the open buffer is clean: the store
   // snapshots the current note first, so any unsaved text would be captured
   // as the "before restore" entry instead of being written.
+  Shortcuts {
+    id: shortcutsPopup
+  }
+
   VersionHistory {
     id: versionHistory
     storePath: root.storePath

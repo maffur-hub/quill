@@ -184,6 +184,7 @@ destination wins and the older file is left where it is.
 | `Shift+F10`, `Menu` | Note actions menu for the selected note |
 | `Ctrl+1` / `Ctrl+2` / `Ctrl+3` | Focus sidebar / list / editor |
 | `Esc` | Clear search, then close |
+| `?` or `F1` | Keyboard cheat sheet |
 | `Tab` / `Shift+Tab` | Insert two spaces, or indent / outdent the selected lines |
 | `Ctrl+V` / `Ctrl+Shift+V` | Paste text, or store a clipboard image and insert it |
 | `Ctrl+C` | Copy selected preview text (when the preview has focus) |
