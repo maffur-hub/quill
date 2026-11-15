@@ -116,8 +116,11 @@ Item {
   // Text written by a save that a reload superseded. The file watcher sees
   // that write land and must not adopt it back into the buffer.
   property string staleWriteText: ""
-  readonly property string watchPath: (root.selectedNote && root.loaded
-    && !root.tooLarge && !root.loadingNote)
+  // A read-only note is watched too: it has no buffer to conflict with, but
+  // the reader must still learn that the file changed (and that it may have
+  // shrunk back under the size limit).
+  readonly property string watchPath: (root.selectedNote
+    && (root.loaded || root.tooLarge) && !root.loadingNote)
     ? root.notePath(root.selectedNote) : ""
 
   // Crash-draft recovery. While a differing adjacent draft exists, the stored
@@ -1516,9 +1519,20 @@ Item {
     id: noteWatch
     path: root.watchPath
     watchChanges: true
+    // A note over the size limit is followed for changes but never read: only
+    // the notification matters, and its bytes would only be thrown away.
+    blockAllReads: root.tooLarge
     printErrors: false
-    onFileChanged: reload()
-    onLoaded: root.handleExternalContent(String(text()))
+    onFileChanged: {
+      if (root.tooLarge) {
+        root.largeNoteChanged()
+        return
+      }
+      reload()
+    }
+    onLoaded: {
+      if (!root.tooLarge) root.handleExternalContent(String(text()))
+    }
   }
 
   // One-shot export writer. Used for the Markdown destination and for the
@@ -1890,6 +1904,19 @@ Item {
     if (!path) return
     Quickshell.execDetached(["omarchy-launch-editor", path])
     root.statusText = "Opened in external editor"
+  }
+
+  // A note that is too large to edit is still watched. There is no buffer to
+  // conflict with, so the change is simply adopted: re-read the file through
+  // the store (which refuses to hand over an oversized body) so the size, the
+  // read-only banner and a note that has shrunk under the limit all update.
+  function largeNoteChanged() {
+    if (root.selectedId === "" || root.loadingNote) return
+    root.statusText = "Note changed on disk"
+    // loadNote() reads through the store, which refuses to hand over an
+    // oversized body, so this refreshes the size verdict and adopts the note
+    // once the file is editable again.
+    root.loadNote()
   }
 
   // A watched FileView tells us the file changed, but not what it now says.

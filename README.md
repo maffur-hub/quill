@@ -1313,9 +1313,9 @@ benchmark to time the same commands over one persistent connection.
 - Only the note currently open in the library or a detached window is watched.
   Notes that are not open are picked up by the normal index refresh (open, save,
   or a note action) rather than a filesystem watcher.
-- Too-large notes are not watched while Quill shows them read-only; editing one
-  externally requires closing and reopening it (or another refresh) to see the
-  change.
+- A note over the size limit opens read-only, but it is still watched: when the
+  file changes Quill re-reads its size and adopts the note as soon as it is
+  small enough to edit again.
 - The desktop window and the detached note window are normal toplevels;
   Hyprland may tile them unless you add a float rule for `class:org.quickshell`.
 - `folder delete --force` moves `.md` notes to the root and deletes other file
