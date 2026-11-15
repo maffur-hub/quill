@@ -175,7 +175,7 @@ Draft writes never wake the Joplin sync. Only the normal note save does.
 | `Shift+F10`, `Menu` | Note actions menu for the selected note |
 | `Ctrl+1` / `Ctrl+2` / `Ctrl+3` | Focus sidebar / list / editor |
 | `Esc` | Clear search, then close |
-| `Tab` | Insert two spaces |
+| `Tab` / `Shift+Tab` | Insert two spaces, or indent / outdent the selected lines |
 | `Ctrl+V` / `Ctrl+Shift+V` | Paste text, or store a clipboard image and insert it |
 | `Ctrl+C` | Copy selected preview text (when the preview has focus) |
 

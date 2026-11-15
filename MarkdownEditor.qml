@@ -2831,8 +2831,17 @@ TextArea {
     var command = control
       && (event.modifiers & Qt.AltModifier) === 0
       && (event.modifiers & Qt.GroupSwitchModifier) === 0
-    if (event.key === Qt.Key_Tab && !(event.modifiers & Qt.ShiftModifier)) {
-      insert(cursorPosition, "  ")
+    if (event.key === Qt.Key_Tab) {
+      var shift = (event.modifiers & Qt.ShiftModifier) !== 0
+      if (shift) {
+        // With nothing selected Shift+Tab still walks back out of the editor.
+        if (root.selectionStart === root.selectionEnd) return
+        root.outdentSelection()
+      } else if (root.selectionStart !== root.selectionEnd) {
+        root.indentSelection()
+      } else {
+        insert(cursorPosition, "  ")
+      }
       event.accepted = true
     } else if (command && event.key === Qt.Key_B) {
       root.applyFormat("bold")
@@ -2875,6 +2884,84 @@ TextArea {
       if (root.readOnly || root.pastingImage) return
       root.beginImagePaste()
     }
+  }
+
+  // The lines a selection touches. A selection that stops right after a
+  // newline does not reach into the line below it.
+  function selectedLineRange() {
+    var text = root.text
+    var start = Math.min(root.selectionStart, root.selectionEnd)
+    var end = Math.max(root.selectionStart, root.selectionEnd)
+    if (end > start && text.charAt(end - 1) === "\n") end -= 1
+    var first = text.lastIndexOf("\n", start - 1) + 1
+    var last = text.lastIndexOf("\n", end - 1) + 1
+    return { first: first, last: Math.max(first, last) }
+  }
+
+  function indentSelection() {
+    var text = root.text
+    var range = root.selectedLineRange()
+    var starts = []
+    var lineStart = range.first
+    while (true) {
+      starts.push(lineStart)
+      var next = text.indexOf("\n", lineStart)
+      if (next < 0 || next + 1 > range.last) break
+      lineStart = next + 1
+    }
+    var edits = []
+    for (var i = 0; i < starts.length; i++) {
+      edits.push({ start: starts[i], end: starts[i], text: "  " })
+    }
+    var shift = function(position) {
+      var added = 0
+      for (var j = 0; j < starts.length; j++) {
+        if (starts[j] <= position) added += 2
+      }
+      return added
+    }
+    var start = root.selectionStart
+    var end = root.selectionEnd
+    var cursor = root.cursorPosition
+    root.applyFormatEdits(edits, start, end, cursor,
+      start + shift(start), end + shift(end), cursor + shift(cursor))
+  }
+
+  function outdentSelection() {
+    var text = root.text
+    var range = root.selectedLineRange()
+    var edits = []
+    var removals = []
+    var lineStart = range.first
+    while (true) {
+      var width = 0
+      if (text.charAt(lineStart) === " ") width = 1
+      if (width === 1 && text.charAt(lineStart + 1) === " ") width = 2
+      if (width === 0 && text.charAt(lineStart) === "\t") width = 1
+      if (width > 0) {
+        edits.push({ start: lineStart, end: lineStart + width, text: "" })
+        removals.push({ start: lineStart, width: width })
+      }
+      var next = text.indexOf("\n", lineStart)
+      if (next < 0 || next + 1 > range.last) break
+      lineStart = next + 1
+    }
+    if (edits.length === 0) return
+    var shift = function(position) {
+      var removed = 0
+      for (var j = 0; j < removals.length; j++) {
+        var start = removals[j].start
+        var width = removals[j].width
+        if (position >= start + width) removed += width
+        else if (position > start) removed += position - start
+      }
+      return removed
+    }
+    var start = root.selectionStart
+    var end = root.selectionEnd
+    var cursor = root.cursorPosition
+    root.applyFormatEdits(edits, start, end, cursor,
+      start - shift(start), end - shift(end), cursor - shift(cursor))
   }
 
   // Right-click moves the caret to the click, except inside a non-empty
