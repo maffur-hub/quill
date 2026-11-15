@@ -2819,49 +2819,56 @@ TextArea {
     // arrives before Keys.onPressed. Accept it here to turn paste into a normal
     // key press that we can intercept.
     var control = (event.modifiers & Qt.ControlModifier) !== 0
+      && (event.modifiers & Qt.AltModifier) === 0
+      && (event.modifiers & Qt.GroupSwitchModifier) === 0
     if (control && (event.key === Qt.Key_V || event.key === Qt.Key_Z)) event.accepted = true
   }
 
   Keys.onPressed: function(event) {
     var control = (event.modifiers & Qt.ControlModifier) !== 0
+    // AltGr reaches Qt as Ctrl+Alt (or Ctrl+GroupSwitch) on most European
+    // layouts, so a shortcut must not swallow a character it is meant to type.
+    var command = control
+      && (event.modifiers & Qt.AltModifier) === 0
+      && (event.modifiers & Qt.GroupSwitchModifier) === 0
     if (event.key === Qt.Key_Tab && !(event.modifiers & Qt.ShiftModifier)) {
       insert(cursorPosition, "  ")
       event.accepted = true
-    } else if (control && event.key === Qt.Key_B) {
+    } else if (command && event.key === Qt.Key_B) {
       root.applyFormat("bold")
       event.accepted = true
-    } else if (control && event.key === Qt.Key_I) {
+    } else if (command && event.key === Qt.Key_I) {
       root.applyFormat("italic")
       event.accepted = true
-    } else if (control && event.key === Qt.Key_U) {
+    } else if (command && event.key === Qt.Key_U) {
       root.applyFormat("underline")
       event.accepted = true
-    } else if (control && event.key === Qt.Key_X
+    } else if (command && event.key === Qt.Key_X
       && (event.modifiers & Qt.ShiftModifier) !== 0) {
       root.applyFormat("strike")
       event.accepted = true
-    } else if (control && event.key === Qt.Key_H
+    } else if (command && event.key === Qt.Key_H
       && (event.modifiers & Qt.ShiftModifier) !== 0) {
       root.applyFormat("highlight")
       event.accepted = true
-    } else if (control && event.key === Qt.Key_K
+    } else if (command && event.key === Qt.Key_K
       && (event.modifiers & Qt.ShiftModifier) !== 0) {
       root.noteLinkRequested()
       event.accepted = true
-    } else if (control && event.key === Qt.Key_K) {
+    } else if (command && event.key === Qt.Key_K) {
       root.linkRequested()
       event.accepted = true
-    } else if (control && event.key === Qt.Key_Z) {
+    } else if (command && event.key === Qt.Key_Z) {
       if ((event.modifiers & Qt.ShiftModifier) !== 0) root.redoFormat()
       else root.undoFormat()
       event.accepted = true
-    } else if (control && event.key === Qt.Key_Y) {
+    } else if (command && event.key === Qt.Key_Y) {
       // The native redo would replay the TextArea's own stack and drop the
       // redo groups a formatting action cancelled. Route it through redoFormat,
       // which falls back to root.redo() when no format group is pending.
       root.redoFormat()
       event.accepted = true
-    } else if (control && event.key === Qt.Key_V) {
+    } else if (command && event.key === Qt.Key_V) {
       // Ctrl+V (and Ctrl+Shift+V) always goes through the image helper first;
       // accepting the event immediately prevents a double text paste.
       event.accepted = true
