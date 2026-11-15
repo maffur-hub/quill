@@ -13,6 +13,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -20,6 +21,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 STORE = ROOT / "scripts" / "quill-store"
+BRIDGE = ROOT / "scripts" / "quill-daemon"
 
 
 class DaemonTestCase(unittest.TestCase):
@@ -229,6 +231,56 @@ class ServeGuardTest(unittest.TestCase):
             payload = json.loads(completed.stderr.decode("utf-8").strip())
             self.assertIn("refuses to serve the real Quill data root", payload["error"])
             self.assertFalse(socket_path.exists())
+
+
+class BridgeEofTest(unittest.TestCase):
+    """The stdio bridge must not drop a reply that is still in flight."""
+
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory(prefix="quill-bridge-test-")
+        self.folder = Path(self._temp.name)
+        self.socket_path = self.folder / "stub.sock"
+        self.env = dict(os.environ)
+        self.env["QUILL_DATA_DIR"] = str(self.folder / "quill")
+        self.env["QUILL_E2E"] = "1"
+        self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.server.bind(str(self.socket_path))
+        self.server.listen(4)
+        self.delay = 2.0
+
+    def tearDown(self):
+        self.server.close()
+        self._temp.cleanup()
+
+    def serve(self):
+        try:
+            probe, _ = self.server.accept()  # ensure_server's readiness probe
+            probe.close()
+            connection, _ = self.server.accept()
+            with connection:
+                for line in connection.makefile("rb"):
+                    request = json.loads(line.decode("utf-8"))
+                    time.sleep(self.delay)
+                    connection.sendall(
+                        json.dumps({"ok": True, "args": request["args"]}).encode("utf-8")
+                        + b"\n")
+        except OSError:
+            pass
+
+    def test_a_slow_reply_reaches_a_caller_that_closed_stdin(self):
+        thread = threading.Thread(target=self.serve, daemon=True)
+        thread.start()
+        process = subprocess.run(
+            [sys.executable, str(BRIDGE), "--socket", str(self.socket_path)],
+            input=b'{"args": ["read", "a.md"]}\n',
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=self.env,
+            timeout=30,
+        )
+        self.assertEqual(process.returncode, 0, process.stderr.decode("utf-8", "replace"))
+        replies = [json.loads(line) for line in process.stdout.decode("utf-8").splitlines()]
+        self.assertEqual([reply.get("args") for reply in replies], [["read", "a.md"]])
 
 
 if __name__ == "__main__":

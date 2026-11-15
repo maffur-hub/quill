@@ -35,7 +35,13 @@ STORE = ROOT / "scripts" / "quill-store"
 START_TIMEOUT = 8.0
 POLL_INTERVAL = 0.05
 LOG_LIMIT = 1024 * 1024
+# After a reply is read the socket is shut down; CLOSE_GRACE lets the daemon
+# finish writing anything that shared the last packet.
 CLOSE_GRACE = 1.0
+# A caller that closes stdin still gets the replies to what it sent. Without
+# this the bridge closed the socket one second later and a slow command (a
+# reindex, a big search) answered into a closed connection.
+REPLY_GRACE = 30.0
 
 
 def load_store():
@@ -168,10 +174,29 @@ def bridge(store, path: Path, watch: bool) -> int:
     ensure_server(store, path, watch)
     client = connect(path)
 
+    counters = {"sent": 0, "replied": 0}
+    counter_lock = threading.Lock()
+
+    def outstanding() -> int:
+        with counter_lock:
+            return counters["sent"] - counters["replied"]
+
+    def is_reply(line: bytes) -> bool:
+        # Broadcasts (watch events) are not answers to anything we sent.
+        try:
+            value = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return False
+        return isinstance(value, dict) and not (
+            "event" in value and "ok" not in value)
+
     def pump() -> None:
         try:
             reader = client.makefile("rb")
             for line in reader:
+                if is_reply(line):
+                    with counter_lock:
+                        counters["replied"] += 1
                 sys.stdout.buffer.write(line)
                 sys.stdout.buffer.flush()
         except (OSError, ValueError):
@@ -202,6 +227,14 @@ def bridge(store, path: Path, watch: bool) -> int:
         except OSError as error:
             print(f"quill-daemon: cannot reach the daemon: {error}", file=sys.stderr)
             return 1
+        with counter_lock:
+            counters["sent"] += 1
+
+    # Stdin closed, but the daemon still owes replies for what was sent. Give
+    # it time to answer instead of dropping the tail of a one-shot run.
+    deadline = time.monotonic() + REPLY_GRACE
+    while outstanding() > 0 and time.monotonic() < deadline:
+        time.sleep(POLL_INTERVAL)
 
     time.sleep(CLOSE_GRACE)
     with contextlib.suppress(OSError):
