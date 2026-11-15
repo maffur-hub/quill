@@ -99,6 +99,12 @@ Item {
   // External-editor support. The open note is watched for writes made outside
   // Quill; a clean note reloads silently, a dirty one asks first.
   property bool diskChangePending: false
+  // The disk text the user rejected with "Keep mine". Remembered so the same
+  // notification is not raised again, but never adopted into savedTextById:
+  // that map means "bytes we know are on disk", and a failed save must not
+  // leave a lie there that hides a later real conflict.
+  property string dismissedDiskText: ""
+
   property string diskChangeText: ""
   property bool pendingEditorOpen: false
   property string inFlightSaveText: ""
@@ -1266,6 +1272,7 @@ Item {
     draftNoteId = ""
     diskChangePending = false
     diskChangeText = ""
+    dismissedDiskText = ""
     pendingEditorOpen = false
     inFlightSaveText = ""
     staleWriteText = ""
@@ -1613,6 +1620,10 @@ Item {
         if (noteId === root.selectedId) {
           root.saveState = "Save failed"
           root.dirty = true
+          // Nothing landed, so the disk may still hold the text the user
+          // rejected; let the watcher raise the conflict again.
+          root.dismissedDiskText = ""
+          root.savedTextById[noteId] = undefined
         }
         root.statusText = message
         if (tagSuggestPopup && tagSuggestPopup.applying) tagSuggestPopup.showError(message)
@@ -1658,6 +1669,7 @@ Item {
       return
     }
     root.staleWriteText = ""
+    root.dismissedDiskText = ""
     // A write that did not change the stored bytes is a no-op. Only a real
     // change wakes the Joplin sync, and only after the write succeeded.
     var previousText = root.savedTextById[noteId]
@@ -1862,6 +1874,10 @@ Item {
       }
       return
     }
+    if (root.dismissedDiskText !== "" && value === root.dismissedDiskText) {
+      // The user already chose their version over exactly this disk text.
+      return
+    }
     if (root.staleWriteText !== "" && value === root.staleWriteText) {
       // A save that the reload already superseded landed late. The buffer was
       // rewritten after it, so this text is not news.
@@ -1895,6 +1911,7 @@ Item {
     editor.resetFormatHistory()
     editor.cursorPosition = Math.min(caret, value.length)
     root.suppressDirty = false
+    root.dismissedDiskText = ""
     // The buffer now holds the disk text: a save that was in flight when the
     // reload started must not be adopted as this buffer's saved state.
     root.writeGeneration += 1
@@ -2074,8 +2091,9 @@ Item {
     var diskText = root.diskChangeText
     root.diskChangePending = false
     root.diskChangeText = ""
-    // Remember what is on disk so the watcher does not re-raise the conflict.
-    if (id !== "") root.savedTextById[id] = diskText
+    // Remember the rejected text so the watcher does not re-raise the same
+    // conflict. A failed save clears it again (see the save error paths).
+    if (id !== "") root.dismissedDiskText = diskText
     root.statusText = "Keeping your version"
     if (root.dirty) saveTimer.restart()
   }
