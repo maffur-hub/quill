@@ -42,6 +42,10 @@ const BROWSER_NAMES = [
   "microsoft-edge"
 ]
 const PDF_MAGIC = "%PDF-"
+// A complete PDF ends with a %%EOF marker; a truncated file still starts with
+// the magic bytes, so the header alone is not enough.
+const PDF_TRAILER = "%%EOF"
+const PDF_TRAILER_WINDOW = 1024
 const MIN_PDF_BYTES = 512
 const MAX_OUTPUT_BYTES = 8 * 1024 * 1024
 const PRINT_TIMEOUT_MS = 120000
@@ -280,6 +284,13 @@ function validatePdf(file) {
     const read = fs.readSync(handle, header, 0, PDF_MAGIC.length, 0)
     if (read < PDF_MAGIC.length || header.toString("latin1") !== PDF_MAGIC) {
       return "the browser wrote a file that is not a PDF"
+    }
+    const tailLength = Math.min(stat.size, PDF_TRAILER_WINDOW)
+    const tail = Buffer.alloc(tailLength)
+    const tailRead = fs.readSync(handle, tail, 0, tailLength, stat.size - tailLength)
+    if (tailRead < tailLength
+        || tail.toString("latin1", 0, tailRead).indexOf(PDF_TRAILER) < 0) {
+      return "the browser wrote an incomplete PDF (no trailer)"
     }
   } catch (error) {
     return "cannot read the printed PDF"
