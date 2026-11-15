@@ -122,7 +122,15 @@ Item {
 
     if (step === 2) {
       if (growProcess.running) return
-      library.selectNote(test.noteId)
+      // The library selects the first note by itself when it finishes loading,
+      // so the seeded note may already be open (and loaded) before this case
+      // grows it. selectNote is a no-op then and nothing re-reads the file, so
+      // ask for a fresh load instead.
+      if (String(library.selectedId) === noteId) {
+        if (!library.loadingNote) library.loadNote()
+      } else {
+        library.selectNote(test.noteId)
+      }
       step = 3
       return
     }
