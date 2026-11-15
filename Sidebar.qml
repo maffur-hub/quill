@@ -13,10 +13,36 @@ BorderSurface {
   property var notes: []
   property var folders: []
   property var tags: []
+  // The library reassigns `tags` with a fresh array on every refresh, and QML
+  // sees that as a change even when the contents are identical. Tearing down
+  // and rebuilding the tree for that would recreate every row delegate (and
+  // drop hover and keyboard focus), so the tree is only rebuilt when the tag
+  // paths or their counts actually differ.
+  property var tagRows: []
+  property string tagSignature: ""
   property var savedSearches: []
   property string activeSearch: ""
   property string category: "all"
   property int trashCount: 0
+
+  onTagsChanged: root.rebuildTagRows()
+  Component.onCompleted: root.rebuildTagRows()
+
+  function rebuildTagRows() {
+    var list = root.tags || []
+    var parts = []
+    for (var i = 0; i < list.length; i++) {
+      var entry = list[i]
+      var object = entry !== null && typeof entry === "object"
+      var tag = object ? String(entry.tag === undefined ? "" : entry.tag) : String(entry)
+      var count = object && entry.count !== undefined ? String(entry.count) : "1"
+      parts.push(tag + "=" + count)
+    }
+    var signature = parts.join("\u0000")
+    if (signature === root.tagSignature) return
+    root.tagSignature = signature
+    root.tagRows = TagTree.build(list)
+  }
 
   signal categorySelected(string category)
   signal createFolderRequested(string path)
@@ -250,7 +276,7 @@ BorderSurface {
         }
 
         Repeater {
-          model: TagTree.build(root.tags)
+          model: root.tagRows
           delegate: SideRow {
             id: tagRow
             required property var modelData
