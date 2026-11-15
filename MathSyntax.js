@@ -17,6 +17,13 @@
 
 var FENCE_RE = /^\s{0,3}(`{3,}|~{3,})/
 var ITEM_MARK = "\u0001"
+// A price starts with a plain number: $5, $1,200.50. Anything else after the
+// dollar is maths, even when the amount itself is digits.
+var AMOUNT_RE = /^\d[\d,]*(?:\.\d+)?/
+// Operators that make "$2 + 2 = 4$" a formula rather than a price range.
+var MATH_OPERATOR_RE = /[=+\-*/^<>_|\\]/
+// Characters that end a price instead of continuing an expression.
+var AMOUNT_STOP_RE = /[\s,.;:!?)\]}"']/
 
 function textOf(value) {
   return String(value === undefined || value === null ? "" : value)
@@ -247,11 +254,19 @@ function inlineSpans(value) {
 
     var limit = masked.length
     if (next >= "0" && next <= "9") {
-      // Currency guard: $5 and $1,200.50 are prices, not maths. A real
-      // formula that starts with a digit has its closing $ before any space.
-      var space = i + 1
-      while (space < masked.length && !isSpace(masked.charAt(space))) space += 1
-      limit = space
+      // Currency guard: "$5", "$1,200.50" and "$5 a month" are prices, not
+      // maths. A formula may start with digits too ("$2x + 3y = 7$"), so only
+      // refuse the span when the amount is not followed by an expression.
+      var amount = AMOUNT_RE.exec(masked.slice(i + 1))
+      var amountEnd = i + 1 + (amount ? amount[0].length : 1)
+      var afterAmount = masked.charAt(amountEnd)
+      var continues = afterAmount !== "" && !AMOUNT_STOP_RE.test(afterAmount)
+      if (!continues) {
+        var candidate = dollarClose(masked, i, masked.length)
+        if (candidate < 0 || !MATH_OPERATOR_RE.test(masked.slice(amountEnd, candidate))) {
+          limit = amountEnd
+        }
+      }
     }
 
     var close = dollarClose(masked, i, limit)

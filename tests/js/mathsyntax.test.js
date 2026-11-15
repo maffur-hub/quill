@@ -44,6 +44,19 @@ test('currency is not treated as maths', () => {
   deepEqual(syntax.inlineSpans('cost $5 and $6'), [])
 })
 
+test('currency followed by words or a range stays text', () => {
+  deepEqual(syntax.inlineSpans('it costs $5 a month'), [])
+  deepEqual(syntax.inlineSpans('range $5 - $6'), [])
+  deepEqual(syntax.inlineSpans('total $1,200.50 for the lot'), [])
+})
+
+test('a formula that starts with digits may contain spaces', () => {
+  const spans = syntax.inlineSpans('$2x + 3y = 7$')
+  assert.equal(spans.length, 1)
+  assert.equal(spans[0].tex, '2x + 3y = 7')
+  deepEqual(syntax.inlineSpans('$2 + 2 = 4$').map(span => span.tex), ['2 + 2 = 4'])
+})
+
 test('escaped dollars are literal', () => {
   deepEqual(syntax.inlineSpans('\\$x$'), [])
 })
