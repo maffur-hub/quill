@@ -572,10 +572,12 @@ function renderBlocks(lines, resolve, syntax, depth, options) {
       while (i < lines.length) {
         var current = lines[i].match(ITEM_RE)
         if (!current || /^[0-9]/.test(current[1]) !== ordered) break
-        var task = current[2].match(/^\[([ xX])\]\s?(.*)$/)
+        // A box only counts when whitespace or the line end follows it.
+        var task = current[2].match(/^\[([ xX])\](?:\s+(.*))?$/)
         if (task) {
           items.push("<li>" + (task[1].toLowerCase() === "x" ? "☑" : "☐") + " "
-            + renderInline(task[2], resolve, syntax, options) + "</li>")
+            + renderInline(task[2] === undefined ? "" : task[2], resolve, syntax, options)
+            + "</li>")
         } else {
           items.push("<li>" + renderInline(current[2], resolve, syntax, options) + "</li>")
         }

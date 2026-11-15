@@ -4,7 +4,8 @@ const test = require('node:test')
 const assert = require('node:assert/strict')
 const { load, plain } = require('./helpers/load')
 
-const { plan } = load('MarkdownFormat.js')
+const MarkdownFormat = load('MarkdownFormat.js')
+const { plan } = MarkdownFormat
 
 test('bold wraps a selection and keeps the surrounding text', () => {
   const result = plan('hello world', 0, 5, 'bold')
@@ -202,4 +203,12 @@ test('reversed selections are normalised before formatting', () => {
   assert.equal(result.ok, true)
   assert.equal(result.text, '**hello** world')
   assert.deepEqual({ start: result.selectionStart, end: result.selectionEnd }, { start: 2, end: 7 })
+})
+
+test('a box without a following space is not a task', () => {
+  assert.equal(MarkdownFormat.parseTaskLine('- [x]ylophone'), null)
+  assert.deepEqual(plain(MarkdownFormat.parseTaskLine('- [x] done')),
+    { indent: 0, checked: true, content: 'done' })
+  assert.deepEqual(plain(MarkdownFormat.parseTaskLine('- [x]')),
+    { indent: 0, checked: true, content: '' })
 })

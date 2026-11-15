@@ -34,7 +34,9 @@ function clamp(value, low, high) {
 
 function parseTaskLine(line) {
   var value = textOf(line)
-  var match = /^([ \t]*)([-*+])\s+\[([ xX])\]\s?(.*)$/.exec(value)
+  // The box must be followed by whitespace or the end of the line: a word
+  // like "- [x]ylophone" is a bullet, not a task.
+  var match = /^([ \t]*)([-*+])\s+\[([ xX])\](?:[ \t]+(.*))?$/.exec(value)
   if (!match) return null
   var lead = match[1]
   var indent = 0
@@ -44,7 +46,7 @@ function parseTaskLine(line) {
   return {
     indent: indent,
     checked: match[3] === "x" || match[3] === "X",
-    content: match[4]
+    content: match[4] === undefined ? "" : match[4]
   }
 }
 

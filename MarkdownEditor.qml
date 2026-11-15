@@ -735,7 +735,7 @@ TextArea {
         continue
       }
 
-      var task = line.match(/^(\s*[-*+]\s+)(\[[ xX]\])(\s*)/)
+      var task = line.match(/^(\s*[-*+]\s+)(\[[ xX]\])(?=\s|$)(\s*)/)
       if (task) {
         var taskLength = task[1].length + task[2].length + task[3].length
         output.push(preserveSpaces(escapeHtml(task[1]))
