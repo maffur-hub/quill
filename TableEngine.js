@@ -442,8 +442,12 @@ function formatNumber(value) {
   var number = Number(value)
   if (number === 0) number = 0
   if (Math.floor(number) === number && Math.abs(number) < 1e21) return String(number)
-  var output = number.toFixed(6).replace(/0+$/, "").replace(/\.$/, "")
-  return output === "-0" ? "0" : output
+  // A fixed six decimals would turn anything under 1e-6 into "0"; small
+  // magnitudes get more room before falling back to exponential notation.
+  var precision = Math.abs(number) < 1e-6 ? 10 : 6
+  var output = number.toFixed(precision).replace(/0+$/, "").replace(/\.$/, "")
+  if (output === "0" || output === "-0") output = String(number)
+  return output
 }
 
 function makeError(code) {
@@ -916,7 +920,11 @@ function computeTable(model) {
         if (roundNumber === null || digits === null) return makeError("#VALUE!")
         digits = Math.max(-10, Math.min(10, Math.round(digits)))
         var factor = Math.pow(10, digits)
-        return makeNumber(Math.round(roundNumber * factor) / factor)
+        // Spreadsheets round halves away from zero; Math.round only does that
+        // for positive numbers, so -1.5 would round to -1.
+        var negative = roundNumber < 0
+        var magnitude = Math.round(Math.abs(roundNumber) * factor) / factor
+        return makeNumber(negative ? -magnitude : magnitude)
       }
 
       if (name === "ABS") {

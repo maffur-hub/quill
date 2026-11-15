@@ -141,6 +141,18 @@ test('ROUND, ABS and IF return computed values', () => {
   ])
 })
 
+test('ROUND rounds halves away from zero', () => {
+  deepEqual(displays([
+    ['=ROUND(-1.5,0)', '=ROUND(2.5,0)', '=ROUND(-0.05,1)']
+  ]), [['-2', '3', '-0.1']])
+})
+
+test('a value smaller than a millionth is not displayed as zero', () => {
+  deepEqual(displays([
+    ['=0.0000001*1', '=0.00000025*1', '=0.1234567*1']
+  ]), [['0.0000001', '0.00000025', '0.123457']])
+})
+
 test('formula errors surface with Excel-compatible codes', () => {
   const rows = [
     ['=A1', '=1+"x"', '=IF(1,2,3)'],
