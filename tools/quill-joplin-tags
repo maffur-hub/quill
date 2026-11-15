@@ -177,10 +177,15 @@ def extract_inline_tags(text):
 
 
 def note_tags(path: Path):
+    """Tags for one note, or None when it cannot be read.
+
+    An empty list would mean "this note has no tags", which makes the sync
+    detach every tag from its Joplin counterpart. None means "leave it alone".
+    """
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return []
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
     frontmatter, body = split_frontmatter(text)
     return normalize_tags(list(frontmatter_tags(frontmatter)) + list(extract_inline_tags(body)))
 
@@ -243,14 +248,23 @@ class Joplin:
             page += 1
 
 
-def local_tags(notes_dir: Path):
-    """Relative POSIX path -> tags, matching the sync state's note keys."""
+def local_tags(notes_dir: Path, warnings=None):
+    """Relative POSIX path -> tags, matching the sync state's note keys.
+
+    Notes that cannot be read are left out entirely so the caller does not
+    mistake them for notes with no tags.
+    """
     result = {}
     for path in sorted(notes_dir.rglob("*.md")):
         rel = path.relative_to(notes_dir)
         if not path.is_file() or any(part.startswith(".") for part in rel.parts):
             continue
-        result[rel.as_posix()] = note_tags(path)
+        tags = note_tags(path)
+        if tags is None:
+            if warnings is not None:
+                warnings.append(f"cannot read note, tags left alone: {rel.as_posix()}")
+            continue
+        result[rel.as_posix()] = tags
     return result
 
 
@@ -300,7 +314,7 @@ def main(argv=None):
         for tag in api.get_all("/tags", {"fields": "id,title"}):
             tag_ids.setdefault(str(tag.get("title") or "").casefold(), tag["id"])
 
-        for rel, tags in local_tags(notes_dir).items():
+        for rel, tags in local_tags(notes_dir, warnings).items():
             entry = mapping.get(rel)
             note_id = entry.get("id") if isinstance(entry, dict) else None
             if not note_id:
