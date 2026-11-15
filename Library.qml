@@ -8,6 +8,7 @@ import qs.Ui
 import "FileUrls.js" as FileUrls
 import "ImageSizing.js" as ImageSizing
 import "MarkdownFormat.js" as MarkdownFormat
+import "NoteSize.js" as NoteSize
 import "PopupAnchor.js" as PopupAnchor
 import "TableEngine.js" as TableEngine
 import "TagSuggest.js" as TagSuggest
@@ -85,6 +86,11 @@ Item {
   property bool loadingNote: false
   property bool loaded: false
   property bool tooLarge: false
+  // The store's own limit, refreshed from every reply that reports it. The
+  // window checks it itself before it adopts text from a watched file: a note
+  // that grows past the limit on disk must never reach the editor, whose
+  // layout on a multi-megabyte buffer freezes the window for minutes.
+  property int maxNoteBytes: 1048576
   property bool suppressDirty: false
   property bool dirty: false
   property int editVersion: 0
@@ -698,6 +704,7 @@ Item {
       if (!root.searchText) root.statusText = root.totalCount + " notes"
     }
     root.trashCount = Number(result.trashCount || 0)
+    if (Number(result.maxNoteBytes || 0) > 0) root.maxNoteBytes = Number(result.maxNoteBytes)
     if (root.restoreNoteId !== "") {
       var wanted = root.restoreNoteId
       if (!trashed) {
@@ -1386,6 +1393,7 @@ Item {
         root.loadingNote = false
         root.tooLarge = !!result.tooLarge
         root.loaded = !root.tooLarge
+        if (Number(result.maxBytes || 0) > 0) root.maxNoteBytes = Number(result.maxBytes)
         // Any save that was in flight when this buffer arrived is superseded.
         root.writeGeneration += 1
         root.loadedModified = Number(result.modified || 0)
@@ -1906,6 +1914,34 @@ Item {
     root.statusText = "Opened in external editor"
   }
 
+  // Adopt the read-only state a note over the size limit opens in. The watcher
+  // needs this on its own: a file that grows past the limit on disk must never
+  // be read into the editor, because laying that buffer out blocks the window
+  // for minutes. The store's own read reports the same verdict on the next
+  // load, and `loadNote()` from `largeNoteChanged()` picks the note up again
+  // once the file is editable.
+  function adoptOversizedNote() {
+    var id = root.selectedId
+    root.suppressDirty = true
+    editor.text = ""
+    editor.resetFormatHistory()
+    root.suppressDirty = false
+    root.tooLarge = true
+    root.loaded = false
+    root.loadingNote = false
+    root.dirty = false
+    root.editVersion = 0
+    root.diskChangePending = false
+    root.diskChangeText = ""
+    root.previewMarkdown = ""
+    root.previewLineOffset = 0
+    root.invalidatePreview()
+    if (id !== "") root.savedTextById[id] = ""
+    root.saveState = "Read only"
+    root.statusText = "Note is larger than "
+      + Math.ceil(Number(root.maxNoteBytes || 1048576) / 1048576) + " MiB"
+  }
+
   // A note that is too large to edit is still watched. There is no buffer to
   // conflict with, so the change is simply adopted: re-read the file through
   // the store (which refuses to hand over an oversized body) so the size, the
@@ -1926,6 +1962,12 @@ Item {
     if (noteWatch.path !== root.watchPath) return
     if (!root.loaded || root.loadingNote || root.tooLarge
       || root.draftPending || root.selectedId === "") return
+    if (NoteSize.exceeds(value, root.maxNoteBytes)) {
+      // The file grew past the size the store would hand over. Treat it the
+      // way selecting such a note already does, instead of loading it.
+      root.adoptOversizedNote()
+      return
+    }
     if (value === String(editor.text)) {
       // The file already holds what we have. A conflict captured for an older
       // disk state is stale now, so clear it instead of offering a reload that
@@ -1975,6 +2017,12 @@ Item {
     if (!root.loaded || root.loadingNote || root.tooLarge || root.selectedId === "") return
     var id = root.selectedId
     var value = String(content === undefined || content === null ? "" : content)
+    // The same screen as the watcher: a conflict's "load the disk version" must
+    // not be a second way to put an oversized buffer into the editor.
+    if (NoteSize.exceeds(value, root.maxNoteBytes)) {
+      root.adoptOversizedNote()
+      return
+    }
     var caret = editor.cursorPosition
     var scrollY = editorScroll.contentY
     root.suppressDirty = true

@@ -142,6 +142,12 @@ Item {
         !library.loaded, "loaded=" + library.loaded)
       editor = findByName(library, "markdownEditor")
       if (!editor) return fail("the editor is not in the library")
+      // The watcher used to hand this text straight to the editor, which then
+      // spent minutes laying a megabyte of rich text out. The buffer must stay
+      // empty, exactly as it does when a note this large is selected.
+      harness.check("the oversized body never reaches the editor",
+        String(editor.text).length === 0,
+        "editor holds " + String(editor.text).length + " characters")
       test.shrink()
       step = 4
       return

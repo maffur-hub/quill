@@ -85,7 +85,8 @@ AGENTS.md    instructions for the chat agent (it is embedded in Quill)
 New files are `<epoch_ms>-<8 hex>.md`. Bodies are UTF-8 Markdown, written with
 an atomic temp-file + rename. The original newline style (LF or CRLF) is kept
 on every save. Notes over 1 MiB are shown read-only ("too large") rather than
-risking a partial write.
+risking a partial write, and an open note that grows past the limit on disk
+switches to that same read-only state instead of loading the oversized body.
 
 While a note is dirty, Quill also writes a debounced (150 ms) copy to
 `<note path>.draft`, for example `notes/Work/plan.md.draft`. The suffix is
