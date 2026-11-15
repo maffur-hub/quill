@@ -28,6 +28,10 @@ Popup {
   property bool isNew: true
   property bool loading: false
   property bool loadingTemplate: false
+  // The body field is only safe to save when it holds the stored body (or a
+  // deliberately blank one for a new template). A failed read leaves it empty,
+  // so saving then would wipe the template.
+  property bool bodyReady: true
   property bool saving: false
   property bool deleting: false
   property bool deleteArmed: false
@@ -106,6 +110,7 @@ Popup {
     iconField.text = ""
     idField.text = ""
     bodyArea.text = ""
+    root.bodyReady = true
   }
 
   function parseError(errorText, fallback) {
@@ -205,6 +210,7 @@ Popup {
     iconField.text = String(entry.icon || "")
     idField.text = String(entry.id || "")
     bodyArea.text = ""
+    root.bodyReady = false
     root.loadTemplate(String(entry.id || ""))
   }
 
@@ -251,6 +257,7 @@ Popup {
       // Keep the summary fields the list already supplied; only the body is
       // missing. Surfacing the store message is more useful than blanking the
       // form.
+      root.bodyReady = false
       root.errorText = root.parseError(errorText, "Could not read this template")
     } else {
       var result = {}
@@ -267,6 +274,7 @@ Popup {
         iconField.text = String(result.icon || "")
         idField.text = String(result.id || "")
         bodyArea.text = String(result.content || "")
+        root.bodyReady = true
       }
     }
     if (root.pendingShowId !== "") {
@@ -284,6 +292,11 @@ Popup {
       // Saving before the body has arrived would overwrite the template with
       // an empty body.
       root.errorText = "Still loading this template"
+      return
+    }
+    if (!root.isNew && !root.bodyReady) {
+      // The body read failed, so the empty field is not the template body.
+      root.errorText = "Reload this template before saving"
       return
     }
     if (root.storePath === "") {
@@ -404,6 +417,7 @@ Popup {
     if (result.description !== undefined) descriptionField.text = String(result.description || "")
     if (result.icon !== undefined) iconField.text = String(result.icon || "")
     if (result.content !== undefined) bodyArea.text = String(result.content || "")
+    root.bodyReady = true
     root.errorText = ""
     root.statusText = "Saved"
     root.pendingSelectionId = savedId
@@ -832,6 +846,7 @@ Popup {
                 textFormat: TextEdit.PlainText
                 wrapMode: TextArea.Wrap
                 selectByMouse: true
+                readOnly: !root.isNew && !root.bodyReady
                 color: Commons.Color.foreground
                 selectionColor: Style.selectionFillFor(Commons.Color.foreground, Commons.Color.accent)
                 selectedTextColor: Commons.Color.foreground
@@ -928,7 +943,7 @@ Popup {
             text: root.saving ? "Saving…" : "Save"
             active: true
             enabled: !root.saving && !root.deleting && !root.loadingTemplate
-              && root.storePath !== ""
+              && root.storePath !== "" && (root.isNew || root.bodyReady)
             opacity: enabled ? 1 : 0.4
             fontSize: Style.font.bodySmall
             horizontalPadding: Style.space(10)
