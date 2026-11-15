@@ -4862,7 +4862,6 @@ Item {
           Button {
             text: "New note"
             iconText: "+"
-            active: true
             fontSize: Style.font.bodySmall
             horizontalPadding: Style.space(9)
             verticalPadding: Style.space(5)
