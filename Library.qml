@@ -2522,8 +2522,13 @@ Item {
     var previous = priorLines.length >= 2 ? priorLines[priorLines.length - 2] : ""
     if (previous !== undefined && previous.trim() !== "") leading += eol
 
+    // The text that follows already starts a new line, so its own line break
+    // is the blank line after the table. CRLF documents break at "\r\n", and
+    // testing only for "\n" left a second blank line behind the table.
     var trailing = eol
-    if (after.length > 0 && after.charAt(0) !== "\n") trailing += eol
+    var followsLineBreak = after.charAt(0) === "\n"
+      || (after.charAt(0) === "\r" && after.charAt(1) === "\n")
+    if (after.length > 0 && !followsLineBreak) trailing += eol
 
     var block = leading + template.join(eol) + trailing
     var startLine = (before + leading).split("\n").length - 1
