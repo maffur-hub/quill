@@ -62,6 +62,12 @@ test('isMutatingArgs classifies note commands', () => {
   }
 })
 
+test('an unknown command counts as a write', () => {
+  assert.equal(guard.isMutatingArgs(['future-command', 'x']), true)
+  assert.equal(guard.isMutatingArgs(['read', 'x']), false)
+  assert.equal(guard.isMutatingArgs(['versions', 'x']), false)
+})
+
 test('isMutatingArgs treats tag-remove as a state write', () => {
   assert.equal(guard.isMutatingArgs(['tag-remove', 'x', '#a']), true)
   assert.equal(guard.isMutatingArgs(['tag-remove', 'x', '--id', 'y', 'a']), true)

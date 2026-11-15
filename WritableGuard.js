@@ -86,24 +86,20 @@ function isMutatingArgs(args) {
     var templatesAction = stringValue(args[1])
     return templatesAction === "save" || templatesAction === "delete"
   }
-  var mutating = {
-    "write": 1,
-    "create": 1,
-    "duplicate": 1,
-    "rename": 1,
-    "move": 1,
-    "trash": 1,
-    "restore": 1,
-    "delete": 1,
-    "empty-trash": 1,
-    "pin": 1,
-    "tag-add": 1,
-    "tag-remove": 1,
-    "tag-rename": 1,
-    "tag-delete": 1,
-    "import-omanano": 1,
-    "index": 1,
-    "restore-version": 1
+  // Commands that only read. Everything else can write, including a command
+  // this guard has never heard of: failing open would let a new store command
+  // modify the real data root from a harness window.
+  var readOnly = {
+    "list": 1,
+    "read": 1,
+    "search": 1,
+    "titles": 1,
+    "versions": 1,
+    "backlinks": 1,
+    "tags": 1,
+    "stats": 1,
+    "preview": 1,
+    "unresolved": 1
   }
-  return Object.prototype.hasOwnProperty.call(mutating, command)
+  return !Object.prototype.hasOwnProperty.call(readOnly, command)
 }
