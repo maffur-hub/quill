@@ -102,16 +102,23 @@ Item {
     if (!visible) sourceTimer.stop()
   }
 
+  // A window-wide shortcut would take Ctrl+Z away from the note editor while
+  // the grid merely sits beside it in split mode. Only claim the grid's undo
+  // keys when the grid, or one of its cells, is where the keystrokes go.
+  readonly property bool ownsUndoKeys: root.activeFocus
+    || (root.Window.activeFocusItem !== null && root.Window.activeFocusItem !== undefined
+        && String(root.Window.activeFocusItem.objectName) === "tableCellInput")
+
   Shortcut {
     sequence: "Ctrl+Z"
     context: Qt.WindowShortcut
-    enabled: root.visible && root.loadedTable
+    enabled: root.visible && root.loadedTable && root.ownsUndoKeys
     onActivated: root.undo()
   }
   Shortcut {
     sequence: "Ctrl+Shift+Z"
     context: Qt.WindowShortcut
-    enabled: root.visible && root.loadedTable
+    enabled: root.visible && root.loadedTable && root.ownsUndoKeys
     onActivated: root.redo()
   }
 
@@ -683,6 +690,18 @@ Item {
       handleEscape()
       return
     }
+    if (key === Qt.Key_Left || key === Qt.Key_Right) {
+      // Move inside the cell first; only step to the neighbour when the caret
+      // is already at that edge, so multi-word cells stay editable.
+      var cell = cellAt(row, column)
+      var forward = key === Qt.Key_Right
+      var atEdge = !cell || (forward ? cell.cursorAtEnd() : cell.cursorAtStart())
+      if (atEdge) {
+        event.accepted = true
+        moveBy(0, forward ? 1 : -1)
+      }
+      return
+    }
     if (key === Qt.Key_Up) {
       event.accepted = true
       moveBy(-1, 0)
@@ -691,16 +710,6 @@ Item {
     if (key === Qt.Key_Down) {
       event.accepted = true
       moveBy(1, 0)
-      return
-    }
-    if (key === Qt.Key_Left) {
-      event.accepted = true
-      moveBy(0, -1)
-      return
-    }
-    if (key === Qt.Key_Right) {
-      event.accepted = true
-      moveBy(0, 1)
       return
     }
     if (key === Qt.Key_Return || key === Qt.Key_Enter) {
@@ -1309,6 +1318,15 @@ Item {
                     function selectAllCells() { cellInput.selectAll() }
                     function selectionEmpty() { return cellInput.selectedText === "" }
                     function textValue() { return cellInput.text }
+                    // Arrow keys step to the neighbouring cell only from the
+                    // edge of the text, so multi-word cells can be edited.
+                    function cursorAtStart() {
+                      return cellInput.selectedText === "" && cellInput.cursorPosition <= 0
+                    }
+                    function cursorAtEnd() {
+                      return cellInput.selectedText === ""
+                        && cellInput.cursorPosition >= cellInput.text.length
+                    }
 
                     Rectangle {
                       anchors.fill: parent
@@ -1329,6 +1347,7 @@ Item {
 
                     TextInput {
                       id: cellInput
+                      objectName: "tableCellInput"
                       anchors.fill: parent
                       anchors.margins: 1
                       leftPadding: Style.space(6)

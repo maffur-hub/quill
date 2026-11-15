@@ -2435,10 +2435,36 @@ Item {
       return
     }
 
-    var caret = editor.cursorPosition
-    editor.text = nextText
-    editor.resetFormatHistory()
-    editor.cursorPosition = Math.min(caret, nextText.length)
+    // Splice the table in place. Assigning editor.text would drop the native
+    // undo stack, the format history and the selection; a minimal edit keeps
+    // all three and arrives as one undo step.
+    var beforeSelectionStart = editor.selectionStart
+    var beforeSelectionEnd = editor.selectionEnd
+    var beforeCursor = editor.cursorPosition
+    var startOffset = 0
+    for (var a = 0; a < start; a += 1) startOffset += rawLines[a].length + 1
+    var endOffset = startOffset
+    for (var b = 0; b < oldLines.length; b += 1) {
+      endOffset += rawLines[start + b].length
+      if (start + b < rawLines.length - 1) endOffset += 1
+    }
+    var replacementText = replacement.join("\n")
+    if (start + oldLines.length - 1 < rawLines.length - 1) replacementText += "\n"
+    var delta = replacementText.length - (endOffset - startOffset)
+    function shiftOffset(value) {
+      if (value <= startOffset) return value
+      if (value >= endOffset) return value + delta
+      return startOffset + Math.min(value - startOffset, replacementText.length)
+    }
+    var afterSelectionStart = shiftOffset(beforeSelectionStart)
+    var afterSelectionEnd = shiftOffset(beforeSelectionEnd)
+    var afterCursor = shiftOffset(beforeCursor)
+    editor.applyFormatEdits(
+      [{ start: startOffset, end: endOffset, text: replacementText }],
+      beforeSelectionStart, beforeSelectionEnd, beforeCursor,
+      afterSelectionStart, afterSelectionEnd, afterCursor)
+    editor.select(afterSelectionStart, afterSelectionEnd)
+    if (afterSelectionStart === afterSelectionEnd) editor.cursorPosition = afterCursor
     tableEditor.commitSucceeded = true
     tableSavePending = true
     statusText = "Table updated"
