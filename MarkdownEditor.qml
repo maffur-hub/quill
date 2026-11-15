@@ -48,6 +48,15 @@ TextArea {
   property bool pastingImage: false
   property string pasteOutput: ""
   property string pasteError: ""
+  // Which note this buffer is showing: the Library binds the selected id and
+  // the detached window its note id. A paste or attach reports back later, and
+  // if the selection moved while it ran the insertion would land in a note the
+  // user is no longer looking at, so every result is checked against the key
+  // captured when the work started.
+  property string documentKey: ""
+  property string pasteDocument: ""
+  property string attachDocument: ""
+  property string textPasteDocument: ""
 
   // "Attach file…": a themed in-app file browser rather than a portal,
   // zenity or QtQuick.Dialogs. The store copies the chosen file into the data
@@ -1302,6 +1311,7 @@ TextArea {
     root.attachOutput = ""
     root.attachError = ""
     root.attaching = true
+    root.attachDocument = root.documentKey
     root.attachSelected = ""
     attachPicker.close()
     attachProcess.command = [root.storePath, "attachment", "save",
@@ -1330,6 +1340,18 @@ TextArea {
       return
     }
     root.attaching = false
+    // The store has copied the file by now; only the Markdown insertion can
+    // go to the wrong note.
+    if (root.attachDocument !== root.documentKey) {
+      root.attachDocument = ""
+      if (root.drawTempPath !== "") {
+        root.completeDrawInsert(false, "The note changed while attaching")
+      }
+      root.attachFailed("The note changed while attaching — file not inserted")
+      root.dropFinished()
+      return
+    }
+    root.attachDocument = ""
 
     var payload = null
     try {
@@ -1644,6 +1666,7 @@ TextArea {
       return
     }
     // Older Qt builds without TextEdit.paste(); read the text ourselves.
+    root.textPasteDocument = root.documentKey
     textPasteProcess.command = ["wl-paste", "--no-newline"]
     textPasteProcess.running = true
   }
@@ -1652,6 +1675,14 @@ TextArea {
     pasteTimer.stop()
     if (!root.pastingImage) return
     root.pastingImage = false
+    // The selection may have moved while the helper ran. The image is already
+    // in the store, but inserting its Markdown here would edit another note.
+    if (root.pasteDocument !== root.documentKey) {
+      root.pasteDocument = ""
+      root.pasteFailed("The note changed while pasting — nothing was inserted")
+      return
+    }
+    root.pasteDocument = ""
 
     var payload = null
     try {
@@ -1695,6 +1726,7 @@ TextArea {
   function beginImagePaste() {
     if (root.readOnly || root.pastingImage) return
     root.pastingImage = true
+    root.pasteDocument = root.documentKey
     root.pasteOutput = ""
     root.pasteError = ""
     pasteProcess.command = [root.pasteHelperPath]
@@ -1719,7 +1751,13 @@ TextArea {
     id: textPasteProcess
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.insert(root.cursorPosition, String(text || ""))
+      onStreamFinished: {
+        // Reading the clipboard is asynchronous, so the buffer may belong to
+        // another note by now.
+        if (root.textPasteDocument !== root.documentKey) return
+        root.textPasteDocument = ""
+        root.insert(root.cursorPosition, String(text || ""))
+      }
     }
   }
 
@@ -1760,6 +1798,12 @@ TextArea {
       if (!root.pastingImage) return
       root.pastingImage = false
       pasteProcess.running = false
+      if (root.pasteDocument !== root.documentKey) {
+        root.pasteDocument = ""
+        root.pasteFailed("The note changed while pasting — nothing was inserted")
+        return
+      }
+      root.pasteDocument = ""
       root.pasteAsText()
       root.pasteFailed("Image paste timed out")
     }
@@ -1838,6 +1882,7 @@ TextArea {
     onTriggered: {
       if (!root.attaching) return
       root.attaching = false
+      root.attachDocument = ""
       attachProcess.running = false
       var message = "Attaching the file timed out"
       root.attachFailed(message)

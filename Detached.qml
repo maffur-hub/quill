@@ -858,6 +858,7 @@ ShellRoot {
               width: editorScroll.width
               height: Math.max(editorScroll.height, implicitHeight)
               storePath: root.storePath
+              documentKey: String(root.noteId || "")
               enabled: root.loaded && !root.tooLarge && !root.draftPending && !root.noteMissing
               selectByMouse: true
               wrapMode: TextEdit.Wrap

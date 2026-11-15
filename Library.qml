@@ -5203,6 +5203,7 @@ Item {
                 width: editorScroll.width
                 height: Math.max(editorScroll.height, implicitHeight)
                 storePath: root.storePath
+                documentKey: String(root.selectedId || "")
                 enabled: root.loaded && !root.tooLarge && !root.loadingNote
                   && !!root.selectedNote && !root.selectedNote.trashed
                   && !root.draftPending
