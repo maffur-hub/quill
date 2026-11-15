@@ -1925,14 +1925,24 @@ TextArea {
         objectName: "attachFilterField"
         width: parent.width
         height: Style.space(24)
-        text: root.attachFilter
         placeholderText: "Filter…"
         font.pixelSize: Style.font.bodySmall
         leftPadding: Style.space(6)
         rightPadding: Style.space(6)
         topPadding: Style.space(3)
         bottomPadding: Style.space(3)
-        onTextChanged: if (root.attachFilter !== text) root.attachFilter = text
+        onTextEdited: root.attachFilter = text
+      }
+
+      // A binding on the field itself is destroyed by the first keystroke, so
+      // a filter the picker resets (or restores when it reopens) never reached
+      // the field again. Binding keeps following the model without fighting
+      // the user, because the edited text is copied back into it.
+      Binding {
+        target: attachFilterField
+        property: "text"
+        value: root.attachFilter
+        restoreMode: Binding.RestoreNone
       }
 
       Item {
@@ -2019,15 +2029,23 @@ TextArea {
         objectName: "attachPathField"
         width: parent.width
         height: Style.space(24)
-        text: root.attachPath
         placeholderText: "Path to a file or folder…"
         font.pixelSize: Style.font.bodySmall
         leftPadding: Style.space(6)
         rightPadding: Style.space(6)
         topPadding: Style.space(3)
         bottomPadding: Style.space(3)
-        onTextChanged: if (root.attachPath !== text) root.attachPath = text
+        onTextEdited: root.attachPath = text
         onAccepted: root.attachChosenPath()
+      }
+
+      // Walking into a folder sets attachPath from the list; without this the
+      // field kept whatever was typed last.
+      Binding {
+        target: attachPathField
+        property: "text"
+        value: root.attachPath
+        restoreMode: Binding.RestoreNone
       }
 
       Row {
