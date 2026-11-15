@@ -76,3 +76,11 @@ test('clearSize removes brace and Obsidian sizes', () => {
   assert.equal(sizing.clearSize('![alt|320](pic.png)'), '![alt](pic.png)')
   assert.equal(sizing.clearSize('not an image'), null)
 })
+
+test('a pipe in the alt text is not mistaken for an Obsidian width', () => {
+  const parsed = sizing.splitLine('![Chart | 2024](pic.png)')
+  assert.equal(parsed.hasSize, false)
+  assert.equal(parsed.alt, 'Chart | 2024')
+  assert.equal(sizing.setWidth('![Chart | 2024](pic.png)', 320), '![Chart | 2024](pic.png){width=320}')
+  assert.equal(sizing.clearSize('![Chart | 2024](pic.png)'), '![Chart | 2024](pic.png)')
+})

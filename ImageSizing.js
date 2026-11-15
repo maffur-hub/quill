@@ -13,6 +13,10 @@
 // with its default size instead of disappearing.
 
 var IMAGE_LINE = /^(\s*)!\[([^\]]*)\]\((<[^>]+>|[^)\s]+)\)(\s*\{([^{}]*)\})?\s*$/
+// Obsidian's width suffix. The reader and the rewriters must agree on it: a
+// looser pattern turned the "2024" of an alt like "Chart | 2024" into a size
+// and deleted it from the alt text.
+var OBSIDIAN_WIDTH = /\|(\d{1,5})\s*$/
 var MAX_DIMENSION = 20000
 
 function toPositiveInt(value) {
@@ -47,7 +51,7 @@ function splitLine(line) {
 
   // Obsidian writes the width in the alt text: ![alt|320](path). Only the
   // trailing all-digit segment is a size; a normal alt containing "|" is not.
-  var obsidian = altRaw.match(/\|(\d{1,5})\s*$/)
+  var obsidian = altRaw.match(OBSIDIAN_WIDTH)
   var obsidianWidth = obsidian ? toPositiveInt(obsidian[1]) : null
   var alt = obsidian ? altRaw.slice(0, obsidian.index) : altRaw
   if (width === null && obsidianWidth !== null) width = obsidianWidth
@@ -151,7 +155,7 @@ function setWidth(line, width) {
   var body = carriage ? text.slice(0, -1) : text
   var match = body.match(IMAGE_LINE)
   var indent = match[1]
-  var alt = match[2].replace(/\|\s*\d{1,5}\s*$/, "")
+  var alt = match[2].replace(OBSIDIAN_WIDTH, "")
 
   return indent + "![" + alt + "](" + match[3] + "){width=" + bounded + "}" + carriage
 }
@@ -167,7 +171,7 @@ function clearSize(line) {
   var body = carriage ? text.slice(0, -1) : text
   var match = body.match(IMAGE_LINE)
   var indent = match[1]
-  var alt = match[2].replace(/\|\s*\d{1,5}\s*$/, "")
+  var alt = match[2].replace(OBSIDIAN_WIDTH, "")
 
   return indent + "![" + alt + "](" + match[3] + ")" + carriage
 }
