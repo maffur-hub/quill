@@ -49,8 +49,13 @@ INLINE_TAG_RE = re.compile(r"(?<![\w#])#[A-Za-z][\w/-]*")
 
 
 def fail(message):
+    """Report an error as JSON on stdout and exit non-zero.
+
+    The JSON carries the detail the editor shows; the status is for callers
+    that cannot read stdout (a shell, a test, a wrapper script).
+    """
     write_json({"ok": False, "error": str(message)})
-    return 0
+    return 1
 
 
 def write_json(payload):
