@@ -32,6 +32,55 @@ test('bold toggles off when the selection is already wrapped', () => {
   assert.equal(result.text, 'hello world')
 })
 
+test('bold on a caret between two bold runs inserts markers instead of merging them', () => {
+  const result = plan('**a** then **b**', 10, 10, 'bold')
+  assert.equal(result.ok, true)
+  assert.equal(result.text, '**a** then**** **b**')
+  assert.deepEqual({ start: result.selectionStart, end: result.selectionEnd }, { start: 12, end: 12 })
+})
+
+test('bold refuses a selection that spans several bold runs', () => {
+  const result = plan('**a** and **b**', 0, 15, 'bold')
+  assert.equal(result.ok, false)
+})
+
+test('bold on part of a bold run clears the whole run', () => {
+  const result = plan('**foo bar**', 2, 8, 'bold')
+  assert.equal(result.ok, true)
+  assert.equal(result.text, 'foo bar')
+  assert.deepEqual({ start: result.selectionStart, end: result.selectionEnd }, { start: 0, end: 6 })
+})
+
+test('bold on a whole marked run clears it', () => {
+  const result = plan('**foo** bar', 0, 7, 'bold')
+  assert.equal(result.ok, true)
+  assert.equal(result.text, 'foo bar')
+})
+
+test('italic on the content of a triple run leaves the bold layer', () => {
+  const result = plan('***foo***', 3, 6, 'italic')
+  assert.equal(result.ok, true)
+  assert.equal(result.text, '**foo**')
+})
+
+test('italic refuses a selection that spans two italic runs', () => {
+  const result = plan('*a* and *b*', 0, 11, 'italic')
+  assert.equal(result.ok, false)
+})
+
+test('clear formatting keeps the contents of a code span literal', () => {
+  const result = plan('`a*b*c`', 0, 7, 'clear')
+  assert.equal(result.ok, true)
+  assert.equal(result.text, 'a*b*c')
+})
+
+test('clear formatting leaves spaced asterisks alone', () => {
+  const result = plan('2 * 3 * 4', 0, 9, 'clear')
+  assert.equal(result.ok, true)
+  assert.equal(result.text, '2 * 3 * 4')
+  assert.deepEqual(plain(result.edits), [])
+})
+
 test('heading adds an ATX prefix at the requested level', () => {
   const result = plan('hello', 0, 0, 'heading', 2)
   assert.equal(result.ok, true)

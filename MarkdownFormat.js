@@ -600,143 +600,184 @@ function insertWrapped(marked, open, close) {
 // -------------------------------------------------------------- inline marks
 
 var INLINE_MARKS = {
-  bold: { open: "**", close: "**" },
-  italic: { open: "*", close: "*" },
-  underline: { open: "<u>", close: "</u>" },
-  strike: { open: "~~", close: "~~" },
-  code: { open: "`", close: "`" },
-  highlight: { open: "==", close: "==" },
-  superscript: { open: "<sup>", close: "</sup>" },
-  subscript: { open: "<sub>", close: "</sub>" }
+  bold: { open: "**", close: "**", kind: "bold" },
+  italic: { open: "*", close: "*", kind: "italic" },
+  underline: { open: "<u>", close: "</u>", kind: "tag" },
+  strike: { open: "~~", close: "~~", kind: "pair" },
+  code: { open: "`", close: "`", kind: "code" },
+  highlight: { open: "==", close: "==", kind: "pair" },
+  superscript: { open: "<sup>", close: "</sup>", kind: "tag" },
+  subscript: { open: "<sub>", close: "</sub>", kind: "tag" }
 }
 
-function markerEscaped(text, index, marker) {
-  if (isEscaped(text, index)) return true
-  if (marker !== "*") return false
-  // A single * inside ** or *** belongs to the stronger marker.
-  var before = index > 0 ? text.charAt(index - 1) : ""
-  var after = text.charAt(index + 1)
-  return before === "*" || after === "*"
+function isSpaceChar(value) {
+  return value === "" || value === " " || value === "\t" || value === "\n" || value === "\r"
 }
 
-function starRunBefore(text, position) {
-  var count = 0
-  for (var i = position - 1; i >= 0 && text.charAt(i) === "*"; i--) count += 1
-  return count
-}
-
-function starRunAfter(text, position) {
-  var count = 0
-  for (var i = position; i < text.length && text.charAt(i) === "*"; i++) count += 1
-  return count
-}
-
-function starRunAt(text, position) {
+// Bounds of the run of `char` around `position`, so a ** token is never read
+// as a * one and a list bullet is never read as italic.
+function runBounds(text, position, char) {
   var start = position
-  while (start > 0 && text.charAt(start - 1) === "*") start -= 1
+  while (start > 0 && text.charAt(start - 1) === char) start -= 1
   var end = position
-  while (end + 1 < text.length && text.charAt(end + 1) === "*") end += 1
-  return end - start + 1
+  while (end + 1 < text.length && text.charAt(end + 1) === char) end += 1
+  return { start: start, end: end + 1, length: end - start + 1 }
 }
 
-function outsideWrap(text, start, end, open, close) {
-  if (start < open.length || end + close.length > text.length) return null
-  if (text.slice(start - open.length, start) !== open) return null
-  if (text.slice(end, end + close.length) !== close) return null
-  if (open === "*" && close === "*") {
-    // One star is italic, two are bold, three are both. Running italic on a
-    // bold run must add emphasis, while running it inside a triple run must
-    // strip the italic layer.
-    var before = starRunBefore(text, start)
-    var after = starRunAfter(text, end)
-    if (before === 2 || after === 2) return null
-    if (before < 1 || after < 1) return null
-    if (isEscaped(text, start - 1) || isEscaped(text, end)) return null
-  } else {
-    if (markerEscaped(text, start - open.length, open)) return null
-    if (markerEscaped(text, end, close)) return null
-  }
-  return { start: start - open.length, end: end + close.length }
-}
-
-function insideWrap(text, start, end, open, close) {
-  if (end - start < open.length + close.length) return null
-  if (text.slice(start, start + open.length) !== open) return null
-  if (text.slice(end - close.length, end) !== close) return null
-  if (open === "*" && close === "*") {
-    var before = starRunAfter(text, start)
-    var after = starRunBefore(text, end)
-    if (before === 2 || after === 2) return null
-    if (before < 1 || after < 1) return null
-    if (isEscaped(text, start) || isEscaped(text, end - 1)) return null
-  } else {
-    if (markerEscaped(text, start, open)) return null
-    if (markerEscaped(text, end - close.length, close)) return null
-  }
-  return true
-}
-
-function wrapAroundCaret(text, position, open, close) {
-  var lineStart = lineStartAt(text, position)
-  var lineEnd = lineEndAt(text, position)
-  var openAt = text.lastIndexOf(open, position - 1)
-  var italic = open === "*" && close === "*"
-  while (openAt >= lineStart) {
-    if (italic) {
-      // A run of two stars is bold and must not be consumed as italic. A run
-      // of three is bold+italic; consume one star from the italic layer.
-      var openRun = starRunAt(text, openAt)
-      if (openRun === 2) break
-      if (openAt + open.length <= position && !isEscaped(text, openAt)) {
-        var closeAtItalic = text.indexOf(close, position)
-        if (closeAtItalic >= position && closeAtItalic + close.length <= lineEnd
-          && starRunAt(text, closeAtItalic) !== 2 && !isEscaped(text, closeAtItalic)
-          && openAt + open.length <= closeAtItalic) {
-          return { openAt: openAt, closeAt: closeAtItalic }
+// Matched markers on the lines that hold [from, to). Symmetric marks alternate
+// opener and closer, which is how CommonMark resolves runs of one marker; the
+// underline and sup/sub tags use a stack so nesting stays balanced. Runs that
+// belong to a stronger marker are skipped, so a caret between two bold words
+// is not mistaken for a caret inside one.
+function inlinePairs(text, mark, from, to) {
+  var pairs = []
+  if (mark.kind === "tag") {
+    var stack = []
+    var index = from
+    while (index < to) {
+      if (text.substr(index, mark.open.length) === mark.open && !isEscaped(text, index)) {
+        stack.push(index)
+        index += mark.open.length
+      } else if (text.substr(index, mark.close.length) === mark.close
+        && !isEscaped(text, index)) {
+        if (stack.length > 0) {
+          var opened = stack.pop()
+          pairs.push({ openAt: opened, openLen: mark.open.length,
+            closeAt: index, closeLen: mark.close.length })
         }
-      }
-    } else if (!markerEscaped(text, openAt, open) && openAt + open.length <= position) {
-      var closeAt = text.indexOf(close, position)
-      if (closeAt >= position && closeAt + close.length <= lineEnd
-        && openAt + open.length <= closeAt) {
-        return { openAt: openAt, closeAt: closeAt }
+        index += mark.close.length
+      } else {
+        index += 1
       }
     }
-    if (openAt <= 0) break
-    openAt = text.lastIndexOf(open, openAt - 1)
+    return pairs
   }
-  return null
+  var delimiters = markerDelimiters(text, mark, from, to)
+  var opener = null
+  for (var i = 0; i < delimiters.length; i++) {
+    if (!opener) {
+      opener = delimiters[i]
+    } else {
+      pairs.push({ openAt: opener.at, openLen: opener.len,
+        closeAt: delimiters[i].at, closeLen: delimiters[i].len })
+      opener = null
+    }
+  }
+  return pairs
 }
 
-function planInline(oldText, mark, start, end) {
-  var open = mark.open
-  var close = mark.close
+function markerDelimiters(text, mark, from, to) {
+  var list = []
+  var char = mark.open.charAt(0)
+  var expectOpener = true
+  var index = from
+  while (index < to) {
+    if (text.charAt(index) !== char) { index += 1; continue }
+    var run = runBounds(text, index, char)
+    index = run.end
+    if (run.start < from || isEscaped(text, run.start)) continue
+    var after = text.charAt(run.end)
+    var before = text.charAt(run.start - 1)
+    var at = run.start
+    var len = mark.open.length
+    if (mark.kind === "italic") {
+      if (run.length !== 1 && run.length !== 3) continue
+      if (expectOpener && isSpaceChar(after)) continue
+      if (!expectOpener && isSpaceChar(before)) continue
+      // The italic layer of a triple run is the star next to the content.
+      at = expectOpener ? run.end - 1 : run.start
+      len = 1
+    } else if (mark.kind === "bold") {
+      if (run.length !== 2 && run.length !== 3) continue
+      if (expectOpener && isSpaceChar(after)) continue
+      if (!expectOpener && isSpaceChar(before)) continue
+      len = 2
+    } else if (mark.kind === "code") {
+      if (run.length !== 1) continue
+    } else {
+      if (run.length !== 2) continue
+      if (expectOpener && isSpaceChar(after)) continue
+      if (!expectOpener && isSpaceChar(before)) continue
+    }
+    list.push({ at: at, len: len })
+    expectOpener = !expectOpener
+  }
+  return list
+}
+
+function hasInlineMarker(text, mark, from, to) {
+  if (mark.kind === "tag") {
+    for (var i = from; i < to; i++) {
+      if (isEscaped(text, i)) continue
+      if (text.substr(i, mark.open.length) === mark.open) return true
+      if (text.substr(i, mark.close.length) === mark.close) return true
+    }
+    return false
+  }
+  return markerDelimiters(text, mark, from, to).length > 0
+}
+
+function removePairs(oldText, pairs, start, end) {
+  var edits = []
+  for (var i = 0; i < pairs.length; i++) {
+    edits.push({ start: pairs[i].openAt, end: pairs[i].openAt + pairs[i].openLen, text: "" })
+    edits.push({ start: pairs[i].closeAt, end: pairs[i].closeAt + pairs[i].closeLen, text: "" })
+  }
+  edits.sort(function(a, b) { return a.start - b.start })
+  var newText = ""
+  var cursor = 0
+  for (var e = 0; e < edits.length; e++) {
+    newText += oldText.slice(cursor, edits[e].start)
+    cursor = edits[e].end
+  }
+  newText += oldText.slice(cursor)
+  return finish(oldText, newText, mapOffset(edits, start), mapOffset(edits, end))
+}
+
+function planInline(oldText, mark, start, end, name) {
+  var pairs = inlinePairs(oldText, mark, lineStartAt(oldText, start), lineEndAt(oldText, end))
+
   if (start === end) {
-    var around = wrapAroundCaret(oldText, start, open, close)
-    if (around) {
-      var trimmed = oldText.slice(0, around.openAt) + oldText.slice(around.openAt + open.length,
-        around.closeAt) + oldText.slice(around.closeAt + close.length)
-      return finish(oldText, trimmed, start - open.length, start - open.length)
+    var around = null
+    for (var i = 0; i < pairs.length; i++) {
+      var pair = pairs[i]
+      if (start >= pair.openAt + pair.openLen && start <= pair.closeAt) {
+        if (!around || pair.openAt > around.openAt) around = pair
+      }
     }
-    var text = oldText.slice(0, start) + open + close + oldText.slice(start)
-    return finish(oldText, text, start + open.length, start + open.length)
+    if (around) return removePairs(oldText, [around], start, end)
+    return finish(oldText, oldText.slice(0, start) + mark.open + mark.close
+      + oldText.slice(start), start + mark.open.length, start + mark.open.length)
   }
 
-  var outside = outsideWrap(oldText, start, end, open, close)
-  if (outside) {
-    var unwrapped = oldText.slice(0, outside.start) + oldText.slice(outside.start + open.length,
-      outside.end - close.length) + oldText.slice(outside.end)
-    return finish(oldText, unwrapped, start - open.length, end - open.length)
+  var covered = null
+  var enclosing = null
+  for (var j = 0; j < pairs.length; j++) {
+    var candidate = pairs[j]
+    if (candidate.openAt === start && candidate.closeAt + candidate.closeLen === end) {
+      covered = candidate
+      break
+    }
+    if (start >= candidate.openAt + candidate.openLen && end <= candidate.closeAt) {
+      if (!enclosing || candidate.openAt > enclosing.openAt) enclosing = candidate
+    }
   }
-  if (insideWrap(oldText, start, end, open, close)) {
-    var stripped = oldText.slice(0, start) + oldText.slice(start + open.length,
-      end - close.length) + oldText.slice(end)
-    return finish(oldText, stripped, start, end - open.length - close.length)
+  if (covered) return removePairs(oldText, [covered], start, end)
+  if (enclosing) return removePairs(oldText, [enclosing], start, end)
+  if (hasInlineMarker(oldText, mark, start, end)) {
+    return fail("Cannot toggle " + String(name || "formatting") + " across existing markers")
   }
-
-  var wrapped = oldText.slice(0, start) + open + oldText.slice(start, end) + close + oldText.slice(end)
-  return finish(oldText, wrapped, start + open.length, end + open.length)
+  // Wrapping next to an existing run would fuse the markers into one longer
+  // run, which Markdown resolves unpredictably. Refuse instead.
+  var char = mark.kind === "tag" ? "" : mark.open.charAt(0)
+  if (char !== "" && (oldText.charAt(start) === char || oldText.charAt(end - 1) === char
+    || oldText.charAt(start - 1) === char || oldText.charAt(end) === char)) {
+    return fail("Cannot toggle " + String(name || "formatting") + " next to existing markers")
+  }
+  return finish(oldText, oldText.slice(0, start) + mark.open + oldText.slice(start, end)
+    + mark.close + oldText.slice(end), start + mark.open.length, end + mark.open.length)
 }
+
 
 // ------------------------------------------------------------------- lists
 
@@ -1222,6 +1263,15 @@ function stripInlineMarkers(value) {
     escapes.push(match)
     return marker
   })
+  // Code spans are literal: their contents must survive the stripping pass
+  // untouched, so park them behind placeholders (the backticks are dropped,
+  // the characters inside are not).
+  var codes = []
+  text = text.replace(/`([^`\n]+)`/g, function(match, inner) {
+    var marker = "\uE310" + codes.length + "\uE311"
+    codes.push(inner)
+    return marker
+  })
   var previous = null
   while (text !== previous) {
     previous = text
@@ -1229,15 +1279,17 @@ function stripInlineMarkers(value) {
     text = text.replace(/<u>([\s\S]*?)<\/u>/gi, "$1")
     text = text.replace(/<sup>([\s\S]*?)<\/sup>/gi, "$1")
     text = text.replace(/<sub>([\s\S]*?)<\/sub>/gi, "$1")
-    text = text.replace(/==([^=\n]+)==/g, "$1")
+    text = text.replace(/==(?![\s=])([^=\n]*?[^\s=])==/g, "$1")
     text = text.replace(/\*\*\*([^*]+)\*\*\*/g, "$1")
     text = text.replace(/___([^_]+)___/g, "$1")
-    text = text.replace(/\*\*([^*]+)\*\*/g, "$1")
-    text = text.replace(/__([^_]+)__/g, "$1")
-    text = text.replace(/~~([^~]+)~~/g, "$1")
-    text = text.replace(/`([^`]+)`/g, "$1")
-    text = text.replace(/\*([^*\n]+)\*/g, "$1")
-    text = text.replace(/(^|[^A-Za-z0-9_])_([^_\n]+)_/g, "$1$2")
+    text = text.replace(/\*\*(?![\s*])([^*]*?[^\s*])\*\*/g, "$1")
+    text = text.replace(/__(?![\s_])([^_]*?[^\s_])__/g, "$1")
+    text = text.replace(/~~(?![\s~])([^~]*?[^\s~])~~/g, "$1")
+    text = text.replace(/\*(?![\s*])([^*\n]*?[^\s*])\*/g, "$1")
+    text = text.replace(/(^|[^A-Za-z0-9_])_(?![\s_])([^_\n]*?[^\s_])_/g, "$1$2")
+  }
+  for (var c = 0; c < codes.length; c++) {
+    text = text.split("\uE310" + c + "\uE311").join(codes[c])
   }
   for (var i = 0; i < escapes.length; i++) {
     text = text.split("\uE300" + i + "\uE301").join(escapes[i])
@@ -1335,7 +1387,7 @@ function plan(text, start, end, action, value) {
     e = safe.end
   }
 
-  if (INLINE_MARKS[name]) return planInline(source, INLINE_MARKS[name], s, e)
+  if (INLINE_MARKS[name]) return planInline(source, INLINE_MARKS[name], s, e, name)
 
   if (name === "color") {
     var colour = normaliseColour(value)
