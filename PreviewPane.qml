@@ -3,6 +3,7 @@ import QtQuick.Controls
 import Quickshell
 import qs.Commons
 import qs.Commons as Commons
+import "FileUrls.js" as FileUrls
 import "ImageSizing.js" as ImageSizing
 import "TableEngine.js" as TableEngine
 import "MathSyntax.js" as MathSyntax
@@ -1038,7 +1039,7 @@ Item {
                 id: mathImage
                 anchors.fill: parent
                 source: blockItem.mathReady
-                  ? "file://" + String(blockItem.mathResult.path || "") : ""
+                  ? FileUrls.fileUrl(String(blockItem.mathResult.path || "")) : ""
                 asynchronous: true
                 fillMode: Image.PreserveAspectFit
               }
@@ -1474,7 +1475,7 @@ Item {
 
   function openImage(source) {
     if (String(source || "").length === 0) return
-    Qt.openUrlExternally("file://" + String(source))
+    Qt.openUrlExternally(FileUrls.fileUrl(String(source)))
   }
 
   Column {

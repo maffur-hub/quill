@@ -5,6 +5,7 @@ import Quickshell.Io
 import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
+import "FileUrls.js" as FileUrls
 import "ImageSizing.js" as ImageSizing
 import "MarkdownFormat.js" as MarkdownFormat
 import "PopupAnchor.js" as PopupAnchor
@@ -2583,9 +2584,9 @@ Item {
   }
 
   // Local Markdown links are stored as absolute paths (`[spec](/home/me/spec.pdf)`).
-  // Qt.openUrlExternally needs a URL, not a bare path, so local paths get a
-  // file:// prefix (already-percent-encoded hrefs stay encoded). Anything with
-  // a scheme is passed through untouched.
+  // Qt.openUrlExternally needs a URL, not a bare path, so local paths are
+  // turned into a properly encoded file:// URL (already-percent-encoded hrefs
+  // stay encoded). Anything with a scheme is passed through untouched.
   function externalLinkUrl(link) {
     var value = String(link === undefined || link === null ? "" : link).trim()
     if (value === "") return ""
@@ -2593,7 +2594,7 @@ Item {
     if (value.slice(0, 2) === "~/") {
       value = (Quickshell.env("HOME") || "") + value.slice(1)
     }
-    if (value.charAt(0) === "/") return "file://" + value
+    if (value.charAt(0) === "/") return FileUrls.fileUrl(value)
     return value
   }
 
