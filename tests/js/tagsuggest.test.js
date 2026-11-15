@@ -83,3 +83,16 @@ test('suggest strips frontmatter and fenced code before scanning', () => {
   assert.ok(tags.includes('realword'))
   assert.ok(!tags.includes('hiddenword'))
 })
+
+test('a word that normalises differently is still scored', () => {
+  const tags = suggest(
+    'Well--known pattern',
+    'The well--known pattern. The well--known pattern again.',
+    [],
+    []
+  )
+  assert.ok(tags.includes('well-known'), tags.join(','))
+  const long = 'a'.repeat(60)
+  const capped = suggest('Long word', long + ' ' + long, [], [])
+  assert.ok(capped.includes('a'.repeat(40)), capped.join(','))
+})

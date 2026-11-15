@@ -113,18 +113,34 @@ function stripFrontmatter(value) {
   return text
 }
 
+// A closing fence carries no info string, so "```js" inside a block cannot
+// end it early. Kept local because this module never imports the preview's
+// scanner.
+function closesFence(line, marker) {
+  var character = marker.charAt(0)
+  var re = new RegExp("^\\s{0,3}" + (character === "`" ? "`" : "~")
+    + "{" + marker.length + ",}\\s*$")
+  return re.test(textOf(line).replace(/\r$/, ""))
+}
+
 function stripFences(value) {
   var lines = textOf(value).split("\n")
   var output = []
-  var inCode = false
+  var marker = ""
   for (var i = 0; i < lines.length; i++) {
     var line = lines[i]
-    if (FENCE_RE.test(line)) {
-      inCode = !inCode
-      output.push("")
+    if (marker === "") {
+      var open = FENCE_RE.exec(line)
+      if (open) {
+        marker = open[1]
+        output.push("")
+        continue
+      }
+      output.push(line)
       continue
     }
-    output.push(inCode ? "" : line)
+    output.push("")
+    if (closesFence(line, marker)) marker = ""
   }
   return output.join("\n")
 }
@@ -243,9 +259,13 @@ function addCount(map, key, amount) {
 function scanLine(line, body, title, heading) {
   var words = tokensOf(line)
   for (var i = 0; i < words.length; i++) {
-    if (body) addCount(body, words[i], 1)
-    if (title) addCount(title, words[i], 1)
-    if (heading) addCount(heading, words[i], 1)
+    // Counts are keyed by the normalised tag, not the raw token: otherwise a
+    // token such as "rock'n'roll" or "well--known" (or a very long word) is
+    // offered as a candidate and then scores zero under its normalised name.
+    var key = keyOf(words[i])
+    if (body) addCount(body, key, 1)
+    if (title) addCount(title, key, 1)
+    if (heading) addCount(heading, key, 1)
   }
   if (words.length < 2) return
   var raw = foldAccents(line).toLowerCase().match(/[a-z0-9\u00c0-\u024f][a-z0-9\u00c0-\u024f'\-]*/g) || []
@@ -260,7 +280,7 @@ function scanLine(line, body, title, heading) {
     var right = sequence[j + 1]
     if (!left || !right) continue
     if (STOPWORDS[left] || STOPWORDS[right]) continue
-    var key = left + "-" + right
+    var key = keyOf(left + "-" + right)
     if (body) addCount(body, key, 1)
     if (title) addCount(title, key, 1)
     if (heading) addCount(heading, key, 1)
