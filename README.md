@@ -667,6 +667,11 @@ anywhere on it to open the editor. Read-only notes show a **Read-only** hint
 instead, and the detached window shows **Open in the library to edit** (tables
 there are rendered, not editable).
 
+Cell text renders the same inline Markdown as body text: bold, italic, inline
+code, strikethrough and links. GFM has no cell fill, so colour a cell by
+colouring its text, e.g. `<span style="color:#e0a030">hot</span>`; the table
+itself stays plain GFM.
+
 Task lines (`- [ ] buy milk`, `* [x] done`, `+ [ ] nested`) render as themed
 checkboxes in the preview. Clicking a checkbox flips `[ ]` ↔ `[x]` in the note
 and the normal autosave mirrors the change to Joplin; read-only notes show the

@@ -1211,6 +1211,11 @@ Item {
                           readonly property string align: root.tableAlignment(blockItem.tableData, column)
                           readonly property string value: root.tableCellText(
                             blockItem.tableData, blockItem.tableValues, tableRow.bodyRow, column)
+                          // Inline Markdown in a cell reads the same as body
+                          // text. Most cells have none, so they skip the
+                          // renderer and stay a plain Text.
+                          readonly property bool inlineRich:
+                            TableEngine.cellHasInlineMarkdown(tableCell.value)
 
                           Rectangle {
                             anchors.fill: parent
@@ -1220,11 +1225,13 @@ Item {
                           }
 
                           Text {
+                            objectName: "previewTableCellText"
                             x: Style.space(8) + (tableCell.cellFormula ? Style.space(11) : 0)
                             width: Math.max(0, parent.width - x - Style.space(6))
                             anchors.verticalCenter: parent.verticalCenter
-                            text: tableCell.value
-                            textFormat: Text.PlainText
+                            text: tableCell.inlineRich
+                              ? root.previewHtml(tableCell.value) : tableCell.value
+                            textFormat: tableCell.inlineRich ? Text.RichText : Text.PlainText
                             color: tableCell.cellError
                               ? Commons.Color.urgent
                               : tableRow.headerRow

@@ -30,6 +30,7 @@ cases=(
   tests/qml/library-large-note.qml
   tests/qml/library-long-note.qml
   tests/qml/tablegrid.qml
+  tests/qml/preview-table.qml
 )
 
 status=0

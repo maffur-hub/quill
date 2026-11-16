@@ -5,6 +5,8 @@ const assert = require('node:assert/strict')
 const { load, deepEqual } = require('./helpers/load')
 
 const engine = load('TableEngine.js')
+const MathText = load('MathText.js')
+const MathSyntax = load('MathSyntax.js')
 
 function model (rows, header) {
   return { header: header || ['A', 'B', 'C'], aligns: [], delimiters: [], rows }
@@ -79,6 +81,34 @@ test('pipes inside a paired code span stay in one cell', () => {
   const table = engine.findTables(lines)[0]
   deepEqual(table.rows, [['`x | y`', 'z']])
   deepEqual(engine.serializeTable(table), lines)
+})
+
+test('cellHasInlineMarkdown skips plain cells', () => {
+  for (const value of ['plain text', '42', '', null, undefined]) {
+    assert.equal(engine.cellHasInlineMarkdown(value), false, JSON.stringify(value))
+  }
+})
+
+test('cellHasInlineMarkdown spots the inline Markdown the preview renders', () => {
+  for (const value of ['**bold**', '*italic*', '_under_', '`code`',
+    '[link](https://example.com)', '~~gone~~', '<u>under</u>',
+    '<span style="color:#ff8800">hot</span>']) {
+    assert.equal(engine.cellHasInlineMarkdown(value), true, JSON.stringify(value))
+  }
+})
+
+test('a pipe alone does not send a cell through the renderer', () => {
+  // displayCellText resolves the `\|` escape before the gate sees the value,
+  // so the pipe is ordinary text by then.
+  assert.equal(engine.cellHasInlineMarkdown('a | b'), false)
+})
+
+test('a coloured span survives MathText and raw tags never become scripts', () => {
+  const html = MathText.toHtml('<span style="color:#e0a030">hot</span>', null, MathSyntax)
+  assert.match(html, /<span style="color:#e0a030">hot<\/span>/)
+
+  const script = MathText.toHtml('<script>alert(1)</script>', null, MathSyntax)
+  assert.doesNotMatch(script, /<script/)
 })
 
 test('insertRow and deleteRow change only the data rows', () => {

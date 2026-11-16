@@ -575,6 +575,20 @@ function displayCellText(value) {
   return output
 }
 
+// True when a cell's text uses inline Markdown the preview can render, so the
+// cell can stay a plain Text when it does not (most cells) and skip the
+// renderer. A lone character is enough; the renderer decides what is valid.
+// This over-approximates on purpose: a literal asterisk only costs one render
+// pass, and MathText leaves it alone.
+function cellHasInlineMarkdown(value) {
+  if (value === undefined || value === null) return false
+  var text = String(value)
+  if (text === "") return false
+  if (text.indexOf("*") >= 0 || text.indexOf("_") >= 0 || text.indexOf("`") >= 0
+    || text.indexOf("[") >= 0 || text.indexOf("~") >= 0) return true
+  return /<[A-Za-z\/!]/.test(text)
+}
+
 function tokenize(source) {
   var text = String(source)
   var tokens = []
