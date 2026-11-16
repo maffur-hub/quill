@@ -353,6 +353,16 @@ function indexToRef(row, col) {
   return columnLabel(c) + String(r + 1)
 }
 
+// A cell holds one line: GFM has no continuation syntax, so a break or a tab
+// inside a value would split the row. Any run of breaks/tabs becomes a single
+// space, and the edges are trimmed.
+function sanitizeCell(value) {
+  var text = String(value === undefined || value === null ? "" : value)
+  // Matching the whole run also collapses "a\n\nb" to "a b", not "a  b".
+  text = text.replace(/(\r\n|\r|\n|\t)+/g, " ")
+  return text.replace(/^\s+|\s+$/g, "")
+}
+
 // Escape bare pipes outside inline code and leave existing `\|` escapes alone.
 function escapePipes(value) {
   var text = String(value === undefined || value === null ? "" : value)
@@ -419,7 +429,7 @@ function serializeRow(cells, columns) {
   var parts = []
   for (var i = 0; i < columns; i++) {
     var value = cells && cells[i] !== undefined && cells[i] !== null ? String(cells[i]) : ""
-    parts.push(escapePipes(value))
+    parts.push(escapePipes(sanitizeCell(value)))
   }
   return "| " + parts.join(" | ") + " |"
 }
@@ -1041,7 +1051,7 @@ function setCell(model, row, column, raw) {
   var r = Math.floor(Number(row))
   var c = Math.floor(Number(column))
   if (!isFinite(r) || !isFinite(c) || r < 0 || r >= m.rows.length || c < 0 || c >= m.header.length) return m
-  m.rows[r][c] = String(raw === undefined || raw === null ? "" : raw)
+  m.rows[r][c] = sanitizeCell(raw)
   return m
 }
 

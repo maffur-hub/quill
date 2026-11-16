@@ -179,3 +179,52 @@ test('tableLines returns only the table source lines', () => {
   const table = engine.findTables(text.split('\n'))[0]
   deepEqual(engine.tableLines(text, table), ['| A |', '| --- |', '| 1 |'])
 })
+
+test('sanitizeCell turns a break or tab into a single space', () => {
+  const cases = [
+    ['a\nb', 'a b'],
+    ['a\r\nb', 'a b'],
+    ['a\rb', 'a b'],
+    ['a\tb', 'a b']
+  ]
+  cases.forEach(([input, expected]) => {
+    assert.equal(engine.sanitizeCell(input), expected, JSON.stringify(input))
+  })
+})
+
+test('sanitizeCell collapses consecutive breaks into one space', () => {
+  assert.equal(engine.sanitizeCell('a\n\nb'), 'a b', JSON.stringify(engine.sanitizeCell('a\n\nb')))
+  assert.equal(engine.sanitizeCell('a\r\n\r\nb'), 'a b', JSON.stringify(engine.sanitizeCell('a\r\n\r\nb')))
+  assert.equal(engine.sanitizeCell('a\t\tb'), 'a b', JSON.stringify(engine.sanitizeCell('a\t\tb')))
+})
+
+test('sanitizeCell trims the edges', () => {
+  assert.equal(engine.sanitizeCell('  a\nb  '), 'a b', JSON.stringify(engine.sanitizeCell('  a\nb  ')))
+  assert.equal(engine.sanitizeCell('\n a \t '), 'a', JSON.stringify(engine.sanitizeCell('\n a \t ')))
+})
+
+test('sanitizeCell treats null and undefined as empty', () => {
+  assert.equal(engine.sanitizeCell(null), '')
+  assert.equal(engine.sanitizeCell(undefined), '')
+})
+
+test('setCell stores sanitised text', () => {
+  const updated = engine.setCell(model([['1']], ['A']), 0, 0, 'a\nb')
+  assert.equal(updated.rows[0][0], 'a b', JSON.stringify(updated.rows[0][0]))
+})
+
+test('serializeTable keeps a cell break on one body row', () => {
+  const lines = engine.serializeTable(model([['a\nb']], ['A']))
+  assert.equal(lines.length, 3, JSON.stringify(lines))
+  assert.equal(lines[2], '| a b |', JSON.stringify(lines[2]))
+  const parsed = engine.parseTableAt(lines, 0)
+  assert.ok(parsed, JSON.stringify(lines))
+  assert.equal(parsed.rows.length, 1, JSON.stringify(parsed.rows))
+  assert.equal(parsed.rows[0][0], 'a b', JSON.stringify(parsed.rows[0][0]))
+})
+
+test('a tab never reaches the serialised line', () => {
+  const lines = engine.serializeTable(model([['a\tb']], ['A']))
+  assert.equal(lines[2].indexOf('\t'), -1, JSON.stringify(lines[2]))
+  assert.equal(lines[2], '| a b |', JSON.stringify(lines[2]))
+})
