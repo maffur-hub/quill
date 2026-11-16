@@ -22,9 +22,24 @@ Item {
     + "| **bold** | plain |\n"
     + "| short | x |\n"
     + "| " + longText + " | y |"
+    + fillerRows
+  // Enough rows to push the table well past the 320px preview viewport, so
+  // the header row really does scroll away from the top.
+  readonly property string fillerRows: {
+    var out = ""
+    for (var i = 0; i < 12; i++)
+      out += "\n| row " + i + " | value " + i + " |"
+    return out
+  }
 
-  function collectByName(item, name, found) {
+  function collectByName(item, name, found, seen) {
     if (!item) return found
+    if (!seen) seen = []
+    // The walk reaches the same delegate through both `data` and `children`;
+    // skipping what it has already seen keeps the walk linear instead of
+    // revisiting children once per route.
+    if (seen.indexOf(item) >= 0) return found
+    seen.push(item)
     if (item.objectName === name) found.push(item)
     var kids = []
     var i
@@ -38,12 +53,13 @@ Item {
     } catch (error) {}
     if (item.contentItem) kids.push(item.contentItem)
     if (item.item) kids.push(item.item)
-    for (i = 0; i < kids.length; i++) test.collectByName(kids[i], name, found)
+    for (i = 0; i < kids.length; i++)
+      test.collectByName(kids[i], name, found, seen)
     return found
   }
 
-  // The walk reaches the same delegate through both `data` and `children`,
-  // so identities repeat. Keep one of each for counting and measuring.
+  // Keep one of each item for counting and measuring; the same node can turn
+  // up through more than one property on a single object.
   function uniqueItems(items) {
     var output = []
     for (var i = 0; i < items.length; i++) {
@@ -58,6 +74,11 @@ Item {
         return rows[i]
     }
     return null
+  }
+
+  function firstByName(name) {
+    var items = uniqueItems(collectByName(preview, name, []))
+    return items.length > 0 ? items[0] : null
   }
 
   function fail(message) {
@@ -93,10 +114,10 @@ Item {
       fail("timed out in step " + step)
       return
     }
-    if (step !== 1 && step !== 2) return
+    if (step !== 1 && step !== 2 && step !== 3 && step !== 4 && step !== 5) return
 
     var cells = uniqueItems(collectByName(preview, "previewTableCellText", []))
-    // Two header cells plus six body cells; wait for the delegates to build.
+    // Header plus body cells; wait for the delegates to build.
     if (step === 1) {
       if (cells.length < 8) return
       // Text lays out its lines on a later polish, so give the wrap a few ticks.
@@ -106,17 +127,64 @@ Item {
     }
     if (ticks < settleUntil) return
 
+    if (step === 3) {
+      var flick = firstByName("previewFlick")
+      if (!flick) {
+        fail("no preview flickable")
+        return
+      }
+      // Past the header row, while the table still covers the viewport top.
+      flick.contentY = 140
+      step = 4
+      return
+    }
+    if (step === 4) {
+      var flickNode = firstByName("previewFlick")
+      var pinned = firstByName("previewTableStickyHeader")
+      harness.check("the long table's header row can be pinned",
+        !!pinned && pinned.visible,
+        pinned ? "visible=" + pinned.visible : "no sticky header")
+      if (pinned && flickNode) {
+        // Mapping into the flickable gives viewport coordinates, so a pinned
+        // header sits at the top edge once the pane has scrolled.
+        harness.check("the pinned header sits at the top of the viewport",
+          Math.abs(pinned.mapToItem(flickNode, 0, 0).y) < 1,
+          String(pinned.mapToItem(flickNode, 0, 0).y))
+        var headerTexts = []
+        var pinnedCells = uniqueItems(
+          collectByName(pinned, "previewTableCellText", []))
+        for (var h = 0; h < pinnedCells.length; h++) headerTexts.push(pinnedCells[h].text)
+        harness.check("the pinned header carries the header labels",
+          headerTexts.indexOf("A") >= 0 && headerTexts.indexOf("B") >= 0,
+          headerTexts.join(", "))
+      }
+      if (flickNode) flickNode.contentY = 0
+      step = 5
+      return
+    }
+    if (step === 5) {
+      var unpinned = firstByName("previewTableStickyHeader")
+      harness.check("the header hides again at the top of the pane",
+        !!unpinned && !unpinned.visible,
+        unpinned ? "visible=" + unpinned.visible : "no sticky header")
+      tick.stop()
+      harness.done()
+      return
+    }
+
     var rich = null
     var plain = null
     var longCell = null
     var shortCell = null
     var headerCell = null
+    var rows = uniqueItems(collectByName(preview, "previewTableRow", []))
     for (var i = 0; i < cells.length; i++) {
       if (cells[i].textFormat === Text.RichText) rich = cells[i]
       else if (cells[i].text === "plain") plain = cells[i]
       if (cells[i].text === test.longText) longCell = cells[i]
       if (cells[i].text === "short") shortCell = cells[i]
-      if (cells[i].text === "A") headerCell = cells[i]
+      // The pinned copy repeats the header labels; keep the one inside a row.
+      if (cells[i].text === "A" && rowForCell(rows, cells[i])) headerCell = cells[i]
     }
     harness.check("a cell with inline Markdown renders as rich text",
       !!rich, "no rich cell among " + cells.length)
@@ -143,7 +211,6 @@ Item {
         shortCell.lineCount === 1, String(shortCell.lineCount))
     }
 
-    var rows = uniqueItems(collectByName(preview, "previewTableRow", []))
     var frames = uniqueItems(collectByName(preview, "previewTableFrame", []))
     var frame = frames.length > 0 ? frames[0] : null
     harness.check("the preview table exposes its frame", !!frame)
@@ -167,8 +234,12 @@ Item {
       }
     }
 
-    tick.stop()
-    harness.done()
+    var idleHeader = firstByName("previewTableStickyHeader")
+    harness.check("the table has a sticky header layer", !!idleHeader)
+    harness.check("the sticky header stays hidden before scrolling",
+      !!idleHeader && !idleHeader.visible,
+      idleHeader ? "visible=" + idleHeader.visible : "no sticky header")
+    step = 3
   }
 
   Timer {

@@ -497,6 +497,90 @@ Item {
   onBlocksChanged: mathService.prefetch(root.mathPrefetchBlocks())
   Component.onCompleted: mathService.prefetch(root.mathPrefetchBlocks())
 
+  // One table cell, shared by the scrolling body and the pinned header so the
+  // two copies cannot drift in width, alignment or Markdown handling.
+  component PreviewTableCell: Item {
+    id: cellItem
+
+    required property bool headerRow
+    required property int bodyRow
+    required property int column
+    required property var tableData
+    required property var tableValues
+    required property var tableWidths
+
+    width: tableWidths.length > column
+      ? tableWidths[column] : Style.space(70)
+    // The text drives the cell height; the base row height is the floor for a
+    // single short line.
+    height: Math.max(root.tableRowHeight,
+      cellText.implicitHeight + 2 * root.tableCellVerticalPadding)
+
+    readonly property var cell: !headerRow && tableValues[bodyRow]
+      ? tableValues[bodyRow][column] : null
+    readonly property bool cellError: !!cell && cell.error !== null
+    readonly property bool cellFormula: !!cell
+      && String(cell.raw).charAt(0) === "="
+    readonly property bool cellNumeric: !!cell && typeof cell.value === "number"
+    readonly property string align: root.tableAlignment(tableData, column)
+    readonly property string value: root.tableCellText(
+      tableData, tableValues, bodyRow, column)
+    // Inline Markdown in a cell reads the same as body text. Most cells have
+    // none, so they skip the renderer and stay a plain Text.
+    readonly property bool inlineRich: TableEngine.cellHasInlineMarkdown(cellItem.value)
+
+    Rectangle {
+      anchors.fill: parent
+      color: cellItem.cellFormula
+        ? Util.alpha(Commons.Color.accent, 0.055)
+        : "transparent"
+    }
+
+    Text {
+      id: cellText
+      objectName: "previewTableCellText"
+      x: Style.space(8) + (cellItem.cellFormula ? Style.space(11) : 0)
+      width: Math.max(0, parent.width - x - Style.space(6))
+      anchors.top: parent.top
+      anchors.topMargin: root.tableCellVerticalPadding
+      text: cellItem.inlineRich
+        ? root.previewHtml(cellItem.value) : cellItem.value
+      textFormat: cellItem.inlineRich ? Text.RichText : Text.PlainText
+      color: cellItem.cellError
+        ? Commons.Color.urgent
+        : cellItem.headerRow
+          ? Commons.Color.foreground
+          : Util.alpha(Commons.Color.foreground, 0.9)
+      font.family: Style.font.family
+      font.pixelSize: Style.font.body
+      font.bold: cellItem.headerRow
+      horizontalAlignment: cellItem.cellNumeric
+        ? Text.AlignRight
+        : root.horizontalFor(cellItem.align)
+      elide: Text.ElideRight
+      wrapMode: Text.Wrap
+      maximumLineCount: root.tableCellMaxLines
+    }
+
+    Text {
+      visible: cellItem.cellFormula
+      x: Style.space(3)
+      anchors.verticalCenter: parent.verticalCenter
+      text: "ƒ"
+      textFormat: Text.PlainText
+      color: Util.alpha(Commons.Color.accent, 0.72)
+      font.family: Style.font.family
+      font.pixelSize: Style.font.caption
+    }
+
+    Rectangle {
+      width: 1
+      height: parent.height
+      anchors.right: parent.right
+      color: Util.alpha(Commons.Color.foreground, 0.12)
+    }
+  }
+
   Flickable {
     id: flick
     objectName: "previewFlick"
@@ -561,6 +645,9 @@ Item {
             && tableNaturalWidth > blockItem.width + 0.5
           readonly property int tableRowCount: isTable && modelData.table ? modelData.table.rows.length + 1 : 0
           readonly property int tableColumnCount: isTable && modelData.table ? modelData.table.header.length : 0
+          // The header row can wrap, so the pinned copy asks the real row for
+          // its height instead of assuming the base row height.
+          property real headerHeight: root.tableRowHeight
           readonly property real overrideWidth: isImage && root.overrides[sourceLine] !== undefined
             ? root.overrides[sourceLine] : -1
           readonly property real paneWidth: Math.max(60, Math.floor(flick.width))
@@ -1187,6 +1274,9 @@ Item {
                     height: Math.max(root.tableRowHeight, cellRow.height)
                     readonly property bool headerRow: index === 0
                     readonly property int bodyRow: index - 1
+                    // Report the real header height so the pinned copy can
+                    // match a wrapped header row exactly.
+                    onHeightChanged: if (headerRow) blockItem.headerHeight = height
 
                     Rectangle {
                       anchors.fill: parent
@@ -1204,83 +1294,23 @@ Item {
                       Repeater {
                         model: blockItem.tableColumnCount
 
+                        // The inline component evaluates its bindings in the
+                        // row's scope, where `index` is the row, so the slot
+                        // captures the cell index for it.
                         delegate: Item {
-                          id: tableCell
-                          property int column: index
-                          width: blockItem.tableWidths.length > column
-                            ? blockItem.tableWidths[column] : Style.space(70)
-                          // The text drives the cell height; the base row height
-                          // is the floor for a single short line.
-                          height: Math.max(root.tableRowHeight,
-                            cellText.implicitHeight
-                              + 2 * root.tableCellVerticalPadding)
+                          id: cellSlot
+                          readonly property int columnIndex: index
+                          width: cellItem.width
+                          height: cellItem.height
 
-                          readonly property var cell: !tableRow.headerRow
-                            && blockItem.tableValues[tableRow.bodyRow]
-                            ? blockItem.tableValues[tableRow.bodyRow][column] : null
-                          readonly property bool cellError: !!cell && cell.error !== null
-                          readonly property bool cellFormula: !!cell
-                            && String(cell.raw).charAt(0) === "="
-                          readonly property bool cellNumeric: !!cell
-                            && typeof cell.value === "number"
-                          readonly property string align: root.tableAlignment(blockItem.tableData, column)
-                          readonly property string value: root.tableCellText(
-                            blockItem.tableData, blockItem.tableValues, tableRow.bodyRow, column)
-                          // Inline Markdown in a cell reads the same as body
-                          // text. Most cells have none, so they skip the
-                          // renderer and stay a plain Text.
-                          readonly property bool inlineRich:
-                            TableEngine.cellHasInlineMarkdown(tableCell.value)
-
-                          Rectangle {
-                            anchors.fill: parent
-                            color: tableCell.cellFormula
-                              ? Util.alpha(Commons.Color.accent, 0.055)
-                              : "transparent"
-                          }
-
-                          Text {
-                            id: cellText
-                            objectName: "previewTableCellText"
-                            x: Style.space(8) + (tableCell.cellFormula ? Style.space(11) : 0)
-                            width: Math.max(0, parent.width - x - Style.space(6))
-                            anchors.top: parent.top
-                            anchors.topMargin: root.tableCellVerticalPadding
-                            text: tableCell.inlineRich
-                              ? root.previewHtml(tableCell.value) : tableCell.value
-                            textFormat: tableCell.inlineRich ? Text.RichText : Text.PlainText
-                            color: tableCell.cellError
-                              ? Commons.Color.urgent
-                              : tableRow.headerRow
-                                ? Commons.Color.foreground
-                                : Util.alpha(Commons.Color.foreground, 0.9)
-                            font.family: Style.font.family
-                            font.pixelSize: Style.font.body
-                            font.bold: tableRow.headerRow
-                            horizontalAlignment: tableCell.cellNumeric
-                              ? Text.AlignRight
-                              : root.horizontalFor(tableCell.align)
-                            elide: Text.ElideRight
-                            wrapMode: Text.Wrap
-                            maximumLineCount: root.tableCellMaxLines
-                          }
-
-                          Text {
-                            visible: tableCell.cellFormula
-                            x: Style.space(3)
-                            anchors.verticalCenter: parent.verticalCenter
-                            text: "ƒ"
-                            textFormat: Text.PlainText
-                            color: Util.alpha(Commons.Color.accent, 0.72)
-                            font.family: Style.font.family
-                            font.pixelSize: Style.font.caption
-                          }
-
-                          Rectangle {
-                            width: 1
-                            height: parent.height
-                            anchors.right: parent.right
-                            color: Util.alpha(Commons.Color.foreground, 0.12)
+                          PreviewTableCell {
+                            id: cellItem
+                            headerRow: tableRow.headerRow
+                            bodyRow: tableRow.bodyRow
+                            column: cellSlot.columnIndex
+                            tableData: blockItem.tableData
+                            tableValues: blockItem.tableValues
+                            tableWidths: blockItem.tableWidths
                           }
                         }
                       }
@@ -1291,6 +1321,70 @@ Item {
                       height: 1
                       anchors.bottom: parent.bottom
                       color: Util.alpha(Commons.Color.foreground, 0.12)
+                    }
+                  }
+                }
+              }
+            }
+
+            // A long table scrolls behind its header row: this copy is pinned
+            // to the viewport top only while the real header is above it, and
+            // follows the table's horizontal scroll so the columns line up.
+            Item {
+              id: tableStickyHeader
+              objectName: "previewTableStickyHeader"
+              visible: blockItem.isTable && !!flick
+                && blockItem.y < flick.contentY
+                && blockItem.y + tableFrame.height
+                  > flick.contentY + tableStickyHeader.height
+              y: Math.max(0, Math.min(flick.contentY - blockItem.y,
+                tableFrame.height - height))
+              width: tableFrame.width
+              height: blockItem.headerHeight
+              clip: true
+              // Purely a visual copy: presses belong to the table's own
+              // handler underneath.
+              enabled: false
+
+              Rectangle {
+                anchors.fill: parent
+                color: Commons.Color.background
+              }
+
+              // The same tint as the header row, opaque over the background so
+              // body rows cannot show through it.
+              Rectangle {
+                anchors.fill: parent
+                color: Util.alpha(Commons.Color.foreground, 0.07)
+              }
+
+              Rectangle {
+                width: parent.width
+                height: 1
+                anchors.bottom: parent.bottom
+                color: Util.alpha(Commons.Color.foreground, 0.12)
+              }
+
+              Row {
+                x: -tableScroll.contentX
+
+                Repeater {
+                  model: blockItem.tableColumnCount
+
+                  delegate: Item {
+                    id: pinnedSlot
+                    readonly property int columnIndex: index
+                    width: pinnedCell.width
+                    height: pinnedCell.height
+
+                    PreviewTableCell {
+                      id: pinnedCell
+                      headerRow: true
+                      bodyRow: -1
+                      column: pinnedSlot.columnIndex
+                      tableData: blockItem.tableData
+                      tableValues: blockItem.tableValues
+                      tableWidths: blockItem.tableWidths
                     }
                   }
                 }
