@@ -661,8 +661,9 @@ zebra body rows, per-column alignment and right-aligned numbers. Formula cells
 show their computed value with a faint accent tint and a small `ƒ` marker;
 errors use the urgent colour. Wide tables scroll horizontally (Shift+wheel or
 drag) and show a slim scroll bar along the bottom whenever the columns overflow;
-the bar sits in reserved space so it never covers the last row. Long cells end
-in an ellipsis. Hover a table to see **Grid**, then click
+the bar sits in reserved space so it never covers the last row. Long cells wrap
+and their row grows (up to ten lines, then an ellipsis), so a table stays
+readable without widening the pane. Hover a table to see **Grid**, then click
 anywhere on it to open the editor. Read-only notes show a **Read-only** hint
 instead, and the detached window shows **Open in the library to edit** (tables
 there are rendered, not editable).

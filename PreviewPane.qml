@@ -271,6 +271,10 @@ Item {
   }
 
   readonly property real tableRowHeight: Style.space(28)
+  // Long cells wrap and grow their row, but one pathological cell must not
+  // fill the pane: ten lines then an ellipsis keeps the table readable.
+  readonly property int tableCellMaxLines: 10
+  readonly property real tableCellVerticalPadding: Style.space(6)
   readonly property real tableScrollBarHeight: Style.space(6)
   // Reserved strip between the table viewport and the frame border.
   readonly property real tableScrollBarSpace: Style.space(7)
@@ -1085,10 +1089,13 @@ Item {
           // ------------------------------------------------------- table
           Rectangle {
             id: tableFrame
+            objectName: "previewTableFrame"
             visible: blockItem.isTable
             width: blockItem.isTable ? blockItem.width : 0
+            // The Column sizes to its rows, and wrapped cells make rows taller
+            // than the base row height, so the frame follows the content.
             height: blockItem.isTable
-              ? root.tableRowHeight * blockItem.tableRowCount + 2
+              ? tableInner.height + 2
                 + (blockItem.tableOverflow ? root.tableScrollBarSpace : 0)
               : 0
             radius: Style.cornerRadius
@@ -1115,7 +1122,7 @@ Item {
                 + (blockItem.tableOverflow ? root.tableScrollBarSpace : 0)
               clip: true
               contentWidth: Math.max(width, tableInner.width)
-              contentHeight: height
+              contentHeight: Math.max(height, tableInner.height)
               flickableDirection: Flickable.HorizontalFlick
               boundsBehavior: Flickable.StopAtBounds
               interactive: contentWidth > width
@@ -1173,8 +1180,11 @@ Item {
 
                   delegate: Item {
                     id: tableRow
+                    objectName: "previewTableRow"
                     width: tableInner.width
-                    height: root.tableRowHeight
+                    // Cells size themselves to their wrapped text; the row
+                    // keeps the base height so ordinary tables stay dense.
+                    height: Math.max(root.tableRowHeight, cellRow.height)
                     readonly property bool headerRow: index === 0
                     readonly property int bodyRow: index - 1
 
@@ -1188,7 +1198,8 @@ Item {
                     }
 
                     Row {
-                      anchors.fill: parent
+                      id: cellRow
+                      width: parent.width
 
                       Repeater {
                         model: blockItem.tableColumnCount
@@ -1198,7 +1209,11 @@ Item {
                           property int column: index
                           width: blockItem.tableWidths.length > column
                             ? blockItem.tableWidths[column] : Style.space(70)
-                          height: tableRow.height
+                          // The text drives the cell height; the base row height
+                          // is the floor for a single short line.
+                          height: Math.max(root.tableRowHeight,
+                            cellText.implicitHeight
+                              + 2 * root.tableCellVerticalPadding)
 
                           readonly property var cell: !tableRow.headerRow
                             && blockItem.tableValues[tableRow.bodyRow]
@@ -1225,10 +1240,12 @@ Item {
                           }
 
                           Text {
+                            id: cellText
                             objectName: "previewTableCellText"
                             x: Style.space(8) + (tableCell.cellFormula ? Style.space(11) : 0)
                             width: Math.max(0, parent.width - x - Style.space(6))
-                            anchors.verticalCenter: parent.verticalCenter
+                            anchors.top: parent.top
+                            anchors.topMargin: root.tableCellVerticalPadding
                             text: tableCell.inlineRich
                               ? root.previewHtml(tableCell.value) : tableCell.value
                             textFormat: tableCell.inlineRich ? Text.RichText : Text.PlainText
@@ -1244,7 +1261,8 @@ Item {
                               ? Text.AlignRight
                               : root.horizontalFor(tableCell.align)
                             elide: Text.ElideRight
-                            wrapMode: Text.NoWrap
+                            wrapMode: Text.Wrap
+                            maximumLineCount: root.tableCellMaxLines
                           }
 
                           Text {
