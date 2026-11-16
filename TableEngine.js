@@ -445,6 +445,72 @@ function serializeTable(model) {
   return lines
 }
 
+// A rectangular block of raw cell text as TSV: one line per row, one tab per
+// cell. Raw text, not the display value, so a formula survives a round trip.
+function rangeToTsv(model, top, left, bottom, right) {
+  var m = normalizeModel(model)
+  var rowCount = m.rows.length
+  var columnCount = m.header.length
+  if (rowCount === 0 || columnCount === 0) return ""
+
+  var topRow = Math.floor(Number(top))
+  var leftColumn = Math.floor(Number(left))
+  var bottomRow = Math.floor(Number(bottom))
+  var rightColumn = Math.floor(Number(right))
+  if (!isFinite(topRow) || !isFinite(leftColumn)
+    || !isFinite(bottomRow) || !isFinite(rightColumn)) return ""
+
+  var firstRow = Math.min(topRow, bottomRow)
+  var lastRow = Math.max(topRow, bottomRow)
+  var firstColumn = Math.min(leftColumn, rightColumn)
+  var lastColumn = Math.max(leftColumn, rightColumn)
+  // A rectangle entirely outside the table has nothing to copy; a partly
+  // outside one is clipped to the cells that exist.
+  if (lastRow < 0 || firstRow > rowCount - 1
+    || lastColumn < 0 || firstColumn > columnCount - 1) return ""
+
+  firstRow = Math.max(0, firstRow)
+  lastRow = Math.min(rowCount - 1, lastRow)
+  firstColumn = Math.max(0, firstColumn)
+  lastColumn = Math.min(columnCount - 1, lastColumn)
+
+  var lines = []
+  for (var r = firstRow; r <= lastRow; r++) {
+    var cells = []
+    for (var c = firstColumn; c <= lastColumn; c++) {
+      var value = m.rows[r][c]
+      cells.push(value === undefined || value === null ? "" : String(value))
+    }
+    lines.push(cells.join("\t"))
+  }
+  return lines.join("\n")
+}
+
+// Parse TSV back into rows of cell text. Cells are sanitised with
+// sanitizeCell, because a clipboard line break must never become table
+// structure. Ragged rows are kept as they are.
+function parseTsv(text) {
+  if (text === undefined || text === null) return []
+  var source = String(text)
+  if (source === "") return []
+
+  var lines = source.split(/\r\n|\r|\n/)
+  var rows = []
+  for (var i = 0; i < lines.length; i++) {
+    var cells = lines[i].split("\t")
+    for (var c = 0; c < cells.length; c++) cells[c] = sanitizeCell(cells[c])
+    rows.push(cells)
+  }
+
+  // A clipboard copy usually ends with a newline. Drop that one empty row,
+  // but leave an empty line in the middle of the block alone.
+  if (/(\r\n|\r|\n)$/.test(source) && rows.length > 0) {
+    var last = rows[rows.length - 1]
+    if (last.length === 1 && last[0] === "") rows.pop()
+  }
+  return rows
+}
+
 // --------------------------------------------------------------- formulas
 
 function formatNumber(value) {

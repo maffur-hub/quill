@@ -228,3 +228,67 @@ test('a tab never reaches the serialised line', () => {
   assert.equal(lines[2].indexOf('\t'), -1, JSON.stringify(lines[2]))
   assert.equal(lines[2], '| a b |', JSON.stringify(lines[2]))
 })
+
+test('rangeToTsv writes raw cell text and parseTsv reads it back', () => {
+  const table = model([
+    ['plain', 'a \\| b', '=SUM(A1:B1)'],
+    ['x', 'y', 'z']
+  ], ['A', 'B', 'C'])
+  const tsv = engine.rangeToTsv(table, 0, 0, 1, 2)
+  assert.equal(tsv, 'plain\ta \\| b\t=SUM(A1:B1)\nx\ty\tz', JSON.stringify(tsv))
+  deepEqual(engine.parseTsv(tsv), [
+    ['plain', 'a \\| b', '=SUM(A1:B1)'],
+    ['x', 'y', 'z']
+  ])
+})
+
+test('rangeToTsv copies a sub-rectangle with no trailing newline', () => {
+  const table = model([['a', 'b', 'c'], ['d', 'e', 'f'], ['g', 'h', 'i']])
+  assert.equal(engine.rangeToTsv(table, 1, 1, 2, 2), 'e\tf\nh\ti')
+})
+
+test('rangeToTsv copies a single cell', () => {
+  const table = model([['a', 'b', 'c'], ['d', 'e', 'f'], ['g', 'h', 'i']])
+  assert.equal(engine.rangeToTsv(table, 1, 2, 1, 2), 'f')
+})
+
+test('rangeToTsv swaps an inverted rectangle', () => {
+  const table = model([['a', 'b', 'c'], ['d', 'e', 'f'], ['g', 'h', 'i']])
+  assert.equal(engine.rangeToTsv(table, 2, 2, 1, 1), 'e\tf\nh\ti')
+})
+
+test('rangeToTsv returns an empty string for a rectangle outside the table', () => {
+  const table = model([['a', 'b'], ['c', 'd']])
+  assert.equal(engine.rangeToTsv(table, 5, 5, 5, 5), '')
+  assert.equal(engine.rangeToTsv(table, 0, 3, 1, 4), '')
+})
+
+test('parseTsv splits CRLF and CR line endings', () => {
+  deepEqual(engine.parseTsv('a\tb\r\nc\td'), [['a', 'b'], ['c', 'd']])
+  deepEqual(engine.parseTsv('a\tb\rc\td'), [['a', 'b'], ['c', 'd']])
+})
+
+test('parseTsv drops exactly one trailing empty row', () => {
+  deepEqual(engine.parseTsv('a\tb\n'), [['a', 'b']])
+  deepEqual(engine.parseTsv('a\tb\r\n'), [['a', 'b']])
+})
+
+test('parseTsv keeps a blank line in the middle of the block', () => {
+  deepEqual(engine.parseTsv('a\n\nb'), [['a'], [''], ['b']])
+})
+
+test('parseTsv keeps ragged rows ragged', () => {
+  deepEqual(engine.parseTsv('a\tb\tc\nd\te'), [['a', 'b', 'c'], ['d', 'e']])
+})
+
+test('parseTsv sanitises cell text', () => {
+  // Tabs and line breaks are the separators, so what reaches a cell can carry
+  // only stray edge whitespace; sanitizeCell trims it.
+  deepEqual(engine.parseTsv('  a  \tb  '), [['a', 'b']])
+})
+
+test('parseTsv always returns an array for empty input', () => {
+  deepEqual(engine.parseTsv(''), [])
+  deepEqual(engine.parseTsv(null), [])
+  deepEqual(engine.parseTsv(undefined), [])
+})

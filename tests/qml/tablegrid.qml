@@ -96,6 +96,9 @@ Item {
       harness.check("the range regrows from the anchor",
         grid.hasRange === true && grid.rangeBottom === 2 && grid.rangeRight === 2,
         detail([grid.rangeTop, grid.rangeLeft, grid.rangeBottom, grid.rangeRight]))
+      harness.check("selectionTsv copies the selected block as raw TSV",
+        grid.selectionTsv() === "a1\tb1\tc1\na2\tb2\tc2\na3\tb3\tc3",
+        detail(grid.selectionTsv()))
 
       grid.clearRange()
       harness.check("clearRange clears the first cell", grid.cellRaw(0, 0) === "",

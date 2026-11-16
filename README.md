@@ -695,10 +695,17 @@ rows, columns, sorting and alignment.
 | `Delete` | Clear the cell, or every cell in the selection |
 | `Esc` | Collapse the selection, clear it, then close the grid |
 | `Ctrl+Z` / `Ctrl+Shift+Z` | Grid-local undo / redo (last 50 edits) |
+| `Ctrl+C` | Copy the selected cells as TSV |
+| `Ctrl+V` | Paste TSV at the active cell |
 | Typing | Replaces the selected cell's content |
 | `Shift`+wheel | Scroll a wide sheet horizontally |
 
 Clicking a column letter or row number selects that whole band.
+
+A pasted block that runs past the edge grows the table instead of dropping
+cells. A single line without tabs goes into the focused cell (replacing its
+selection). A formula copies as raw text, so pasting it elsewhere keeps its
+references where they were rather than moving them.
 
 Wide sheets also show a slim horizontal scroll bar below the cells, in space
 reserved for it, so the last visible row is never covered.

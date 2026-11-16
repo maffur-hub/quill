@@ -1,5 +1,7 @@
 import QtQuick
 import QtQuick.Controls
+import Quickshell
+import Quickshell.Io
 import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
@@ -45,6 +47,11 @@ Item {
   property var undoStack: []
   property var redoStack: []
   property bool editUndoPushed: false
+  // Pasting reads the clipboard asynchronously, so the cell to paste into and
+  // the table line it belonged to are captured when the key is pressed.
+  property int pasteRow: -1
+  property int pasteCol: -1
+  property int pasteStartLine: -1
 
   signal closed()
   // newLines is the complete replacement for this table (header + delimiter +
@@ -106,6 +113,17 @@ Item {
     id: sourceTimer
     interval: 120
     onTriggered: root.reconcileSource()
+  }
+
+  // Pasting goes through wl-paste rather than TextInput's own clipboard so the
+  // same TSV can be parsed as a block. The process is async; applyPaste checks
+  // the captured target when the stream ends.
+  Process {
+    id: clipboardProcess
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.applyPaste(String(text || ""))
+    }
   }
 
   onSourceTextChanged: {
@@ -785,9 +803,145 @@ Item {
     flushWrite()
   }
 
+  // ---------------------------------------------------------------- clipboard
+
+  // Every copy goes through here, so the text is exactly the raw cells in
+  // the range (and tests never need the real clipboard).
+  function selectionTsv() {
+    if (!loadedTable || !hasSelection) return ""
+    return TableEngine.rangeToTsv(model, rangeTop, rangeLeft, rangeBottom, rangeRight)
+  }
+
+  function copySelection() {
+    var text = selectionTsv()
+    if (text === "") return
+    var cellCount = (rangeBottom - rangeTop + 1) * (rangeRight - rangeLeft + 1)
+    Quickshell.execDetached(["wl-copy", "--", text])
+    statusMessage("Copied " + cellCount + (cellCount === 1 ? " cell" : " cells"))
+  }
+
+  function clearPasteTarget() {
+    pasteRow = -1
+    pasteCol = -1
+    pasteStartLine = -1
+  }
+
+  function pasteClipboard() {
+    if (!loadedTable || conflict || !hasSelection) return
+    // The clipboard read is asynchronous; remember where the paste started so
+    // a moved table or a closed grid discards the result.
+    pasteRow = selectedRow
+    pasteCol = selectedCol
+    pasteStartLine = startLine
+    clipboardProcess.command = ["wl-paste", "--no-newline"]
+    clipboardProcess.running = true
+  }
+
+  function applyPaste(text) {
+    if (!loadedTable || conflict || startLine !== pasteStartLine) {
+      clearPasteTarget()
+      return
+    }
+    if (pasteRow < 0 || pasteCol < 0) {
+      clearPasteTarget()
+      return
+    }
+    if (text === "") {
+      clearPasteTarget()
+      statusMessage("Nothing to paste")
+      return
+    }
+    if (text.indexOf("\t") < 0 && text.indexOf("\n") < 0 && text.indexOf("\r") < 0) {
+      pasteIntoCell(pasteRow, pasteCol, text)
+    } else {
+      pasteBlock(TableEngine.parseTsv(text))
+    }
+    clearPasteTarget()
+  }
+
+  // A single line without tabs lands in the focused cell. The TextInput's own
+  // selection is replaced when it has one, so pasting over selected text works
+  // like typing; the model write and undo follow the normal cell path.
+  function pasteIntoCell(row, column, value) {
+    if (!loadedTable || conflict) return
+    var input = cellAt(row, column)
+    var next
+    if (input && typeof input.replaceSelection === "function") {
+      next = input.replaceSelection(value)
+    } else {
+      next = cellRaw(row, column) + String(value === undefined || value === null ? "" : value)
+    }
+    setCellRaw(row, column, next, true)
+    flushWrite()
+    statusMessage("Pasted into " + TableEngine.indexToRef(row, column))
+  }
+
+  // A multi-line or tabbed block grows the table rather than dropping cells
+  // past the edge. The model growth and every cell write are one undo step.
+  function pasteBlock(rows) {
+    if (!rows || rows.length === 0) return
+    if (!loadedTable || conflict) return
+    var row = pasteRow
+    var column = pasteCol
+    if (row < 0 || column < 0) return
+
+    var widest = 1
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i] && rows[i].length > widest) widest = rows[i].length
+    }
+    var growRows = Math.max(0, row + rows.length - rowCount)
+    var growColumns = Math.max(0, column + widest - columnCount)
+
+    pushUndo()
+    var next = model
+    for (var r = 0; r < growRows; r++) {
+      next = TableEngine.insertRow(next, next.rows.length)
+    }
+    for (var c = 0; c < growColumns; c++) {
+      next = TableEngine.insertColumn(next, next.header.length)
+    }
+    for (var rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+      var cells = rows[rowIndex] || []
+      for (var columnIndex = 0; columnIndex < cells.length; columnIndex++) {
+        var value = cells[columnIndex] === undefined || cells[columnIndex] === null
+          ? "" : String(cells[columnIndex])
+        var targetRow = row + rowIndex
+        var targetColumn = column + columnIndex
+        if (value === "" && String(next.rows[targetRow][targetColumn]) === "") continue
+        next = TableEngine.setCell(next, targetRow, targetColumn, value)
+      }
+    }
+    applyModel(next, false)
+    editUndoPushed = true
+
+    selectedRow = row
+    selectedCol = column
+    anchorRow = Math.min(rowCount - 1, row + rows.length - 1)
+    anchorCol = Math.min(columnCount - 1, column + widest - 1)
+    focusCell(selectedRow, selectedCol, false)
+    ensureVisible(selectedRow, selectedCol)
+    flushWrite()
+    statusMessage("Pasted " + rows.length + " × " + widest + " cells")
+  }
+
   function cellKey(event, row, column) {
     var key = event.key
     var shift = (event.modifiers & Qt.ShiftModifier) !== 0
+    // AltGr arrives as Ctrl+Alt on European layouts, so it must not start a
+    // clipboard shortcut.
+    var control = (event.modifiers & Qt.ControlModifier) !== 0
+      && (event.modifiers & Qt.AltModifier) === 0
+      && (event.modifiers & Qt.GroupSwitchModifier) === 0
+    if (control && key === Qt.Key_C) {
+      event.accepted = true
+      copySelection()
+      return
+    }
+    if (control && key === Qt.Key_V) {
+      event.accepted = true
+      pasteClipboard()
+      return
+    }
     if (key === Qt.Key_Escape) {
       event.accepted = true
       handleEscape()
@@ -1515,6 +1669,19 @@ Item {
                         }
                       }
 
+                      // Replace the TextInput's own selection with `value` and
+                      // hand back the new raw text; the model is still
+                      // authoritative, so the caller writes it.
+                      function replaceSelection(value) {
+                        var text = String(value === undefined || value === null ? "" : value)
+                        var start = cellInput.selectionStart
+                        var end = cellInput.selectionEnd
+                        cellInput.text = cellInput.text.slice(0, start) + text
+                          + cellInput.text.slice(end)
+                        cellInput.cursorPosition = start + text.length
+                        return cellInput.text
+                      }
+
                       Component.onCompleted: {
                         if (cellInput.activeFocus) beginEdit()
                         else syncFromModel()
@@ -1533,8 +1700,19 @@ Item {
                       }
                       onTextEdited: root.cellEdited(rowDelegate.rowIndex, cellItem.columnIndex, text)
                       Keys.onShortcutOverride: function(event) {
+                        var control = (event.modifiers & Qt.ControlModifier) !== 0
+                          && (event.modifiers & Qt.AltModifier) === 0
+                          && (event.modifiers & Qt.GroupSwitchModifier) === 0
                         // Keep Tab out of the focus chain so it can move cells.
+                        // Ctrl+V is TextInput's own paste, so claim it too and
+                        // handle it as a normal key press.
                         if (event.key === Qt.Key_Tab) event.accepted = true
+                        else if (control && event.key === Qt.Key_V) event.accepted = true
+                        // A single cell keeps native copy for its text
+                        // selection; a range copies the whole block as TSV.
+                        else if (control && event.key === Qt.Key_C && root.hasRange) {
+                          event.accepted = true
+                        }
                       }
                       Keys.onPressed: function(event) {
                         root.cellKey(event, rowDelegate.rowIndex, cellItem.columnIndex)
