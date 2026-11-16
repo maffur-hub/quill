@@ -1,9 +1,10 @@
 import QtQuick
 
 // Drives TableGrid's range selection directly: open a small table, extend and
-// collapse the range, clear it, and undo. Runs inside scripts/qmltest's
-// offscreen harness; the grid never writes because no commit handler is
-// connected, so the note data root is irrelevant to this case.
+// collapse the range, clear it, undo, then fill down and right. Runs inside
+// scripts/qmltest's offscreen harness; the grid never writes because no
+// commit handler is connected, so the note data root is irrelevant to this
+// case.
 Item {
   id: test
 
@@ -13,6 +14,12 @@ Item {
   property int step: 0
   property int ticks: 0
   property int settleUntil: 0
+  property string lastStatus: ""
+
+  Connections {
+    target: test.grid
+    function onStatusMessage(message) { test.lastStatus = message }
+  }
 
   readonly property string tableText: "| A | B | C |\n| --- | --- | --- |\n"
     + "| a1 | b1 | c1 |\n| a2 | b2 | c2 |\n| a3 | b3 | c3 |\n| a4 | b4 | c4 |"
@@ -117,6 +124,74 @@ Item {
         detail(grid.cellRaw(2, 2)))
 
       step = 4
+      return
+    }
+
+    if (step === 4) {
+      // Fill down over a 3x2 rectangle: the top row is the source and stays.
+      grid.selectCell(0, 0, true)
+      grid.extendTo(2, 1)
+      grid.fillSelection(true)
+      harness.check("fill down copies the top row into the selection",
+        grid.cellRaw(1, 0) === "a1" && grid.cellRaw(2, 1) === "b1",
+        detail([grid.cellRaw(1, 0), grid.cellRaw(2, 1)]))
+      harness.check("fill down leaves the source row alone",
+        grid.cellRaw(0, 0) === "a1" && grid.cellRaw(0, 1) === "b1",
+        detail([grid.cellRaw(0, 0), grid.cellRaw(0, 1)]))
+      harness.check("fill down leaves cells outside the selection",
+        grid.cellRaw(2, 2) === "c3", detail(grid.cellRaw(2, 2)))
+      harness.check("fill down reports how many rows it filled",
+        lastStatus === "Filled 2 rows", detail(lastStatus))
+
+      grid.undo()
+      harness.check("undo reverses a fill down",
+        grid.cellRaw(1, 0) === "a2" && grid.cellRaw(1, 1) === "b2"
+          && grid.cellRaw(2, 1) === "b3",
+        detail([grid.cellRaw(1, 0), grid.cellRaw(1, 1), grid.cellRaw(2, 1)]))
+
+      // Fill right over a 2x3 rectangle: the left column is the source.
+      grid.selectCell(0, 0, true)
+      grid.extendTo(1, 2)
+      grid.fillSelection(false)
+      harness.check("fill right copies the left column into the selection",
+        grid.cellRaw(0, 1) === "a1" && grid.cellRaw(1, 2) === "a2",
+        detail([grid.cellRaw(0, 1), grid.cellRaw(1, 2)]))
+      harness.check("fill right leaves the source column alone",
+        grid.cellRaw(0, 0) === "a1" && grid.cellRaw(1, 0) === "a2",
+        detail([grid.cellRaw(0, 0), grid.cellRaw(1, 0)]))
+      harness.check("fill right leaves cells outside the selection",
+        grid.cellRaw(2, 1) === "b3", detail(grid.cellRaw(2, 1)))
+      harness.check("fill right reports how many columns it filled",
+        lastStatus === "Filled 2 columns", detail(lastStatus))
+
+      grid.undo()
+      harness.check("undo reverses a fill right",
+        grid.cellRaw(0, 1) === "b1" && grid.cellRaw(1, 2) === "c2",
+        detail([grid.cellRaw(0, 1), grid.cellRaw(1, 2)]))
+
+      // A single cell takes its neighbour, and the first row/column has none.
+      grid.selectCell(1, 1, true)
+      grid.fillSelection(true)
+      harness.check("a single cell fills down from the cell above",
+        grid.cellRaw(1, 1) === "b1", detail(grid.cellRaw(1, 1)))
+      harness.check("a single cell fill reports its source",
+        lastStatus === "Filled B2 from B1", detail(lastStatus))
+      grid.undo()
+      harness.check("undo reverses a single cell fill",
+        grid.cellRaw(1, 1) === "b2", detail(grid.cellRaw(1, 1)))
+
+      grid.selectCell(0, 0, true)
+      grid.fillSelection(true)
+      harness.check("the first row has nothing above to fill from",
+        grid.cellRaw(0, 0) === "a1" && lastStatus === "Nothing above to fill from",
+        detail([grid.cellRaw(0, 0), lastStatus]))
+      grid.selectCell(0, 0, true)
+      grid.fillSelection(false)
+      harness.check("the first column has nothing to the left to fill from",
+        grid.cellRaw(0, 0) === "a1" && lastStatus === "Nothing to the left to fill from",
+        detail([grid.cellRaw(0, 0), lastStatus]))
+
+      step = 5
       tick.stop()
       harness.done()
     }

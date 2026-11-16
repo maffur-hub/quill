@@ -697,6 +697,8 @@ rows, columns, sorting and alignment.
 | `Ctrl+Z` / `Ctrl+Shift+Z` | Grid-local undo / redo (last 50 edits) |
 | `Ctrl+C` | Copy the selected cells as TSV |
 | `Ctrl+V` | Paste TSV at the active cell |
+| `Ctrl+D` | Fill down from the top row, or from the cell above |
+| `Ctrl+R` | Fill right from the left column, or from the cell to the left |
 | Typing | Replaces the selected cell's content |
 | `Shift`+wheel | Scroll a wide sheet horizontally |
 
@@ -706,6 +708,14 @@ A pasted block that runs past the edge grows the table instead of dropping
 cells. A single line without tabs goes into the focused cell (replacing its
 selection). A formula copies as raw text, so pasting it elsewhere keeps its
 references where they were rather than moving them.
+
+Fill down (`Ctrl+D`) and fill right (`Ctrl+R`) copy the selection's first row or
+left column through the rest of the rectangle. Select the source row or column
+together with the cells to fill: the source stays exactly as it is, and every
+cell below or to its right takes that source cell's value. With a single cell
+selected the value comes from the cell above or to the left. Formulas copy as
+text, so their references do not move; edit them by hand when the filled copy
+needs different references.
 
 Wide sheets also show a slim horizontal scroll bar below the cells, in space
 reserved for it, so the last visible row is never covered.

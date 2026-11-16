@@ -1121,6 +1121,56 @@ function setCell(model, row, column, raw) {
   return m
 }
 
+// Copy a rectangle's first row down or its first column across, the way a
+// spreadsheet's fill handle does. The source row/column is left alone; every
+// cell after it takes the raw text of the cell above it (or to its left).
+// Formulas copy verbatim, so their references keep pointing where they did.
+// A one-cell rect has nothing to fill into and comes back unchanged.
+function fillRange(model, top, left, bottom, right, down) {
+  var m = normalizeModel(model)
+  var rowCount = m.rows.length
+  var columnCount = m.header.length
+  if (rowCount === 0 || columnCount === 0) return m
+
+  var topRow = Math.floor(Number(top))
+  var leftColumn = Math.floor(Number(left))
+  var bottomRow = Math.floor(Number(bottom))
+  var rightColumn = Math.floor(Number(right))
+  if (!isFinite(topRow) || !isFinite(leftColumn)
+    || !isFinite(bottomRow) || !isFinite(rightColumn)) return m
+
+  var firstRow = Math.min(topRow, bottomRow)
+  var lastRow = Math.max(topRow, bottomRow)
+  var firstColumn = Math.min(leftColumn, rightColumn)
+  var lastColumn = Math.max(leftColumn, rightColumn)
+  // A rectangle entirely outside the table has nothing to copy; a partly
+  // outside one is clipped to the cells that exist.
+  if (lastRow < 0 || firstRow > rowCount - 1
+    || lastColumn < 0 || firstColumn > columnCount - 1) return m
+
+  firstRow = Math.max(0, firstRow)
+  lastRow = Math.min(rowCount - 1, lastRow)
+  firstColumn = Math.max(0, firstColumn)
+  lastColumn = Math.min(columnCount - 1, lastColumn)
+
+  var r
+  var c
+  if (down) {
+    if (lastRow === firstRow) return m
+    for (c = firstColumn; c <= lastColumn; c++) {
+      var downValue = sanitizeCell(m.rows[firstRow][c])
+      for (r = firstRow + 1; r <= lastRow; r++) m.rows[r][c] = downValue
+    }
+  } else {
+    if (lastColumn === firstColumn) return m
+    for (r = firstRow; r <= lastRow; r++) {
+      var acrossValue = sanitizeCell(m.rows[r][firstColumn])
+      for (c = firstColumn + 1; c <= lastColumn; c++) m.rows[r][c] = acrossValue
+    }
+  }
+  return m
+}
+
 function sortRank(cell) {
   if (!cell) return 3
   if (cell.error) return 2

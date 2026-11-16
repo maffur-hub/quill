@@ -263,6 +263,53 @@ test('rangeToTsv returns an empty string for a rectangle outside the table', () 
   assert.equal(engine.rangeToTsv(table, 0, 3, 1, 4), '')
 })
 
+test('fillRange copies the top row down across a 3x2 rectangle', () => {
+  const table = model([['a', 'b'], ['c', 'd'], ['e', 'f']], ['A', 'B'])
+  const filled = engine.fillRange(table, 0, 0, 2, 1, true)
+  deepEqual(filled.rows, [['a', 'b'], ['a', 'b'], ['a', 'b']])
+})
+
+test('fillRange copies the left column across a 2x3 rectangle', () => {
+  const table = model([['a', 'b', 'c'], ['d', 'e', 'f']])
+  const filled = engine.fillRange(table, 0, 0, 1, 2, false)
+  deepEqual(filled.rows, [['a', 'a', 'a'], ['d', 'd', 'd']])
+})
+
+test('fillRange leaves the source row and column untouched', () => {
+  const table = model([['a', 'b'], ['c', 'd'], ['e', 'f']], ['A', 'B'])
+  const down = engine.fillRange(table, 0, 0, 2, 1, true)
+  deepEqual(down.rows[0], ['a', 'b'])
+  const across = engine.fillRange(table, 0, 0, 2, 1, false)
+  deepEqual(across.rows.map(row => row[0]), ['a', 'c', 'e'])
+})
+
+test('fillRange returns an unchanged clone for a single cell', () => {
+  const table = model([['a', 'b'], ['c', 'd']], ['A', 'B'])
+  const filled = engine.fillRange(table, 1, 1, 1, 1, true)
+  assert.notEqual(filled, table)
+  deepEqual(filled.rows, [['a', 'b'], ['c', 'd']])
+})
+
+test('fillRange clamps inverted and out-of-bounds rectangles', () => {
+  const table = model([['a', 'b'], ['c', 'd'], ['e', 'f']], ['A', 'B'])
+  // Inverted corners still describe the same 3x2 rectangle.
+  const inverted = engine.fillRange(table, 2, 1, 0, 0, true)
+  deepEqual(inverted.rows, [['a', 'b'], ['a', 'b'], ['a', 'b']])
+  // A rectangle that starts above and left of the table is clipped to it.
+  const clipped = engine.fillRange(table, -2, -1, 1, 1, false)
+  deepEqual(clipped.rows, [['a', 'a'], ['c', 'c'], ['e', 'f']])
+  // A rectangle wholly outside the table changes nothing.
+  const outside = engine.fillRange(table, 5, 5, 6, 6, true)
+  deepEqual(outside.rows, [['a', 'b'], ['c', 'd'], ['e', 'f']])
+})
+
+test('fillRange copies formulas verbatim and sanitises the copied text', () => {
+  const table = model([['=A1+1', 'a\tb'], ['0', 'x']], ['A', 'B'])
+  const filled = engine.fillRange(table, 0, 0, 1, 1, true)
+  assert.equal(filled.rows[1][0], '=A1+1', JSON.stringify(filled.rows[1][0]))
+  assert.equal(filled.rows[1][1], 'a b', JSON.stringify(filled.rows[1][1]))
+})
+
 test('parseTsv splits CRLF and CR line endings', () => {
   deepEqual(engine.parseTsv('a\tb\r\nc\td'), [['a', 'b'], ['c', 'd']])
   deepEqual(engine.parseTsv('a\tb\rc\td'), [['a', 'b'], ['c', 'd']])

@@ -803,6 +803,45 @@ Item {
     flushWrite()
   }
 
+  // Fill the selection from its first row/column, or from the neighbour when
+  // only one cell is selected. The whole fill is one undo step and one write.
+  function fillSelection(down) {
+    if (!loadedTable || conflict || !hasSelection) return
+    var total = down ? rangeBottom - rangeTop : rangeRight - rangeLeft
+
+    if (hasRange) {
+      if (total < 1) {
+        statusMessage(down ? "Nothing below to fill" : "Nothing to the right to fill")
+        return
+      }
+      var next = TableEngine.fillRange(model, rangeTop, rangeLeft,
+        rangeBottom, rangeRight, down)
+      pushUndo()
+      applyModel(next, true)
+      editUndoPushed = true
+      ensureVisible(rangeBottom, rangeRight)
+      flushWrite()
+      statusMessage("Filled " + total + (total === 1
+        ? (down ? " row" : " column")
+        : (down ? " rows" : " columns")))
+      return
+    }
+
+    if (down ? selectedRow === 0 : selectedCol === 0) {
+      statusMessage(down ? "Nothing above to fill from" : "Nothing to the left to fill from")
+      return
+    }
+    var sourceRow = down ? selectedRow - 1 : selectedRow
+    var sourceCol = down ? selectedCol : selectedCol - 1
+    pushUndo()
+    setCellRaw(selectedRow, selectedCol, cellRaw(sourceRow, sourceCol), false)
+    editUndoPushed = true
+    ensureVisible(selectedRow, selectedCol)
+    flushWrite()
+    statusMessage("Filled " + TableEngine.indexToRef(selectedRow, selectedCol)
+      + " from " + TableEngine.indexToRef(sourceRow, sourceCol))
+  }
+
   // ---------------------------------------------------------------- clipboard
 
   // Every copy goes through here, so the text is exactly the raw cells in
@@ -940,6 +979,16 @@ Item {
     if (control && key === Qt.Key_V) {
       event.accepted = true
       pasteClipboard()
+      return
+    }
+    if (control && key === Qt.Key_D) {
+      event.accepted = true
+      fillSelection(true)
+      return
+    }
+    if (control && key === Qt.Key_R) {
+      event.accepted = true
+      fillSelection(false)
       return
     }
     if (key === Qt.Key_Escape) {
@@ -1705,9 +1754,14 @@ Item {
                           && (event.modifiers & Qt.GroupSwitchModifier) === 0
                         // Keep Tab out of the focus chain so it can move cells.
                         // Ctrl+V is TextInput's own paste, so claim it too and
-                        // handle it as a normal key press.
+                        // handle it as a normal key press. Ctrl+D and Ctrl+R
+                        // are not TextInput shortcuts but are claimed here so
+                        // they reach cellKey on every platform.
                         if (event.key === Qt.Key_Tab) event.accepted = true
                         else if (control && event.key === Qt.Key_V) event.accepted = true
+                        else if (control && (event.key === Qt.Key_D || event.key === Qt.Key_R)) {
+                          event.accepted = true
+                        }
                         // A single cell keeps native copy for its text
                         // selection; a range copies the whole block as TSV.
                         else if (control && event.key === Qt.Key_C && root.hasRange) {
