@@ -689,12 +689,16 @@ rows, columns, sorting and alignment.
 | Key | Action |
 | --- | --- |
 | Arrows | Commit the cell and move the selection |
+| `Shift`+arrows | Extend the selection |
 | `Tab` / `Shift+Tab` | Next / previous cell, wrapping at the ends |
 | `Enter` | Commit and move down |
-| `Esc` | Clear the selection, then close the grid |
+| `Delete` | Clear the cell, or every cell in the selection |
+| `Esc` | Collapse the selection, clear it, then close the grid |
 | `Ctrl+Z` / `Ctrl+Shift+Z` | Grid-local undo / redo (last 50 edits) |
 | Typing | Replaces the selected cell's content |
 | `Shift`+wheel | Scroll a wide sheet horizontally |
+
+Clicking a column letter or row number selects that whole band.
 
 Wide sheets also show a slim horizontal scroll bar below the cells, in space
 reserved for it, so the last visible row is never covered.

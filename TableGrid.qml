@@ -66,6 +66,21 @@ Item {
   readonly property bool hasSelection: loadedTable && rowCount > 0
     && selectedRow >= 0 && selectedRow < rowCount && selectedCol >= 0
     && selectedCol < columnCount
+  // The active cell keeps the caret; the anchor fixes the other corner of the
+  // range that copy, fill and delete will work on.
+  property int anchorRow: -1
+  property int anchorCol: -1
+  readonly property bool hasRange: loadedTable && rowCount > 0 && columnCount > 0
+    && anchorRow >= 0 && anchorCol >= 0
+    && (anchorRow !== selectedRow || anchorCol !== selectedCol)
+  readonly property int rangeTop: anchorRow < 0 ? selectedRow
+    : Math.min(anchorRow, selectedRow)
+  readonly property int rangeLeft: anchorCol < 0 ? selectedCol
+    : Math.min(anchorCol, selectedCol)
+  readonly property int rangeBottom: anchorRow < 0 ? selectedRow
+    : Math.max(anchorRow, selectedRow)
+  readonly property int rangeRight: anchorCol < 0 ? selectedCol
+    : Math.max(anchorCol, selectedCol)
   // Updated when the banner is raised, so the buttons reflect what can still
   // be done. Kept as plain properties to avoid reparsing the whole note on
   // every keystroke.
@@ -256,6 +271,11 @@ Item {
     return Math.max(low, Math.min(high, value))
   }
 
+  function inRange(row, column) {
+    return hasRange && row >= rangeTop && row <= rangeBottom
+      && column >= rangeLeft && column <= rangeRight
+  }
+
   // ------------------------------------------------------------ model state
 
   function recompute() {
@@ -284,6 +304,13 @@ Item {
     if (keepSelection !== false) {
       selectedRow = rowCount > 0 ? clamp(row, 0, rowCount - 1) : -1
       selectedCol = columnCount > 0 ? clamp(column, 0, columnCount - 1) : -1
+      if (anchorRow >= 0 && anchorCol >= 0) {
+        anchorRow = rowCount > 0 ? clamp(anchorRow, 0, rowCount - 1) : -1
+        anchorCol = columnCount > 0 ? clamp(anchorCol, 0, columnCount - 1) : -1
+      } else {
+        anchorRow = selectedRow
+        anchorCol = selectedCol
+      }
     }
     recompute()
   }
@@ -292,7 +319,9 @@ Item {
     return {
       model: TableEngine.cloneModel(model),
       row: selectedRow,
-      column: selectedCol
+      column: selectedCol,
+      anchorRow: anchorRow,
+      anchorCol: anchorCol
     }
   }
 
@@ -309,6 +338,17 @@ Item {
     model = TableEngine.cloneModel(snapshot.model)
     selectedRow = rowCount > 0 ? clamp(snapshot.row, 0, rowCount - 1) : -1
     selectedCol = columnCount > 0 ? clamp(snapshot.column, 0, columnCount - 1) : -1
+    var savedAnchorRow = snapshot.anchorRow === undefined || snapshot.anchorRow === null
+      ? -1 : Math.floor(Number(snapshot.anchorRow))
+    var savedAnchorCol = snapshot.anchorCol === undefined || snapshot.anchorCol === null
+      ? -1 : Math.floor(Number(snapshot.anchorCol))
+    if (savedAnchorRow >= 0 && savedAnchorCol >= 0 && rowCount > 0 && columnCount > 0) {
+      anchorRow = clamp(savedAnchorRow, 0, rowCount - 1)
+      anchorCol = clamp(savedAnchorCol, 0, columnCount - 1)
+    } else {
+      anchorRow = -1
+      anchorCol = -1
+    }
     recompute()
     editUndoPushed = false
     Qt.callLater(function() {
@@ -345,6 +385,8 @@ Item {
       colWidths = []
       externalChange = false
       notice = "No table at this line"
+      anchorRow = -1
+      anchorCol = -1
       return
     }
     to = Math.min(lines.length - 1, Math.max(from, to))
@@ -358,6 +400,8 @@ Item {
       colWidths = []
       externalChange = false
       notice = "No table at this line"
+      anchorRow = -1
+      anchorCol = -1
       statusMessage(notice)
       return
     }
@@ -380,6 +424,8 @@ Item {
     loadedTable = true
     selectedRow = rowCount > 0 ? 0 : -1
     selectedCol = columnCount > 0 ? 0 : -1
+    anchorRow = selectedRow
+    anchorCol = selectedCol
     recompute()
     Qt.callLater(function() {
       root.forceActiveFocus()
@@ -428,14 +474,47 @@ Item {
     if (rowCount === 0 || columnCount === 0) {
       selectedRow = -1
       selectedCol = -1
+      anchorRow = -1
+      anchorCol = -1
       return
     }
     var changed = selectedRow !== row || selectedCol !== column
     selectedRow = clamp(row, 0, rowCount - 1)
     selectedCol = clamp(column, 0, columnCount - 1)
+    anchorRow = selectedRow
+    anchorCol = selectedCol
     if (changed) editUndoPushed = false
     if (focus) focusCell(selectedRow, selectedCol, true)
     ensureVisible(selectedRow, selectedCol)
+  }
+
+  // Move the active cell while leaving the anchor where the range started.
+  // The caret goes to the new cell without selecting its text, because the
+  // user is extending a range, not about to replace the value.
+  function extendTo(row, column) {
+    if (!hasSelection) return
+    selectedRow = clamp(row, 0, rowCount - 1)
+    selectedCol = clamp(column, 0, columnCount - 1)
+    editUndoPushed = false
+    focusCell(selectedRow, selectedCol, false)
+    ensureVisible(selectedRow, selectedCol)
+  }
+
+  function selectRow(row) {
+    if (!loadedTable || rowCount === 0 || columnCount === 0) return
+    selectCell(row, 0, true)
+    anchorCol = columnCount - 1
+  }
+
+  function selectColumn(column) {
+    if (!loadedTable || rowCount === 0 || columnCount === 0) return
+    selectCell(0, column, true)
+    anchorRow = rowCount - 1
+  }
+
+  function collapseRange() {
+    anchorRow = selectedRow
+    anchorCol = selectedCol
   }
 
   function moveBy(deltaRow, deltaColumn) {
@@ -517,6 +596,7 @@ Item {
     endLine = table.endLine
     lastSnapshot = source.slice(table.startLine, table.endLine + 1)
     applyModel(table, true)
+    collapseRange()
     // The note's version is the new baseline; old grid history would restore
     // cells that are no longer anchored to it.
     undoStack = []
@@ -675,16 +755,39 @@ Item {
   function handleEscape() {
     if (hasSelection) {
       commitCell(selectedRow, selectedCol)
+      if (hasRange) {
+        // First Escape drops the range but keeps the active cell; the next one
+        // clears the selection and a third closes the grid.
+        collapseRange()
+        return
+      }
       selectedRow = -1
       selectedCol = -1
+      anchorRow = -1
+      anchorCol = -1
       root.forceActiveFocus()
       return
     }
     requestClose()
   }
 
+  // Clear every cell in the rectangle as one undo step.
+  function clearRange() {
+    if (!hasRange) return
+    pushUndo()
+    for (var r = rangeTop; r <= rangeBottom; r++) {
+      for (var c = rangeLeft; c <= rangeRight; c++) {
+        model = TableEngine.setCell(model, r, c, "")
+      }
+    }
+    recompute()
+    editUndoPushed = true
+    flushWrite()
+  }
+
   function cellKey(event, row, column) {
     var key = event.key
+    var shift = (event.modifiers & Qt.ShiftModifier) !== 0
     if (key === Qt.Key_Escape) {
       event.accepted = true
       handleEscape()
@@ -696,20 +799,26 @@ Item {
       var cell = cellAt(row, column)
       var forward = key === Qt.Key_Right
       var atEdge = !cell || (forward ? cell.cursorAtEnd() : cell.cursorAtStart())
+      if (shift) {
+        // Away from the edge the TextInput keeps the key and extends its text
+        // selection; at the edge it becomes a range extension.
+        if (atEdge) {
+          event.accepted = true
+          extendTo(row, column + (forward ? 1 : -1))
+        }
+        return
+      }
       if (atEdge) {
         event.accepted = true
         moveBy(0, forward ? 1 : -1)
       }
       return
     }
-    if (key === Qt.Key_Up) {
+    if (key === Qt.Key_Up || key === Qt.Key_Down) {
+      var delta = key === Qt.Key_Down ? 1 : -1
       event.accepted = true
-      moveBy(-1, 0)
-      return
-    }
-    if (key === Qt.Key_Down) {
-      event.accepted = true
-      moveBy(1, 0)
+      if (shift) extendTo(row + delta, column)
+      else moveBy(delta, 0)
       return
     }
     if (key === Qt.Key_Return || key === Qt.Key_Enter) {
@@ -719,10 +828,15 @@ Item {
     }
     if (key === Qt.Key_Tab) {
       event.accepted = true
-      moveTab((event.modifiers & Qt.ShiftModifier) !== 0)
+      moveTab(shift)
       return
     }
     if (key === Qt.Key_Delete) {
+      if (hasRange) {
+        event.accepted = true
+        clearRange()
+        return
+      }
       // Delete clears the selected cell when the caret has no selection.
       var input = cellAt(row, column)
       if (input && input.selectionEmpty()) {
@@ -763,6 +877,8 @@ Item {
     else {
       selectedRow = -1
       selectedCol = actionColSafe()
+      anchorRow = -1
+      anchorCol = selectedCol
     }
     flushWrite()
   }
@@ -1172,8 +1288,7 @@ Item {
                 cursorShape: Qt.PointingHandCursor
                 onClicked: {
                   root.commitCell(root.selectedRow, root.selectedCol)
-                  root.selectCell(root.rowCount > 0 ? Math.max(0, root.selectedRow) : 0,
-                    headerCell.column, root.rowCount > 0)
+                  root.selectColumn(headerCell.column)
                 }
               }
             }
@@ -1220,6 +1335,15 @@ Item {
                 font.family: Style.font.family
                 font.pixelSize: Style.font.caption
                 font.bold: root.selectedRow === index
+              }
+
+              MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: {
+                  root.commitCell(root.selectedRow, root.selectedCol)
+                  root.selectRow(index)
+                }
               }
             }
           }
@@ -1321,9 +1445,15 @@ Item {
                     // Arrow keys step to the neighbouring cell only from the
                     // edge of the text, so multi-word cells can be edited.
                     function cursorAtStart() {
+                      // A cell selected in full has no caret to move inside it;
+                      // either direction steps out to the neighbour.
+                      if (cellInput.selectedText === cellInput.text) return true
                       return cellInput.selectedText === "" && cellInput.cursorPosition <= 0
                     }
                     function cursorAtEnd() {
+                      // The same holds at the other end: a whole-cell selection
+                      // is already an edge.
+                      if (cellInput.selectedText === cellInput.text) return true
                       return cellInput.selectedText === ""
                         && cellInput.cursorPosition >= cellInput.text.length
                     }
@@ -1332,13 +1462,15 @@ Item {
                       anchors.fill: parent
                       color: cellItem.selected
                         ? Util.alpha(Commons.Color.accent, 0.11)
-                        : root.cellError(rowDelegate.rowIndex, cellItem.columnIndex) !== ""
-                          ? Util.alpha(Commons.Color.urgent, 0.06)
-                          : root.cellIsFormula(rowDelegate.rowIndex, cellItem.columnIndex)
-                            ? Util.alpha(Commons.Color.accent, 0.035)
-                            : rowDelegate.rowIndex % 2 === 1
-                              ? Util.alpha(Commons.Color.foreground, 0.022)
-                              : "transparent"
+                        : root.hasRange && root.inRange(rowDelegate.rowIndex, cellItem.columnIndex)
+                          ? Util.alpha(Commons.Color.accent, 0.07)
+                          : root.cellError(rowDelegate.rowIndex, cellItem.columnIndex) !== ""
+                            ? Util.alpha(Commons.Color.urgent, 0.06)
+                            : root.cellIsFormula(rowDelegate.rowIndex, cellItem.columnIndex)
+                              ? Util.alpha(Commons.Color.accent, 0.035)
+                              : rowDelegate.rowIndex % 2 === 1
+                                ? Util.alpha(Commons.Color.foreground, 0.022)
+                                : "transparent"
                       border.width: cellItem.selected ? 1 : 1
                       border.color: cellItem.selected
                         ? Commons.Color.accent
@@ -1374,7 +1506,13 @@ Item {
                       function beginEdit() {
                         cellInput.text = root.cellRaw(rowDelegate.rowIndex, cellItem.columnIndex)
                         cellInput.selectAll()
-                        root.selectCell(rowDelegate.rowIndex, cellItem.columnIndex, false)
+                        // A click into another cell moves the selection (and
+                        // collapses the range); focus moving within an
+                        // extended range must leave the anchor alone.
+                        if (root.selectedRow !== rowDelegate.rowIndex
+                          || root.selectedCol !== cellItem.columnIndex) {
+                          root.selectCell(rowDelegate.rowIndex, cellItem.columnIndex, false)
+                        }
                       }
 
                       Component.onCompleted: {
