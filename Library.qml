@@ -1527,7 +1527,23 @@ Item {
 
   // Watches the open note for writes from outside Quill: the external editor,
   // Git, Syncthing, another Quill window. watchChanges follows atomic renames
-  // but does not re-read, so reload explicitly and handle fresh text on load.
+  // but does not re-read, so reload explicitly once the write settles and
+  // handle fresh text on load.
+  // A writer that truncates and then streams the new body (a shell redirect,
+  // some editors) fires a change for every chunk. Reloading on each one hands
+  // a half-written note to the editor, and a large body costs seconds of
+  // layout per pass. Wait for the quiet that means the write finished, the
+  // same shape as the store's own watch debounce.
+  Timer {
+    id: externalChangeTimer
+    interval: 250
+    repeat: false
+    onTriggered: {
+      if (root.tooLarge) root.largeNoteChanged()
+      else noteWatch.reload()
+    }
+  }
+
   FileView {
     id: noteWatch
     path: root.watchPath
@@ -1536,13 +1552,7 @@ Item {
     // the notification matters, and its bytes would only be thrown away.
     blockAllReads: root.tooLarge
     printErrors: false
-    onFileChanged: {
-      if (root.tooLarge) {
-        root.largeNoteChanged()
-        return
-      }
-      reload()
-    }
+    onFileChanged: externalChangeTimer.restart()
     onLoaded: {
       if (!root.tooLarge) root.handleExternalContent(String(text()))
     }

@@ -88,17 +88,21 @@ Item {
     return false
   }
 
-  // Written straight into the data root: the store itself refuses to create a
-  // note this large, which is the whole reason the window has to cope.
+  // Written straight into the data root, because the store itself refuses to
+  // create a note this large: that is the whole reason the window has to cope.
+  // Written atomically, like a real editor's save, so the body is complete
+  // before the watcher ever sees it.
   function grow() {
     growProcess.command = ["sh", "-c",
-      "head -c 1200000 /dev/zero | tr '\\0' 'x' > \"$1\"", "quill", test.notePath]
+      "head -c 1200000 /dev/zero | tr '\\0' 'x' > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"",
+      "quill", test.notePath]
     growProcess.running = true
   }
 
   function shrink() {
     shrinkProcess.command = ["sh", "-c",
-      "printf '%s' \"$1\" > \"$2\"", "quill", test.smallText, test.notePath]
+      "printf '%s' \"$2\" > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"",
+      "quill", test.notePath, test.smallText]
     shrinkProcess.running = true
   }
 
