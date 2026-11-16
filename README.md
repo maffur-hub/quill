@@ -86,7 +86,10 @@ New files are `<epoch_ms>-<8 hex>.md`. Bodies are UTF-8 Markdown, written with
 an atomic temp-file + rename. The original newline style (LF or CRLF) is kept
 on every save. Notes over 1 MiB are shown read-only ("too large") rather than
 risking a partial write, and an open note that grows past the limit on disk
-switches to that same read-only state instead of loading the oversized body.
+switches to that same read-only state instead of loading the oversized body. A
+note over 400,000 characters opens read-only too, because laying that much text
+out blocks the window for seconds; the rich-text highlighter already stops at
+200,000.
 
 While a note is dirty, Quill also writes a debounced (150 ms) copy to
 `<note path>.draft`, for example `notes/Work/plan.md.draft`. The suffix is

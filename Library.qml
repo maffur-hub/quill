@@ -91,6 +91,12 @@ Item {
   // that grows past the limit on disk must never reach the editor, whose
   // layout on a multi-megabyte buffer freezes the window for minutes.
   property int maxNoteBytes: 1048576
+  // A separate, lower limit for opening the editor at all. Qt lays a wrapped
+  // `Text` out on the main thread, and a long unbroken run costs about a
+  // second at 200,000 characters, four seconds at 400,000 and tens of seconds
+  // near the store's 1 MiB limit. A body over this many characters opens in
+  // the same read-only state as an oversized note instead of being laid out.
+  readonly property int maxEditChars: 400000
   property bool suppressDirty: false
   property bool dirty: false
   property int editVersion: 0
@@ -313,6 +319,29 @@ Item {
     var marker = "/scripts/"
     var cut = storePath.lastIndexOf(marker)
     return cut > 0 ? storePath.slice(0, cut) : ""
+  }
+
+  function tooLongToEdit(value) {
+    return String(value === undefined || value === null ? "" : value).length > root.maxEditChars
+  }
+
+  // Group digits by hand: toLocaleString would follow the user's locale, and
+  // the message must keep working in a bare QML/JS context.
+  function groupThousands(value) {
+    var digits = String(Math.round(Number(value) || 0))
+    var out = ""
+    for (var i = 0; i < digits.length; i++) {
+      if (i > 0 && (digits.length - i) % 3 === 0) out += ","
+      out += digits.charAt(i)
+    }
+    return out
+  }
+
+  // Derive the number from the constant so the message cannot drift from the
+  // check that enforces it.
+  function longNoteMessage() {
+    return "Note is too long to edit here (over "
+      + root.groupThousands(root.maxEditChars) + " characters)"
   }
 
   // ------------------------------------------------------------ backend queue
@@ -1390,19 +1419,25 @@ Item {
       silent: true,
       onSuccess: function(result) {
         if (requestedId !== root.selectedId) return
+        var body = result.tooLarge ? "" : String(result.content || "")
+        // A body under the store's byte limit can still be too long to lay
+        // out. Treat it exactly like an oversized note so the editor never
+        // sees it and the same read-only machinery takes over.
+        var tooLong = !result.tooLarge && root.tooLongToEdit(body)
+        var readOnly = !!result.tooLarge || tooLong
         root.suppressDirty = true
-        editor.text = result.tooLarge ? "" : String(result.content || "")
+        editor.text = readOnly ? "" : body
         editor.resetFormatHistory()
         editor.cursorPosition = caretAtEnd ? editor.text.length : 0
         root.suppressDirty = false
         root.loadingNote = false
-        root.tooLarge = !!result.tooLarge
-        root.loaded = !root.tooLarge
+        root.tooLarge = readOnly
+        root.loaded = !readOnly
         if (Number(result.maxBytes || 0) > 0) root.maxNoteBytes = Number(result.maxBytes)
         // Any save that was in flight when this buffer arrived is superseded.
         root.writeGeneration += 1
         root.loadedModified = Number(result.modified || 0)
-        root.savedTextById[requestedId] = root.tooLarge ? "" : String(result.content || "")
+        root.savedTextById[requestedId] = readOnly ? "" : body
         root.dirty = false
         root.editVersion = 0
         root.backlinksOpen = false
@@ -1410,9 +1445,11 @@ Item {
         root.saveState = root.loaded
           ? "Saved " + Qt.formatTime(new Date(root.loadedModified), "HH:mm")
           : "Read only"
-        root.statusText = root.tooLarge
-          ? "Note is larger than " + Math.ceil(Number(result.maxBytes || 1048576) / 1048576) + " MiB"
-          : root.categoryLabel
+        root.statusText = root.loaded
+          ? root.categoryLabel
+          : (tooLong ? root.longNoteMessage()
+            : "Note is larger than "
+              + Math.ceil(Number(result.maxBytes || 1048576) / 1048576) + " MiB")
         if (result.draft && root.writesAllowed) {
           root.draftPending = true
           root.draftText = String(result.draft.content || "")
@@ -1929,13 +1966,13 @@ Item {
     root.statusText = "Opened in external editor"
   }
 
-  // Adopt the read-only state a note over the size limit opens in. The watcher
-  // needs this on its own: a file that grows past the limit on disk must never
-  // be read into the editor, because laying that buffer out blocks the window
-  // for minutes. The store's own read reports the same verdict on the next
-  // load, and `loadNote()` from `largeNoteChanged()` picks the note up again
-  // once the file is editable.
-  function adoptOversizedNote() {
+  // Adopt the read-only state a note over a limit opens in. The watcher needs
+  // this on its own: a file that grows past the byte or character limit on
+  // disk must never be read into the editor, because laying that buffer out
+  // blocks the window for seconds. The store's own read reports the same
+  // verdict on the next load, and `loadNote()` from `largeNoteChanged()` picks
+  // the note up again once the file is editable.
+  function adoptOversizedNote(message) {
     var id = root.selectedId
     root.suppressDirty = true
     editor.text = ""
@@ -1953,8 +1990,8 @@ Item {
     root.invalidatePreview()
     if (id !== "") root.savedTextById[id] = ""
     root.saveState = "Read only"
-    root.statusText = "Note is larger than "
-      + Math.ceil(Number(root.maxNoteBytes || 1048576) / 1048576) + " MiB"
+    root.statusText = message || ("Note is larger than "
+      + Math.ceil(Number(root.maxNoteBytes || 1048576) / 1048576) + " MiB")
   }
 
   // A note that is too large to edit is still watched. There is no buffer to
@@ -1981,6 +2018,12 @@ Item {
       // The file grew past the size the store would hand over. Treat it the
       // way selecting such a note already does, instead of loading it.
       root.adoptOversizedNote()
+      return
+    }
+    if (root.tooLongToEdit(value)) {
+      // Under the byte limit but still too long to lay out: the same read-only
+      // state keeps the buffer out of the editor.
+      root.adoptOversizedNote(root.longNoteMessage())
       return
     }
     if (value === String(editor.text)) {
@@ -2036,6 +2079,10 @@ Item {
     // not be a second way to put an oversized buffer into the editor.
     if (NoteSize.exceeds(value, root.maxNoteBytes)) {
       root.adoptOversizedNote()
+      return
+    }
+    if (root.tooLongToEdit(value)) {
+      root.adoptOversizedNote(root.longNoteMessage())
       return
     }
     var caret = editor.cursorPosition
