@@ -77,7 +77,9 @@ ShellRoot {
     var available = Math.max(0, window.width - 2 * Style.space(14))
     if (root.mode === "preview") return Math.min(available, Style.space(860))
     if (root.mode === "edit") return Math.min(available, Style.space(1100))
-    return Math.min(available, Style.space(1400))
+    // Two panes side by side are not one long line of prose: each keeps a
+    // readable measure of its own, so the pair uses the whole window.
+    return available
   }
 
   // External-editor support, mirroring Library.qml for a single note.
