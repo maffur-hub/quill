@@ -578,9 +578,17 @@ Commands: `start`, `sessions`, `new`, `open`, `prompt`, `interrupt`, `rename`,
 The **Detach** button in the note header (or `Ctrl+Return`) flushes any pending
 edit and launches `scripts/quill-window` with that note's id, title and data
 directory. The note opens in a separate Quickshell process using the same
-`MarkdownEditor` and `PreviewPane` components, in split view. It is editable: edits autosave after
-450 ms through `quill-store write`, `Ctrl+S` saves immediately, and `Esc` or
-the window close button flushes any pending edit and quits.
+`MarkdownEditor` and `PreviewPane` components, in split view by default. It is
+editable: edits autosave after 450 ms through `quill-store write`, `Ctrl+S`
+saves immediately, and `Esc` or the window close button flushes any pending
+edit and quits.
+
+The header carries the same **Edit**, **Split** and **Preview** choices as the
+library, and a hidden pane gives its width to the other one instead of leaving
+a gap. **Preview** also drops the formatting toolbar, since nothing there takes
+formatting. A wide window caps the panes at a readable measure and centres
+them, rather than stretching a line of prose across the display; the header and
+toolbar stay full width.
 
 ```bash
 Q=~/.config/omarchy/plugins/matt.quill

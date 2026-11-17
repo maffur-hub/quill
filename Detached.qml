@@ -61,6 +61,15 @@ ShellRoot {
   // note and writing one are different jobs, and a narrow window only has
   // room for one of them.
   property string mode: "split"
+  // A readable measure, not a window size: a full-screen window should not
+  // stretch a line of prose across the whole display. Splitting needs room
+  // for two panes, and the editor is happy a little wider than a preview.
+  readonly property real contentWidth: {
+    var available = Math.max(0, window.width - 2 * Style.space(14))
+    if (root.mode === "preview") return Math.min(available, Style.space(860))
+    if (root.mode === "edit") return Math.min(available, Style.space(1100))
+    return Math.min(available, Style.space(1400))
+  }
 
   // External-editor support, mirroring Library.qml for a single note.
   property bool diskChangePending: false
@@ -892,116 +901,123 @@ ShellRoot {
         onKeepRequested: root.keepDiskChange()
       }
 
-      Row {
+      Item {
         width: parent.width
-        height: parent.height - y
-        spacing: Style.space(8)
+        height: Math.max(0, parent.height - y)
 
-        BorderSurface {
-          id: editorPane
-          visible: root.mode !== "preview"
-          width: root.mode === "split" ? Math.floor((parent.width - parent.spacing) * 0.55) : parent.width
+        Row {
+          id: paneRow
+          anchors.horizontalCenter: parent.horizontalCenter
+          width: root.contentWidth
           height: parent.height
-          color: Util.alpha(Commons.Color.foreground, 0.022)
-          borderSpec: Border.controlSpec("normal", Commons.Color.foreground, Commons.Color.accent)
-          radius: Style.cornerRadius
+          spacing: Style.space(8)
 
-          Flickable {
-            id: editorScroll
-            anchors.fill: parent
-            anchors.margins: Style.space(8)
-            clip: true
-            contentWidth: width
-            contentHeight: editor.implicitHeight
-            boundsBehavior: Flickable.StopAtBounds
-            interactive: contentHeight > height
+          BorderSurface {
+            id: editorPane
+            visible: root.mode !== "preview"
+            width: root.mode === "split" ? Math.floor((paneRow.width - paneRow.spacing) * 0.55) : paneRow.width
+            height: parent.height
+            color: Util.alpha(Commons.Color.foreground, 0.022)
+            borderSpec: Border.controlSpec("normal", Commons.Color.foreground, Commons.Color.accent)
+            radius: Style.cornerRadius
 
-            function ensureVisible(rect) {
-              if (contentY >= rect.y) contentY = rect.y
-              else if (contentY + height <= rect.y + rect.height) contentY = rect.y + rect.height - height
-            }
+            Flickable {
+              id: editorScroll
+              anchors.fill: parent
+              anchors.margins: Style.space(8)
+              clip: true
+              contentWidth: width
+              contentHeight: editor.implicitHeight
+              boundsBehavior: Flickable.StopAtBounds
+              interactive: contentHeight > height
 
-            // Qt's built-in wheel step is fixed, which is slow in a long note
-            // and ignores how fast the wheel is spun. Scale each notch by how
-            // quickly the notches arrive: a hard spin covers ground, a single
-            // deliberate roll stays precise.
-            property var wheelState: WheelScroll.create()
+              function ensureVisible(rect) {
+                if (contentY >= rect.y) contentY = rect.y
+                else if (contentY + height <= rect.y + rect.height) contentY = rect.y + rect.height - height
+              }
 
-            WheelHandler {
-              onWheel: function(event) {
-                var step = WheelScroll.step(editorScroll.wheelState,
-                  event.angleDelta.y, event.pixelDelta.y, Date.now())
-                if (step === 0) return
-                editorScroll.contentY = Math.max(0, Math.min(
-                  editorScroll.contentHeight - editorScroll.height,
-                  editorScroll.contentY - step))
-                event.accepted = true
+              // Qt's built-in wheel step is fixed, which is slow in a long note
+              // and ignores how fast the wheel is spun. Scale each notch by how
+              // quickly the notches arrive: a hard spin covers ground, a single
+              // deliberate roll stays precise.
+              property var wheelState: WheelScroll.create()
+
+              WheelHandler {
+                onWheel: function(event) {
+                  var step = WheelScroll.step(editorScroll.wheelState,
+                    event.angleDelta.y, event.pixelDelta.y, Date.now())
+                  if (step === 0) return
+                  editorScroll.contentY = Math.max(0, Math.min(
+                    editorScroll.contentHeight - editorScroll.height,
+                    editorScroll.contentY - step))
+                  event.accepted = true
+                }
+              }
+
+              MarkdownEditor {
+                id: editor
+                objectName: "markdownEditor"
+                width: editorScroll.width
+                height: Math.max(editorScroll.height, implicitHeight)
+                storePath: root.storePath
+                documentKey: String(root.noteId || "")
+                enabled: root.loaded && !root.tooLarge && !root.draftPending && !root.noteMissing
+                selectByMouse: true
+                wrapMode: TextEdit.Wrap
+                onCursorRectangleChanged: editorScroll.ensureVisible(cursorRectangle)
+                foregroundColor: Commons.Color.foreground
+                accentColor: Commons.Color.accent
+                font.family: Style.font.family
+                font.pixelSize: Style.font.body
+                leftPadding: Style.space(10)
+                rightPadding: Style.space(10)
+                topPadding: Style.space(8)
+                bottomPadding: Style.space(24)
+                placeholderText: root.loading
+                  ? "Loading note…"
+                  : root.noteMissing
+                    ? "This note is no longer in notes/."
+                    : root.tooLarge
+                      ? "This note is too large to edit safely in Quill."
+                      : "Start writing Markdown…"
+                placeholderTextColor: Util.alpha(Commons.Color.foreground, 0.28)
+                onTextChanged: root.markDirty()
+                onLinkRequested: formatBar.openLinkPopover()
+                onNoteLinkRequested: formatBar.openNoteLink()
+                onFormatRejected: function(message) { root.statusText = message }
+                onImagePasted: function(path) { root.statusText = "Image added" }
+                onPasteFailed: function(message) { root.statusText = message }
+                onAttachmentAdded: function(path) { root.statusText = "File attached" }
+                onAttachFailed: function(message) { root.statusText = message }
               }
             }
-
-            MarkdownEditor {
-              id: editor
-              objectName: "markdownEditor"
-              width: editorScroll.width
-              height: Math.max(editorScroll.height, implicitHeight)
-              storePath: root.storePath
-              documentKey: String(root.noteId || "")
-              enabled: root.loaded && !root.tooLarge && !root.draftPending && !root.noteMissing
-              selectByMouse: true
-              wrapMode: TextEdit.Wrap
-              onCursorRectangleChanged: editorScroll.ensureVisible(cursorRectangle)
-              foregroundColor: Commons.Color.foreground
-              accentColor: Commons.Color.accent
-              font.family: Style.font.family
-              font.pixelSize: Style.font.body
-              leftPadding: Style.space(10)
-              rightPadding: Style.space(10)
-              topPadding: Style.space(8)
-              bottomPadding: Style.space(24)
-              placeholderText: root.loading
-                ? "Loading note…"
-                : root.noteMissing
-                  ? "This note is no longer in notes/."
-                  : root.tooLarge
-                    ? "This note is too large to edit safely in Quill."
-                    : "Start writing Markdown…"
-              placeholderTextColor: Util.alpha(Commons.Color.foreground, 0.28)
-              onTextChanged: root.markDirty()
-              onLinkRequested: formatBar.openLinkPopover()
-              onNoteLinkRequested: formatBar.openNoteLink()
-              onFormatRejected: function(message) { root.statusText = message }
-              onImagePasted: function(path) { root.statusText = "Image added" }
-              onPasteFailed: function(message) { root.statusText = message }
-              onAttachmentAdded: function(path) { root.statusText = "File attached" }
-              onAttachFailed: function(message) { root.statusText = message }
-            }
           }
-        }
 
-        BorderSurface {
-          id: previewPane
-          visible: root.mode !== "edit"
-          width: root.mode === "split" ? parent.width - editorPane.width - parent.spacing : parent.width
-          height: parent.height
-          color: Util.alpha(Commons.Color.foreground, 0.014)
-          borderSpec: Border.controlSpec("normal", Commons.Color.foreground, Commons.Color.accent)
-          radius: Style.cornerRadius
+          BorderSurface {
+            id: previewPane
+            visible: root.mode !== "edit"
+            width: root.mode === "split" ? paneRow.width - editorPane.width - paneRow.spacing : paneRow.width
+            height: parent.height
+            color: Util.alpha(Commons.Color.foreground, 0.014)
+            borderSpec: Border.controlSpec("normal", Commons.Color.foreground, Commons.Color.accent)
+            radius: Style.cornerRadius
 
-          PreviewPane {
-            anchors.fill: parent
-            anchors.margins: Style.space(4)
-            markdown: root.previewMarkdown
-            loading: root.loading
-            dirty: root.dirty
-            hasNote: root.loaded
-            tooLarge: root.tooLarge
-            editable: root.loaded && !root.tooLarge && !root.draftPending
-            tableEditing: false
-            lineOffset: root.previewLineOffset
-            onLinkActivated: function(link) { root.openLink(link) }
-            onImageResized: function(line, width) { root.setImageWidth(line, width) }
-            onImageReset: function(line) { root.clearImageSize(line) }
-            onTaskToggled: function(line) { root.toggleTaskAt(line) }
+            PreviewPane {
+              anchors.fill: parent
+              anchors.margins: Style.space(4)
+              markdown: root.previewMarkdown
+              loading: root.loading
+              dirty: root.dirty
+              hasNote: root.loaded
+              tooLarge: root.tooLarge
+              editable: root.loaded && !root.tooLarge && !root.draftPending
+              tableEditing: false
+              lineOffset: root.previewLineOffset
+              onLinkActivated: function(link) { root.openLink(link) }
+              onImageResized: function(line, width) { root.setImageWidth(line, width) }
+              onImageReset: function(line) { root.clearImageSize(line) }
+              onTaskToggled: function(line) { root.toggleTaskAt(line) }
+            }
           }
         }
       }
