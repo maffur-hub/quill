@@ -57,6 +57,10 @@ ShellRoot {
   property string previewMarkdown: ""
   property int previewLineOffset: 0
   property string statusText: "Loading note…"
+  // The detached window can show the editor, the preview, or both. Reading a
+  // note and writing one are different jobs, and a narrow window only has
+  // room for one of them.
+  property string mode: "split"
 
   // External-editor support, mirroring Library.qml for a single note.
   property bool diskChangePending: false
@@ -140,6 +144,13 @@ ShellRoot {
     if (target.kind !== "external") return
     var url = root.externalLinkUrl(target.value)
     if (url !== "") Qt.openUrlExternally(url)
+  }
+
+  function setMode(next) {
+    var value = String(next || "")
+    if (value !== "edit" && value !== "split" && value !== "preview") return
+    if (root.mode === value) return
+    root.mode = value
   }
 
   // The watched file is gone: edited or deleted elsewhere, or moved to Trash
@@ -705,6 +716,37 @@ ShellRoot {
     stderr: StdioCollector { waitForEnd: true }
   }
 
+  // A mode chip, copied from the library's header so the same three choices
+  // look the same in both windows.
+  component ModeButton: BorderSurface {
+    id: modeButton
+    property string label: ""
+    property bool current: false
+    signal activated()
+    width: modeLabel.implicitWidth + Style.space(14)
+    height: Style.space(26)
+    color: current ? Style.selectedAccentFill : modeMouse.containsMouse ? Style.hoverFillFor(Commons.Color.foreground, Commons.Color.accent) : "transparent"
+    borderSpec: current ? Border.controlSpec("selected", Commons.Color.accent, Commons.Color.accent) : Border.none
+    radius: Style.cornerRadius
+
+    Text {
+      id: modeLabel
+      anchors.centerIn: parent
+      text: modeButton.label
+      color: Commons.Color.foreground
+      font.family: Style.font.family
+      font.pixelSize: Style.font.caption
+      font.bold: modeButton.current
+    }
+    MouseArea {
+      id: modeMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: modeButton.activated()
+    }
+  }
+
   FloatingWindow {
     id: window
     visible: true
@@ -754,6 +796,14 @@ ShellRoot {
           id: headerActions
           anchors.verticalCenter: parent.verticalCenter
           spacing: Style.space(6)
+
+          Row {
+            spacing: Style.space(2)
+            anchors.verticalCenter: parent.verticalCenter
+            ModeButton { label: "Edit"; current: root.mode === "edit"; onActivated: root.setMode("edit") }
+            ModeButton { label: "Split"; current: root.mode === "split"; onActivated: root.setMode("split") }
+            ModeButton { label: "Preview"; current: root.mode === "preview"; onActivated: root.setMode("preview") }
+          }
 
           Text {
             id: status
@@ -814,7 +864,7 @@ ShellRoot {
       FormatBar {
         id: formatBar
         width: parent.width
-        visible: !root.tooLarge
+        visible: !root.tooLarge && root.mode !== "preview"
         available: root.loaded && !root.tooLarge && !root.draftPending
         canUndo: editor ? editor.canUndo : false
         canRedo: editor ? editor.canRedo : false
@@ -848,7 +898,9 @@ ShellRoot {
         spacing: Style.space(8)
 
         BorderSurface {
-          width: Math.floor((parent.width - parent.spacing) * 0.55)
+          id: editorPane
+          visible: root.mode !== "preview"
+          width: root.mode === "split" ? Math.floor((parent.width - parent.spacing) * 0.55) : parent.width
           height: parent.height
           color: Util.alpha(Commons.Color.foreground, 0.022)
           borderSpec: Border.controlSpec("normal", Commons.Color.foreground, Commons.Color.accent)
@@ -927,7 +979,9 @@ ShellRoot {
         }
 
         BorderSurface {
-          width: parent.width - x
+          id: previewPane
+          visible: root.mode !== "edit"
+          width: root.mode === "split" ? parent.width - editorPane.width - parent.spacing : parent.width
           height: parent.height
           color: Util.alpha(Commons.Color.foreground, 0.014)
           borderSpec: Border.controlSpec("normal", Commons.Color.foreground, Commons.Color.accent)
