@@ -48,7 +48,7 @@ Item {
       dataRoot: test.dataRoot,
       storePath: test.storePath,
       joplinSyncPath: "",
-      width: 1000,
+      width: 1200,
       height: 700
     })
     if (!library) {
@@ -129,6 +129,16 @@ Item {
       if (!library.loaded || String(library.selectedId) !== noteId) return
       editor = findByName(library, "markdownEditor")
       if (!editor) return fail("the editor is not in the library")
+      // The header swaps its long action row for icons on narrow panes, so
+      // the window is wide enough for the detach button to be visible.
+      var detach = findByName(library, "detachButton")
+      harness.check("the note header has a detach button", !!detach)
+      harness.check("the detach button is visible on an editable note",
+        !!detach && detach.visible && library.loaded && !library.tooLarge,
+        detach ? "visible=" + detach.visible + " loaded=" + library.loaded : "missing")
+      harness.check("the detach button is labelled Detach",
+        !!detach && String(detach.text) === "Detach",
+        detach ? String(detach.text) : "missing")
       editor.text = editedText
       editor.cursorPosition = editor.text.length
       step = 3

@@ -575,12 +575,12 @@ Commands: `start`, `sessions`, `new`, `open`, `prompt`, `interrupt`, `rename`,
 
 ## Detached note window
 
-`Ctrl+Return` in the library flushes the current note and launches
-`scripts/quill-window` with that note's id, title and data directory. The note
-opens in a separate Quickshell process using the same `MarkdownEditor` and
-`PreviewPane` components, in split view. It is editable: edits autosave after
-450 ms through `quill-store write`, `Ctrl+S` saves immediately, and `Esc` or the
-window close button flushes any pending edit and quits.
+The **Detach** button in the note header (or `Ctrl+Return`) flushes any pending
+edit and launches `scripts/quill-window` with that note's id, title and data
+directory. The note opens in a separate Quickshell process using the same
+`MarkdownEditor` and `PreviewPane` components, in split view. It is editable: edits autosave after
+450 ms through `quill-store write`, `Ctrl+S` saves immediately, and `Esc` or
+the window close button flushes any pending edit and quits.
 
 ```bash
 Q=~/.config/omarchy/plugins/matt.quill

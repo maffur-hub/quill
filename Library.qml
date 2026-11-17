@@ -1848,7 +1848,10 @@ Item {
       statusText = "Restore this note before opening it in a window"
       return
     }
-    if (selectedNote.tooLarge) {
+    // A note is read-only either because the store marks it too large or
+    // because it exceeds maxEditChars here. Both must be refused: a detached
+    // window would lay out the body and freeze.
+    if (root.tooLarge || selectedNote.tooLarge) {
       statusText = "This note is too large to detach safely"
       return
     }
@@ -6975,6 +6978,16 @@ Item {
             onChanged: function(value) { root.moveSelectedTo(value) }
           }
 
+          Button {
+            objectName: "detachButton"
+            visible: !!root.selectedNote && !root.selectedNote.trashed && !root.compactHeader
+            text: "Detach"
+            tooltipText: "Open this note in its own window (Ctrl+Return)"
+            fontSize: Style.font.bodySmall
+            horizontalPadding: Style.space(7)
+            verticalPadding: Style.space(4)
+            onClicked: root.detachSelectedNote()
+          }
           Button {
             visible: !!root.selectedNote && !root.selectedNote.trashed && !root.compactHeader
             text: root.selectedNote && root.selectedNote.pinned ? "Unpin" : "Pin"
