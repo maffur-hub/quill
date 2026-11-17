@@ -590,6 +590,11 @@ formatting. A wide window caps the panes at a readable measure and centres
 them, rather than stretching a line of prose across the display; the header and
 toolbar stay full width.
 
+In split view the chain button in the header links the two panes, so scrolling
+either one keeps the same source line at the top of the other. The link lasts
+only for that window: the library's own Linked scrolling preference is separate
+and unchanged.
+
 ```bash
 Q=~/.config/omarchy/plugins/matt.quill
 $Q/scripts/quill-window <note-id> "Note title" "$HOME/.local/share/quill"

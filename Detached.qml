@@ -61,6 +61,15 @@ ShellRoot {
   // note and writing one are different jobs, and a narrow window only has
   // room for one of them.
   property string mode: "split"
+  // Follow the same source line in both panes. Off by default: reading a
+  // window and typing in it are different jobs, and a jumpy pane is worse
+  // than an independent one when you only want one of them. Session-only by
+  // design — writing settings from this process would replace the whole
+  // settings object and clobber what the library window has open.
+  property bool linkedScroll: false
+  // Driving one pane's contentY from the other's change signal fires the
+  // other change signal back; the echo stays set for one event-loop turn.
+  property bool scrollEcho: false
   // A readable measure, not a window size: a full-screen window should not
   // stretch a line of prose across the whole display. Splitting needs room
   // for two panes, and the editor is happy a little wider than a preview.
@@ -160,6 +169,30 @@ ShellRoot {
     if (value !== "edit" && value !== "split" && value !== "preview") return
     if (root.mode === value) return
     root.mode = value
+  }
+
+  // Linked scrolling keeps the preview on the same source line as the editor.
+  // Only the line mapping is offered here: the library's position mode is a
+  // stored preference, and this window has nowhere to keep one.
+  function syncPreviewToEditor() {
+    if (!root.linkedScroll || root.mode !== "split" || root.scrollEcho) return
+    if (!root.loaded) return
+    root.scrollEcho = true
+    previewPane.scrollToLine(editor.lineAtY(editorScroll.contentY))
+    Qt.callLater(function() { root.scrollEcho = false })
+  }
+
+  function syncEditorToPreview() {
+    if (!root.linkedScroll || root.mode !== "split" || root.scrollEcho) return
+    if (!root.loaded) return
+    // Line anchors are built by the preview from the block list; before the
+    // first render there is nothing to map.
+    if (previewPane.lineAnchors.length === 0) return
+    root.scrollEcho = true
+    // A short note has no scrollable range, so the clamp floor wins.
+    var maxY = Math.max(0, editorScroll.contentHeight - editorScroll.height)
+    editorScroll.contentY = Math.max(0, Math.min(maxY, editor.yForLine(previewPane.topLine)))
+    Qt.callLater(function() { root.scrollEcho = false })
   }
 
   // The watched file is gone: edited or deleted elsewhere, or moved to Trash
@@ -814,6 +847,24 @@ ShellRoot {
             ModeButton { label: "Preview"; current: root.mode === "preview"; onActivated: root.setMode("preview") }
           }
 
+          // The chain sits with the mode chips because it only means anything
+          // in split view.
+          Button {
+            objectName: "linkedScrollButton"
+            visible: root.mode === "split" && root.loaded && !root.tooLarge
+            width: Style.space(24)
+            height: Style.space(24)
+            text: ""
+            iconText: root.linkedScroll ? "\uf0c1" : "\uf127"
+            iconSize: Style.font.bodySmall
+            tooltipText: root.linkedScroll
+              ? "Edit and preview follow the same line — click to unlink"
+              : "Scroll edit and preview together — click to link"
+            horizontalPadding: 0
+            verticalPadding: 0
+            onClicked: root.linkedScroll = !root.linkedScroll
+          }
+
           Text {
             id: status
             anchors.verticalCenter: parent.verticalCenter
@@ -930,6 +981,10 @@ ShellRoot {
               contentHeight: editor.implicitHeight
               boundsBehavior: Flickable.StopAtBounds
               interactive: contentHeight > height
+              // Fires for wheel, keyboard-follow and programmatic moves alike;
+              // scrollEcho filters the ones this window caused from the other
+              // pane.
+              onContentYChanged: root.syncPreviewToEditor()
 
               function ensureVisible(rect) {
                 if (contentY >= rect.y) contentY = rect.y
@@ -994,7 +1049,7 @@ ShellRoot {
           }
 
           BorderSurface {
-            id: previewPane
+            id: previewFrame
             visible: root.mode !== "edit"
             width: root.mode === "split" ? paneRow.width - editorPane.width - paneRow.spacing : paneRow.width
             height: parent.height
@@ -1003,6 +1058,7 @@ ShellRoot {
             radius: Style.cornerRadius
 
             PreviewPane {
+              id: previewPane
               anchors.fill: parent
               anchors.margins: Style.space(4)
               markdown: root.previewMarkdown
@@ -1013,6 +1069,7 @@ ShellRoot {
               editable: root.loaded && !root.tooLarge && !root.draftPending
               tableEditing: false
               lineOffset: root.previewLineOffset
+              onScrolled: root.syncEditorToPreview()
               onLinkActivated: function(link) { root.openLink(link) }
               onImageResized: function(line, width) { root.setImageWidth(line, width) }
               onImageReset: function(line) { root.clearImageSize(line) }
