@@ -963,12 +963,14 @@ ShellRoot {
           anchors.horizontalCenter: parent.horizontalCenter
           width: root.contentWidth
           height: parent.height
-          spacing: Style.space(8)
+          // One gutter, not three: the panes sit either side of a single gap
+          // and each keeps its own border.
+          spacing: Style.space(4)
 
           BorderSurface {
             id: editorPane
             visible: root.mode !== "preview"
-            width: root.mode === "split" ? Math.floor((paneRow.width - paneRow.spacing) * 0.55) : paneRow.width
+            width: root.mode === "split" ? Math.floor((paneRow.width - paneRow.spacing) * 0.5) : paneRow.width
             height: parent.height
             color: Util.alpha(Commons.Color.foreground, 0.022)
             borderSpec: Border.controlSpec("normal", Commons.Color.foreground, Commons.Color.accent)
@@ -976,8 +978,17 @@ ShellRoot {
 
             Flickable {
               id: editorScroll
-              anchors.fill: parent
-              anchors.margins: Style.space(8)
+              anchors.left: parent.left
+              anchors.top: parent.top
+              anchors.bottom: parent.bottom
+              anchors.right: parent.right
+              // The join side needs less padding than the others: the preview
+              // carries its own margin plus the gutter, and three insets stacked
+              // at the seam read as a dead stripe between two flush panes.
+              anchors.leftMargin: Style.space(8)
+              anchors.rightMargin: Style.space(4)
+              anchors.topMargin: Style.space(8)
+              anchors.bottomMargin: Style.space(8)
               clip: true
               contentWidth: width
               contentHeight: editor.implicitHeight

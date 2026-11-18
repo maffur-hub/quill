@@ -587,9 +587,10 @@ The header carries the same **Edit**, **Split** and **Preview** choices as the
 library, and a hidden pane gives its width to the other one instead of leaving
 a gap. **Preview** also drops the formatting toolbar, since nothing there takes
 formatting. A single pane caps at a readable measure and centres in a wide
-window, rather than stretching a line of prose across the display; when both
-panes are open they use the whole window, since each one is already a readable
-width. The header and toolbar are always full width.
+window, rather than stretching a line of prose across the display. When both
+panes are open they split the window evenly, either side of a single gutter, so
+there is no dead band between them. The header and toolbar are always full
+width.
 
 In split view the chain button in the header links the two panes, so scrolling
 either one keeps the same source line at the top of the other. The link lasts
