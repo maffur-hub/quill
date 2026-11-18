@@ -360,6 +360,7 @@ preference in one place:
 | --- | --- |
 | Reopen last session | on / off |
 | Linked scrolling | off / by position / by line |
+| Page width | on / off |
 | Spellcheck | on / off |
 | Syntax highlighting | on / off |
 | Printer | System default, or any CUPS queue |
@@ -371,6 +372,13 @@ searches, so they survive a shell restart. The store owns the file:
 `quill-store settings get` returns `{"ui": …}` and `settings set --json '<object>'`
 replaces it; the keys are opaque to the CLI, which only enforces a 64 KiB cap
 and 64-character key names. Editing preferences therefore never touches a note.
+
+**Page width** caps the note panes at A4's printable width — 180 mm, about
+680 px, at the Normal 15 mm print margin — and centres them, so on-screen line
+lengths match the printed page. In split view each pane keeps its own measure
+either side of the gutter. It is a stored preference and survives a restart. It
+paints no page border, shadow or break guides and does not paginate: printing is
+unchanged.
 
 ### Reopening where you left off
 
@@ -597,17 +605,23 @@ either one keeps the same source line at the top of the other. The link lasts
 only for that window: the library's own Linked scrolling preference is separate
 and unchanged.
 
+The header's page button switches **Page width**, which caps the panes at A4's
+printable width and centres them. The window inherits the library's setting at
+launch (passed as the launcher's fourth argument) and the button changes it for
+that window only.
+
 ```bash
 Q=~/.config/omarchy/plugins/matt.quill
-$Q/scripts/quill-window <note-id> "Note title" "$HOME/.local/share/quill"
+$Q/scripts/quill-window <note-id> "Note title" "$HOME/.local/share/quill" 0
 ```
 
-The launcher accepts `QUILL_DATA_DIR`, `QUILL_STORE_PATH` and `QUILL_NOTE_TITLE`
-from the environment as defaults. A standalone `quickshell -p` process resolves
-`qs.Commons`/`qs.Ui` relative to the QML file, and Omarchy's plugin validator
-forbids symlinks inside a plugin, so `quill-window` stages a copy in
-`~/.cache/quill/detached/` with links to `/usr/share/omarchy/shell/{Commons,Ui}`
-and runs that. Re-running the launcher refreshes stale copies.
+The launcher accepts `QUILL_DATA_DIR`, `QUILL_STORE_PATH`, `QUILL_NOTE_TITLE`
+and `QUILL_PAGE_WIDTH` from the environment as defaults. A standalone
+`quickshell -p` process resolves `qs.Commons`/`qs.Ui` relative to the QML file,
+and Omarchy's plugin validator forbids symlinks inside a plugin, so
+`quill-window` stages a copy in `~/.cache/quill/detached/` with links to
+`/usr/share/omarchy/shell/{Commons,Ui}` and runs that. Re-running the launcher
+refreshes stale copies.
 
 ## External editor
 

@@ -152,6 +152,10 @@ Item {
   property bool linkedScroll: false
   property string linkedMode: "line"
   property bool scrollEcho: false
+  // Page width caps the note panes at A4's printable width and centres them.
+  // It is a readable measure matched to the printed page, not a page editor:
+  // there is no page furniture and no pagination.
+  property bool pageWidth: false
   // Persistent UI preferences live in the store's state.json under `ui` and are
   // restored on startup. restoreSession only gates the *layout* half of the
   // restore — mode, panes, category and last note — while every preference in
@@ -564,6 +568,7 @@ Item {
     root.highlighting = data.highlighting !== false
     root.linkedMode = data.linkedMode === "position" ? "position" : "line"
     root.linkedScroll = data.linkedScroll === true
+    root.pageWidth = data.pageWidth === true
     root.printCopies = root.settingNumber(data.printCopies, 1, 9, 1)
     root.printPrinter = typeof data.printPrinter === "string" ? data.printPrinter : ""
     root.printMargin = root.printMarginSetting(data.printMargin)
@@ -671,6 +676,7 @@ Item {
       "noteList": root.noteListOpen,
       "linkedScroll": root.linkedScroll,
       "linkedMode": root.linkedMode,
+      "pageWidth": root.pageWidth,
       "spellcheck": root.spellcheck,
       "highlighting": root.highlighting,
       "printCopies": root.printCopies,
@@ -1873,7 +1879,8 @@ Item {
       pluginDir + "/scripts/quill-window",
       String(id),
       String(title || "Note"),
-      dataRoot
+      dataRoot,
+      root.pageWidth ? "1" : "0"
     ]
     detachedProcess.running = true
     statusText = "Opened “" + String(title || "note") + "” in a detached window"
@@ -4604,6 +4611,7 @@ Item {
   onPrintCopiesChanged: root.scheduleSettingsSave()
   onPrintPrinterChanged: root.scheduleSettingsSave()
   onPrintMarginChanged: root.scheduleSettingsSave()
+  onPageWidthChanged: root.scheduleSettingsSave()
 
   onWidthChanged: {
     if (!modeChosen) mode = width >= Style.space(1000) ? "split" : "edit"
@@ -5215,6 +5223,21 @@ Item {
         ? sidebar.width : (sidebarRail.visible ? sidebarRail.width : 0)
       readonly property real noteSlot: noteList.visible
         ? noteList.width : (noteRail.visible ? noteRail.width : 0)
+      // The note panes run from the left slot to the chat dock (or the edge).
+      readonly property real paneLeft: sidebarSlot + noteSlot + gap * 2
+      readonly property real paneRight: chatDock.visible ? chatDock.left - gap : width
+      // A4 at 96 dpi is 794 px; at the Normal 15 mm print margin the printable
+      // width is 180 mm, about 680 px. Capping the pane there matches the
+      // printed line length. Split gives each pane its own measure either side
+      // of the one-pixel gutter, so the pair is wider than a single pane.
+      readonly property real pagePaneWidth: root.mode === "split"
+        ? Style.space(680) * 2 + Style.space(1)
+        : Style.space(680)
+      // Extra space added to each side of the pane to centre it. Zero whenever
+      // the pane already fits, so a narrow window behaves exactly as before.
+      readonly property real pageInset: root.pageWidth
+        ? Math.max(0, (paneRight - paneLeft - pagePaneWidth) / 2)
+        : 0
 
       Sidebar {
         id: sidebar
@@ -5324,11 +5347,11 @@ Item {
         // Anchors avoid the Row's stale child positions when the window
         // shrinks and a child width depends on sibling widths.
         anchors.left: parent.left
-        anchors.leftMargin: panesArea.sidebarSlot + panesArea.noteSlot + panesArea.gap * 2
+        anchors.leftMargin: panesArea.paneLeft + panesArea.pageInset
         anchors.top: parent.top
         anchors.bottom: parent.bottom
         anchors.right: chatDock.visible ? chatDock.left : parent.right
-        anchors.rightMargin: chatDock.visible ? panesArea.gap : 0
+        anchors.rightMargin: (chatDock.visible ? panesArea.gap : 0) + panesArea.pageInset
         color: Util.alpha(Commons.Color.foreground, 0.022)
         borderSpec: Border.controlSpec("normal", Commons.Color.foreground, Commons.Color.accent)
         radius: Style.cornerRadius
@@ -6008,6 +6031,16 @@ Item {
             root.linkedMode = "line"
             root.linkedScroll = true
           }
+        }
+
+        SettingsSection {
+          label: "PAGE"
+        }
+
+        ViewMenuRow {
+          label: "Page width"
+          checked: root.pageWidth
+          onActivated: root.pageWidth = !root.pageWidth
         }
 
         SettingsSection {

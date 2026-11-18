@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # quill-window - open one Quill note in a detached Quickshell window.
 #
-# Usage: quill-window <note-id> [title] [data-dir]
+# Usage: quill-window <note-id> [title] [data-dir] [page-width]
 #
 # Environment (defaults shown):
 #   QUILL_DATA_DIR    ~/.local/share/quill
 #   QUILL_STORE_PATH  <plugin>/scripts/quill-store
+#   QUILL_PAGE_WIDTH  0
 #   QUILL_ALLOW_REAL_DATA  1 (set here for the production detached window)
 #
 # Detached.qml imports Quickshell's qs.Commons/qs.Ui modules. A standalone
@@ -17,7 +18,7 @@ set -eu
 
 note_id="${1:-${QUILL_NOTE_ID:-}}"
 if [[ -z "$note_id" ]]; then
-  echo "usage: quill-window <note-id> [title] [data-dir]" >&2
+  echo "usage: quill-window <note-id> [title] [data-dir] [page-width]" >&2
   exit 2
 fi
 
@@ -28,6 +29,7 @@ stage="${XDG_CACHE_HOME:-$HOME/.cache}/quill/detached"
 export QUILL_NOTE_ID="$note_id"
 export QUILL_NOTE_TITLE="${2:-${QUILL_NOTE_TITLE:-Note}}"
 export QUILL_DATA_DIR="${3:-${QUILL_DATA_DIR:-$HOME/.local/share/quill}}"
+export QUILL_PAGE_WIDTH="${4:-${QUILL_PAGE_WIDTH:-0}}"
 export QUILL_STORE_PATH="${QUILL_STORE_PATH:-$script_dir/quill-store}"
 # Production opt-in for WritableGuard. It is set per launch, never globally,
 # so a harness cannot inherit it by accident.

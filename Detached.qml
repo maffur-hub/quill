@@ -67,6 +67,10 @@ ShellRoot {
   // design — writing settings from this process would replace the whole
   // settings object and clobber what the library window has open.
   property bool linkedScroll: false
+  // Inherits the library's page-width setting at launch. Session-only like
+  // linkedScroll: a second process must not write `settings set`, because that
+  // replaces the whole object and would clobber the library's open note.
+  property bool pageWidth: Quickshell.env("QUILL_PAGE_WIDTH") === "1"
   // Driving one pane's contentY from the other's change signal fires the
   // other change signal back; the echo stays set for one event-loop turn.
   property bool scrollEcho: false
@@ -75,10 +79,16 @@ ShellRoot {
   // for two panes, and the editor is happy a little wider than a preview.
   readonly property real contentWidth: {
     var available = Math.max(0, window.width - 2 * Style.space(14))
-    if (root.mode === "preview") return Math.min(available, Style.space(860))
-    if (root.mode === "edit") return Math.min(available, Style.space(1100))
+    if (root.mode === "preview") {
+      return Math.min(available, root.pageWidth ? Style.space(680) : Style.space(860))
+    }
+    if (root.mode === "edit") {
+      return Math.min(available, root.pageWidth ? Style.space(680) : Style.space(1100))
+    }
     // Two panes side by side are not one long line of prose: each keeps a
-    // readable measure of its own, so the pair uses the whole window.
+    // readable measure of its own, so the pair uses the whole window. Page
+    // width gives each its A4 measure and centres the pair.
+    if (root.pageWidth) return Math.min(available, Style.space(680) * 2 + paneRow.spacing)
     return available
   }
 
@@ -141,7 +151,8 @@ ShellRoot {
       root.statusText = "This note"
       return
     }
-    Quickshell.execDetached([root.windowPath, target, "Note", root.dataRoot])
+    Quickshell.execDetached([root.windowPath, target, "Note", root.dataRoot,
+      root.pageWidth ? "1" : "0"])
     root.statusText = "Opened in a new window"
   }
 
@@ -847,6 +858,24 @@ ShellRoot {
             ModeButton { label: "Edit"; current: root.mode === "edit"; onActivated: root.setMode("edit") }
             ModeButton { label: "Split"; current: root.mode === "split"; onActivated: root.setMode("split") }
             ModeButton { label: "Preview"; current: root.mode === "preview"; onActivated: root.setMode("preview") }
+          }
+
+          // Page width caps the panes at A4's printable measure. It sits with
+          // the mode chips so reading can be switched without going back to
+          // the library, which owns the stored setting.
+          Button {
+            objectName: "pageWidthButton"
+            width: Style.space(24)
+            height: Style.space(24)
+            text: ""
+            iconText: "\uf0f6"
+            iconSize: Style.font.bodySmall
+            tooltipText: root.pageWidth
+              ? "Page width — matches the printed page"
+              : "Full width — click for page width"
+            horizontalPadding: 0
+            verticalPadding: 0
+            onClicked: root.pageWidth = !root.pageWidth
           }
 
           // The chain sits with the mode chips because it only means anything
