@@ -31,6 +31,7 @@ cases=(
   tests/qml/library-long-note.qml
   tests/qml/tablegrid.qml
   tests/qml/preview-table.qml
+  tests/qml/editor-underlay.qml
 )
 
 status=0

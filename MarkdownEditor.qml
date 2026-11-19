@@ -2529,12 +2529,19 @@ TextArea {
       textFormat: root.richTextVisible ? Text.RichText : Text.PlainText
       wrapMode: Text.Wrap
       lineHeightMode: Text.FixedHeight
-      // One fixed line height for the whole underlay. Do not follow
-      // cursorRectangle.height: TextEdit shrinks a line that contains only
-      // emoji to the emoji font's metrics (12 px at the body size). Feeding
-      // that back made every underlay line 4 px shorter, so in a long note the
-      // painted text drifted hundreds of pixels above the real caret.
-      lineHeight: Math.max(1, Math.round(editorMetrics.height))
+      // TextEdit has no lineHeight property: it advances a normal line by
+      // ceil(fontMetrics.height), so the underlay has to use the ceiling too.
+      // Rounding left the painted text a pixel above the caret on every line,
+      // which put a click on an earlier line the further down the note it was.
+      //
+      // One fixed height for the whole underlay also stops a large inline
+      // font-size span, which the mirror renders, from stretching its line and
+      // dragging every line after it out of step.
+      //
+      // An emoji-only line is TextEdit's own exception: it shrinks to the
+      // emoji font's metrics. A single underlay height cannot follow that, so
+      // matching ordinary text is the lesser error.
+      lineHeight: Math.max(1, Math.ceil(editorMetrics.height))
       color: root.foregroundColor
       font.family: root.font.family
       font.pixelSize: root.font.pixelSize
