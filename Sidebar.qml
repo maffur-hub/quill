@@ -253,58 +253,6 @@ BorderSurface {
 
         Item { width: 1; height: Style.space(6) }
 
-        Text {
-          width: parent.width
-          height: Style.space(24)
-          verticalAlignment: Text.AlignVCenter
-          text: "TAGS"
-          color: Util.alpha(Commons.Color.foreground, 0.5)
-          font.family: Style.font.family
-          font.pixelSize: Style.font.bodySmall
-          font.bold: true
-        }
-
-        Text {
-          visible: root.tags.length === 0
-          width: parent.width
-          text: "No tags yet — write #tag"
-          color: Util.alpha(Commons.Color.foreground, 0.32)
-          font.family: Style.font.family
-          font.pixelSize: Style.font.bodySmall
-          wrapMode: Text.WordWrap
-          leftPadding: Style.space(8)
-        }
-
-        Repeater {
-          model: root.tagRows
-          delegate: SideRow {
-            id: tagRow
-            required property var modelData
-            readonly property string tagPath: String(modelData.path)
-            readonly property bool realTag: modelData.isLeaf === true
-
-            label: "#" + String(modelData.label)
-            count: Number(modelData.count) || 0
-            showCount: true
-            indent: 4 + Number(modelData.depth) * 10
-            actionText: realTag ? "⋯" : ""
-            actionColor: Commons.Color.foreground
-            selected: realTag
-              ? root.category === "tag:" + tagPath
-              : root.category === "tagtree:" + tagPath
-            onActivated: {
-              if (realTag) root.categorySelected("tag:" + tagPath)
-              else root.tagSubtreeSelected(tagPath)
-            }
-            onActionTriggered: root.openTagMenu(tagPath, tagRow)
-            onRightClicked: {
-              if (realTag) root.openTagMenu(tagPath, tagRow)
-            }
-          }
-        }
-
-        Item { width: 1; height: Style.space(6) }
-
         Row {
           width: parent.width
           height: Style.space(24)
@@ -509,6 +457,58 @@ BorderSurface {
                   drop.accept(Qt.MoveAction)
                 }
               }
+            }
+          }
+        }
+
+        Item { width: 1; height: Style.space(6) }
+
+        Text {
+          width: parent.width
+          height: Style.space(24)
+          verticalAlignment: Text.AlignVCenter
+          text: "TAGS"
+          color: Util.alpha(Commons.Color.foreground, 0.5)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.bodySmall
+          font.bold: true
+        }
+
+        Text {
+          visible: root.tags.length === 0
+          width: parent.width
+          text: "No tags yet — write #tag"
+          color: Util.alpha(Commons.Color.foreground, 0.32)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.WordWrap
+          leftPadding: Style.space(8)
+        }
+
+        Repeater {
+          model: root.tagRows
+          delegate: SideRow {
+            id: tagRow
+            required property var modelData
+            readonly property string tagPath: String(modelData.path)
+            readonly property bool realTag: modelData.isLeaf === true
+
+            label: "#" + String(modelData.label)
+            count: Number(modelData.count) || 0
+            showCount: true
+            indent: 4 + Number(modelData.depth) * 10
+            actionText: realTag ? "⋯" : ""
+            actionColor: Commons.Color.foreground
+            selected: realTag
+              ? root.category === "tag:" + tagPath
+              : root.category === "tagtree:" + tagPath
+            onActivated: {
+              if (realTag) root.categorySelected("tag:" + tagPath)
+              else root.tagSubtreeSelected(tagPath)
+            }
+            onActionTriggered: root.openTagMenu(tagPath, tagRow)
+            onRightClicked: {
+              if (realTag) root.openTagMenu(tagPath, tagRow)
             }
           }
         }
