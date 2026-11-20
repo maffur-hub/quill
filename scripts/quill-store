@@ -1727,10 +1727,28 @@ def sync_index(conn: sqlite3.Connection, full: bool = False) -> bool:
 
 
 def with_index():
-    conn = index_connect()
-    if not INDEX_TRUSTED:
-        sync_index(conn)
-    return conn
+    """Open the index, healing a damaged one from the notes once.
+
+    The index is derived data, so garbage or a truncated file should not wedge
+    every read until `index --rebuild`. Only corruption markers qualify: a
+    locked, unreadable, or full database is a real environment problem, and
+    deleting the index in response would just loop. Callers hold the store
+    lock, so the rebuild races nothing.
+    """
+    try:
+        conn = index_connect()
+        if not INDEX_TRUSTED:
+            sync_index(conn)
+        return conn
+    except sqlite3.DatabaseError as error:
+        if "not a database" not in str(error) and "malformed" not in str(error):
+            raise
+        for suffix in ("", "-wal", "-shm"):
+            with contextlib.suppress(OSError):
+                os.unlink(str(INDEX) + suffix)
+        conn = index_connect()
+        sync_index(conn, full=True)
+        return conn
 
 
 # --------------------------------------------------------------------------
