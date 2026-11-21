@@ -91,6 +91,9 @@ note over 400,000 characters opens read-only too, because laying that much text
 out blocks the window for seconds; the rich-text highlighter already stops at
 200,000.
 
+Change detection (the `--if-mtime` token) is millisecond-granular by design,
+so an external write in the same millisecond is invisible and raises no banner.
+
 While a note is dirty, Quill also writes a debounced (150 ms) copy to
 `<note path>.draft`, for example `notes/Work/plan.md.draft`. The suffix is
 invisible to the `*.md` note scan and to the index. A normal save removes the
