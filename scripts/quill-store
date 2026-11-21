@@ -1415,13 +1415,19 @@ def rewrite_wiki_links(text: str, old_keys: set[str], new_title: str) -> tuple[s
 # index
 
 
-def index_connect() -> sqlite3.Connection:
+def index_connect() -> tuple[sqlite3.Connection, bool]:
+    """Open the index, recreating it from scratch when the schema is not trusted.
+
+    The second return value is True when this call wiped and recreated the
+    file, so the caller knows the index is empty and must be repopulated.
+    """
     ROOT.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(INDEX), timeout=15)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=15000")
     version = 0
+    rebuilt = False
     try:
         version = int(conn.execute("PRAGMA user_version").fetchone()[0])
     except (sqlite3.DatabaseError, TypeError):
@@ -1436,7 +1442,8 @@ def index_connect() -> sqlite3.Connection:
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA busy_timeout=15000")
         create_schema(conn)
-    return conn
+        rebuilt = True
+    return conn, rebuilt
 
 
 def create_schema(conn: sqlite3.Connection) -> None:
@@ -1773,7 +1780,7 @@ def sync_index(conn: sqlite3.Connection, full: bool = False) -> bool:
     return changed
 
 
-def with_index():
+def with_index(sync: bool = True):
     """Open the index, healing a damaged one from the notes once.
 
     The index is derived data, so garbage or a truncated file should not wedge
@@ -1781,10 +1788,17 @@ def with_index():
     locked, unreadable, or full database is a real environment problem, and
     deleting the index in response would just loop. Callers hold the store
     lock, so the rebuild races nothing.
+
+    `sync=False` lets a caller that indexes its own change skip the
+    incremental walk over the notes directory. A rebuild always forces the
+    full sync regardless: the recreated index is empty, so without it nothing
+    would ever repopulate it.
     """
     try:
-        conn = index_connect()
-        if not INDEX_TRUSTED:
+        conn, rebuilt = index_connect()
+        if rebuilt:
+            sync_index(conn, full=True)
+        elif sync and not INDEX_TRUSTED:
             sync_index(conn)
         return conn
     except sqlite3.DatabaseError as error:
@@ -1793,7 +1807,7 @@ def with_index():
         for suffix in ("", "-wal", "-shm"):
             with contextlib.suppress(OSError):
                 os.unlink(str(INDEX) + suffix)
-        conn = index_connect()
+        conn, _ = index_connect()
         sync_index(conn, full=True)
         return conn
 
@@ -2017,9 +2031,13 @@ def write_note(args, content_path: Path | None) -> dict:
             pass
         stat = path.stat()
         # The body is already safely on disk, so a corrupt index must heal
-        # here too instead of reporting a save that did land as an error:
-        # with_index's full resync indexes the bytes just written.
-        conn = with_index()
+        # here too instead of reporting a save that did land as an error.
+        # The write path skips with_index's incremental walk: this save's
+        # index_and_resolve below upserts exactly this note. with_index still
+        # forces a full resync when it had to recreate the schema, because a
+        # wiped index is empty. Reads sync by design and heal anything this
+        # skip leaves stale for other notes.
+        conn = with_index(sync=False)
         try:
             index_and_resolve(conn, path)
             conn.commit()
@@ -2086,7 +2104,7 @@ def command_create(args) -> dict:
             identifier = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}.md"
             path = parent / identifier
         atomic_write(path, encoded)
-        conn = index_connect()
+        conn, _ = index_connect()
         try:
             index_and_resolve(conn, path)
             conn.commit()
@@ -2306,7 +2324,7 @@ def command_duplicate(args) -> dict:
         content = decode_note_utf8(data)
         source_folder = source.parent.relative_to(NOTES)
         folder = "" if str(source_folder) == "." else source_folder.as_posix()
-        conn = index_connect()
+        conn, _ = index_connect()
         try:
             sync_index(conn)
             used = {
@@ -2451,7 +2469,7 @@ def command_rename(args) -> dict:
                     sources.append(
                         {"id": source_id, "title": source_title, "count": count}
                     )
-        conn = index_connect()
+        conn, _ = index_connect()
         try:
             changed_keys: set[str] = set()
             for source_id in [identifier] + [source["id"] for source in sources]:
@@ -2536,7 +2554,7 @@ def batch_targets(args, trashed: bool = False) -> list[tuple[str, Path]]:
 
 def sync_index_once() -> None:
     """Refresh the derived index once, at the end of a bulk command."""
-    conn = index_connect()
+    conn, _ = index_connect()
     try:
         sync_index(conn)
     finally:
@@ -2743,7 +2761,7 @@ def command_restore_version(args) -> dict:
             path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write(path, data)
         stat = path.stat()
-        conn = index_connect()
+        conn, _ = index_connect()
         try:
             index_and_resolve(conn, path)
             conn.commit()
@@ -2787,7 +2805,7 @@ def command_empty_trash(_args) -> dict:
                 if path.is_dir():
                     with contextlib.suppress(OSError):
                         path.rmdir()
-        conn = index_connect()
+        conn, _ = index_connect()
         try:
             sync_index(conn)
         finally:
@@ -2955,7 +2973,7 @@ def command_folder(args) -> dict:
             result = {"deleted": True, "folder": folder, "moved": moved}
         else:
             raise StoreError("unknown folder action")
-        conn = index_connect()
+        conn, _ = index_connect()
         try:
             sync_index(conn)
         finally:
@@ -4057,7 +4075,7 @@ def delete_tag_everywhere(tag) -> dict:
             atomic_write(path, updated_bytes)
             snapshotted.append(identifier)
             updated += 1
-        conn = index_connect()
+        conn, _ = index_connect()
         try:
             sync_index(conn, full=True)
         finally:
@@ -4172,7 +4190,7 @@ def command_tag_rename(args) -> dict:
                 atomic_write(path, updated_bytes)
                 snapshotted.append(identifier)
                 updated += 1
-        conn = index_connect()
+        conn, _ = index_connect()
         try:
             sync_index(conn, full=True)
         finally:
@@ -4418,7 +4436,7 @@ def command_preview(args) -> dict:
             raise StoreError(f"note not found: {identifier}")
         payload = read_note_bytes(path)
         with locked():
-            conn = index_connect()
+            conn, _ = index_connect()
             try:
                 sync_index(conn)
                 by_title, by_stem = lookup_titles(conn)
@@ -4476,7 +4494,7 @@ def command_import(args) -> dict:
                     existing = {path.relative_to(NOTES).as_posix() for path in NOTES.rglob("*.md")}
                     pins.update(value for value in source_pins if value in existing)
                     save_pinned(pins)
-            conn = index_connect()
+            conn, _ = index_connect()
             try:
                 sync_index(conn, full=True)
             finally:
@@ -4491,7 +4509,7 @@ def command_index(args) -> dict:
             for suffix in ("", "-wal", "-shm"):
                 with contextlib.suppress(OSError):
                     os.unlink(str(INDEX) + suffix)
-        conn = index_connect()
+        conn, _ = index_connect()
         try:
             sync_index(conn, full=bool(args.rebuild))
             notes = int(conn.execute("SELECT COUNT(*) FROM notes WHERE trashed=0").fetchone()[0])
@@ -4864,7 +4882,7 @@ class _Watcher:
         full = False
         with EXEC_LOCK:
             with locked():
-                conn = index_connect()
+                conn, _ = index_connect()
                 try:
                     if fallback:
                         sync_index(conn, full=False)
@@ -5192,7 +5210,7 @@ def serve(socket_path: Path, watch: bool = True, idle: float = 0.0) -> None:
         if watch and start_watcher(broadcast):
             with EXEC_LOCK:
                 with locked():
-                    conn = index_connect()
+                    conn, _ = index_connect()
                     try:
                         sync_index(conn)
                     finally:
