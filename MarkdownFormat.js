@@ -1165,9 +1165,52 @@ function currentLinkURL(text, start, end) {
   return link ? link.url : ""
 }
 
-function planLink(oldText, start, end, url) {
-  var target = textOf(url).trim()
+// A destination the reader can read back. linkAt scans the destination with a
+// parenthesis depth counter, skips `\x` escape pairs and stops at a newline,
+// so a raw interior space, an unmatched parenthesis or a bare `%` would be
+// re-read differently from what was written. Encode those; balanced
+// parentheses stay raw because the depth counter reads them, and `#` and `?`
+// are ordinary URL characters.
+function encodeLinkDestination(value) {
+  var target = textOf(value).trim()
   if (target === "") return fail("Enter a link URL")
+  if (/[\r\n]/.test(target)) return fail("A link URL cannot contain line breaks")
+  // `%` first: the replacements below introduce their own percent signs. A
+  // valid %XX escape is already encoded, so re-editing a written link keeps it
+  // (FileUrls decodes valid escapes for the same reason); any other percent is
+  // bare and ambiguous to a decoder.
+  var encoded = target.replace(/%(?![0-9A-Fa-f]{2})/g, "%25").replace(/ /g, "%20")
+  var chars = []
+  var openParens = []
+  var index = 0
+  while (index < encoded.length) {
+    var char = encoded.charAt(index)
+    if (char === "\\") {
+      // A lone trailing backslash would escape the link's own closing `)` when
+      // linkAt scans it back, so the written link would have no terminator.
+      if (index + 1 >= encoded.length) return fail("A link URL cannot end with a backslash")
+      chars.push(encoded.slice(index, index + 2))
+      index += 2
+      continue
+    }
+    if (char === "(") {
+      openParens.push(chars.length)
+      chars.push(char)
+    } else if (char === ")") {
+      if (openParens.length === 0) chars.push("%29")
+      else { openParens.pop(); chars.push(char) }
+    } else {
+      chars.push(char)
+    }
+    index += 1
+  }
+  for (var p = 0; p < openParens.length; p++) chars[openParens[p]] = "%28"
+  return chars.join("")
+}
+
+function planLink(oldText, start, end, url) {
+  var target = encodeLinkDestination(url)
+  if (typeof target !== "string") return target
   var link = linkAt(oldText, start, end)
   if (link) {
     var updated = oldText.slice(0, link.urlStart) + target + oldText.slice(link.urlEnd)
@@ -1213,19 +1256,39 @@ function planEmoji(oldText, start, end, value) {
   return finish(oldText, next, caret, caret)
 }
 
-// Insert a wiki-style note link and leave the title selected so typing
-// replaces it. A non-empty selection is used as the title.
+// Insert a wiki-style note link. At a caret the picked title is the target and
+// is left selected so typing replaces it. Over a selection the picked title is
+// still the target and the selected text becomes its alias, so neither input
+// is discarded: [[Target|Alias]], with the alias left selected.
 function planNoteLink(oldText, start, end, value) {
   var selected = start < end ? oldText.slice(start, end) : ""
-  var title = selected !== "" ? selected : textOf(value)
-  // One line only: a note title cannot contain a line break.
-  title = title.replace(/[\r\n]+/g, " ").trim()
-  if (title === "") return fail("Enter a note title")
-  if (title.indexOf("]]") >= 0) return fail("Note title cannot contain ]]")
-  var insertion = "[[" + title + "]]"
-  var next = oldText.slice(0, start) + insertion + oldText.slice(end)
-  var titleStart = start + 2
-  return finish(oldText, next, titleStart, titleStart + title.length)
+  if (selected === "") {
+    var title = textOf(value)
+    // One line only: a note title cannot contain a line break.
+    title = title.replace(/[\r\n]+/g, " ").trim()
+    if (title === "") return fail("Enter a note title")
+    if (title.indexOf("]]") >= 0) return fail("Note title cannot contain ]]")
+    var insertion = "[[" + title + "]]"
+    var next = oldText.slice(0, start) + insertion + oldText.slice(end)
+    var titleStart = start + 2
+    return finish(oldText, next, titleStart, titleStart + title.length)
+  }
+  // The target splits on the first `|` and `#` splits a heading off the target,
+  // so those characters would silently re-target the link: refuse, never
+  // rewrite the picked title. WIKI_RE forbids every bracket in the construct.
+  var target = textOf(value).replace(/[\r\n]+/g, " ").trim()
+  if (target === "") return fail("Enter a note title")
+  if (target.indexOf("]]") >= 0) return fail("Note title cannot contain ]]")
+  if (/[\[\]|#]/.test(target)) return fail("Note title cannot contain [ ] # or |")
+  // The alias is the visible label; a paragraph-crossing selection is folded to
+  // one line rather than refused.
+  var alias = selected.replace(/[\r\n]+/g, " ").trim()
+  if (alias === "") return fail("Select a label for the note link")
+  if (/[\[\]]/.test(alias)) return fail("Link label cannot contain [ or ]")
+  var wiki = "[[" + target + "|" + alias + "]]"
+  var after = oldText.slice(0, start) + wiki + oldText.slice(end)
+  var aliasStart = start + 2 + target.length + 1
+  return finish(oldText, after, aliasStart, aliasStart + alias.length)
 }
 
 // --------------------------------------------------------- blocks and tables
