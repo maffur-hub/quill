@@ -245,6 +245,11 @@ Item {
   // Last content written per note id. A save whose bytes equal this is a
   // no-op and must not wake the Joplin sync.
   property var savedTextById: ({})
+  // Last mtime known to belong to each note id: the one a read returned or a
+  // write produced. A save that starts while one of ours is still in flight
+  // reads this at execution time, not at enqueue time, because the in-flight
+  // write is the one that moves the file to the version it must match.
+  property var modifiedById: ({})
 
   // Chat is remembered for this library session only: no config file, and it
   // starts closed every time the shell launches.
@@ -401,6 +406,14 @@ Item {
     }
   }
 
+  // The mtime a queued write must still match when it runs. Zero means "not
+  // known", which leaves the write unguarded exactly as before: a guard we
+  // invent would refuse our own save.
+  function saveGuardFor(noteId) {
+    if (noteId === undefined || noteId === null || noteId === "") return 0
+    return Math.round(Number(root.modifiedById[noteId] || 0))
+  }
+
   // The original per-call path: one backend process per job. Still the only
   // path when the bridge is missing or has failed too often.
   function pumpSpawned() {
@@ -410,12 +423,27 @@ Item {
     process.outputText = ""
     process.errorText = ""
     var command = [root.storePath].concat(job.args || [])
+    // Bound here, not when the buffer was written: a save queued behind one of
+    // ours only learns the version it is based on once that save has returned.
+    // The previous job's onSuccess (which seeds modifiedById) ran before this
+    // pump, so the value is the one now on disk.
+    if (job.lateGuard) {
+      var guard = root.saveGuardFor(job.noteId)
+      if (guard > 0) command = command.concat(["--if-mtime", String(guard)])
+    }
     process.command = command
     process.running = true
   }
 
   function daemonRequest(job) {
-    var payload = { "id": job.daemonId, "args": job.args || [], "stdin": job.stdin || "" }
+    var args = job.args || []
+    // Same late binding as pumpSpawned: the bridge answers the previous job
+    // before pump() asks for this one.
+    if (job.lateGuard) {
+      var guard = root.saveGuardFor(job.noteId)
+      if (guard > 0) args = args.concat(["--if-mtime", String(guard)])
+    }
+    var payload = { "id": job.daemonId, "args": args, "stdin": job.stdin || "" }
     try {
       daemon.write(JSON.stringify(payload) + "\n")
     } catch (error) {
@@ -1443,6 +1471,7 @@ Item {
         // Any save that was in flight when this buffer arrived is superseded.
         root.writeGeneration += 1
         root.loadedModified = Number(result.modified || 0)
+        root.modifiedById[requestedId] = Number(result.modified || 0)
         root.savedTextById[requestedId] = readOnly ? "" : body
         root.dirty = false
         root.editVersion = 0
@@ -1559,6 +1588,9 @@ Item {
       property int targetVersion: 0
       property int targetGeneration: 0
       property int targetGuard: 0
+      // True when the guard could not be baked in because a save of ours was
+      // still in flight. The runner binds it to the mtime that save returned.
+      property bool targetLateGuard: false
       property string targetText: ""
       atomicWrites: true
       blockAllReads: true
@@ -1676,13 +1708,16 @@ Item {
       if (!dirty) return
     }
     // Compare-and-swap: name the version this buffer was based on so the store
-    // can refuse the write if another window saved in the meantime. Skipped
-    // while a save of ours is still in flight, because its mtime is not known
-    // yet and the queue runs them in order anyway.
+    // can refuse the write if another window saved in the meantime. When one of
+    // our own saves is still in flight its mtime is not known yet, and it is
+    // the write that will move the file: a queued save must be bound to the
+    // version that save returns, not to the one this buffer was loaded from
+    // (which its write is already invalidating) and not to nothing at all.
     var expectedMtime = 0
-    if (!root.ignoreStaleWrite && root.inFlightSaveText === ""
-        && root.loadedModified > 0) {
-      expectedMtime = Math.round(root.loadedModified)
+    var lateGuard = false
+    if (!root.ignoreStaleWrite) {
+      if (root.inFlightSaveText !== "") lateGuard = true
+      else if (root.loadedModified > 0) expectedMtime = Math.round(root.loadedModified)
     }
     root.ignoreStaleWrite = false
     saveSeq += 1
@@ -1699,6 +1734,7 @@ Item {
     view.targetVersion = editVersion
     view.targetGeneration = generation
     view.targetGuard = expectedMtime
+    view.targetLateGuard = lateGuard
     view.targetText = text
     saveState = "Saving…"
     view.setText(text)
@@ -1711,6 +1747,7 @@ Item {
     // writeGeneration to spot a save that a reload superseded.
     var generation = view.targetGeneration
     var guard = view.targetGuard
+    var lateGuard = view.targetLateGuard
     var contentPath = view.path
     var savedText = String(view.targetText || "")
     view.destroy()
@@ -1721,6 +1758,7 @@ Item {
       silent: true,
       noteId: noteId,
       version: version,
+      lateGuard: lateGuard,
       onSuccess: function(result) { root.afterWrite(noteId, version, result, savedText, generation) },
       onError: function(message) {
         if (root.inFlightSaveText === savedText) root.inFlightSaveText = ""
@@ -1779,6 +1817,10 @@ Item {
     // Only the matching save clears the in-flight text: a newer edit may have
     // started another save while this one was running.
     if (inFlightSaveText === savedText) inFlightSaveText = ""
+    // A successful write moved this note's mtime, whether or not the note is
+    // still selected and whether or not the buffer this save came from is
+    // still the one on screen. Saves queued behind it name this version.
+    root.modifiedById[noteId] = Number(result.modified || 0)
     if (generation !== undefined && Number(generation) !== root.writeGeneration) {
       // The buffer was replaced (reload, or the note was reloaded while this
       // save was in flight), so the text that just landed on disk is the one
@@ -2112,6 +2154,10 @@ Item {
     root.diskChangePending = false
     root.diskChangeText = ""
     root.loadedModified = Number(modified || Date.now())
+    // A late-bound guard may only name a version the caller actually reported.
+    // Without one, forget the older stamp instead of inventing a guard that
+    // would refuse the next save of our own.
+    if (Number(modified || 0) > 0) root.modifiedById[id] = Number(modified)
     // A clean external reload is a saved state: there is nothing to write.
     root.saveState = "Saved " + Qt.formatTime(new Date(root.loadedModified), "HH:mm")
     root.statusText = message || "Reloaded from disk"
