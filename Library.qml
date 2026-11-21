@@ -455,9 +455,25 @@ Item {
     }
   }
 
+  // A bridge that cannot exec at all never reports onStarted or onExited:
+  // Quickshell only logs a warning, and without this the first job would sit
+  // in the pending slot forever with every later command queued behind it. The
+  // watchdog covers exactly that class. Any line from the bridge proves it is
+  // alive and stops the timer, and a real exit stops it too, so a slow but
+  // working cold start only ever pays a strike if it says nothing for the
+  // whole interval. Three strikes reuse handleDaemonExit's counting, which is
+  // what falls back to the per-call runner.
+  Timer {
+    id: daemonStartWatchdog
+    interval: 3000
+    repeat: false
+    onTriggered: root.handleDaemonExit(-1)
+  }
+
   function startDaemon() {
     if (root.daemonReady || root.daemonStarting) return
     root.daemonStarting = true
+    daemonStartWatchdog.restart()
     daemon.environment = { "QUILL_DATA_DIR": root.dataRoot }
     daemon.command = [root.daemonPath]
     daemon.running = true
@@ -466,6 +482,9 @@ Item {
   function handleDaemonLine(raw) {
     var line = String(raw || "").trim()
     if (line === "") return
+    // A line, even an unparsable one, proves the process runs: only a real
+    // exec failure is silent for the whole watchdog interval.
+    daemonStartWatchdog.stop()
     var payload = null
     try {
       payload = JSON.parse(line)
@@ -498,10 +517,16 @@ Item {
   }
 
   function handleDaemonExit(exitCode) {
+    daemonStartWatchdog.stop()
     root.daemonReady = false
     root.daemonStarting = false
     root.daemonFailures = root.daemonFailures + 1
     if (root.daemonFailures > 2) {
+      if (!root.daemonDisabled) {
+        // Surfaces the silent degradation: every command from here runs as its
+        // own process with no bridge in between.
+        root.statusText = "Backend bridge unavailable — running commands directly"
+      }
       root.daemonDisabled = true
       root.pendingJob = null
     }
@@ -4900,6 +4925,7 @@ Item {
       onStreamFinished: daemon.lastError = String(text || "")
     }
     onStarted: {
+      daemonStartWatchdog.stop()
       root.daemonReady = true
       root.daemonStarting = false
       var job = root.pendingJob
