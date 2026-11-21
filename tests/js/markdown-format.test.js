@@ -205,6 +205,78 @@ test('reversed selections are normalised before formatting', () => {
   assert.deepEqual({ start: result.selectionStart, end: result.selectionEnd }, { start: 2, end: 7 })
 })
 
+// ------------------------------------------------- inline marks and paragraphs
+//
+// A paragraph break ends the inline context: the preview renders an emphasis
+// pair that straddles one as literal markers ("**alpha" then "beta**"), so a
+// wrap that would write one is refused before anything reaches the note.
+
+const INLINE_MARKS = ['bold', 'italic', 'underline', 'strike', 'code', 'highlight',
+  'superscript', 'subscript']
+
+test('an inline mark refuses to wrap a selection across a paragraph break', () => {
+  for (const action of INLINE_MARKS) {
+    const result = plan('alpha\n\nbeta', 0, 11, action)
+    assert.equal(result.ok, false, action + ' is refused')
+    assert.equal(result.error, 'Select within one paragraph', action)
+    // A refusal carries no text: the editor has nothing to apply.
+    assert.equal('text' in result, false, action + ' carries no text')
+    assert.equal('edits' in result, false, action + ' carries no edits')
+  }
+})
+
+test('a paragraph break with trailing spaces is still a paragraph break', () => {
+  for (const action of INLINE_MARKS) {
+    const result = plan('alpha\n \t\nbeta', 0, 13, action)
+    assert.equal(result.ok, false, action + ' is refused')
+    assert.equal(result.error, 'Select within one paragraph', action)
+  }
+})
+
+test('an inline mark still wraps a selection across a soft break', () => {
+  // The refusal is only for paragraph breaks: one line ending keeps one
+  // paragraph, and the preview renders these marks across it.
+  for (const action of INLINE_MARKS) {
+    const result = plan('alpha\nbeta', 0, 10, action)
+    assert.equal(result.ok, true, action + ' still wraps')
+  }
+})
+
+test('switching an inline mark off across a paragraph break stays allowed', () => {
+  // Removing markers cannot create content the renderer cannot read.
+  const result = plan('**alpha\n\nbeta**', 2, 13, 'bold')
+  assert.equal(result.ok, true)
+  assert.equal(result.text, 'alpha\n\nbeta')
+})
+
+// ------------------------------------------------------------------ headings
+
+test('heading level 0 strips an ATX closing sequence', () => {
+  const result = plan('## hi ##', 0, 8, 'heading', 0)
+  assert.equal(result.ok, true)
+  assert.equal(result.text, 'hi')
+})
+
+test('heading level 0 strips a closing sequence and its trailing spaces', () => {
+  const result = plan('## hi ###   ', 0, 12, 'heading', 0)
+  assert.equal(result.ok, true)
+  assert.equal(result.text, 'hi')
+})
+
+test('setting a level on a closing-carrying heading rewrites it without the closer', () => {
+  const result = plan('## hi ##', 0, 8, 'heading', 2)
+  assert.equal(result.ok, true)
+  assert.equal(result.text, '## hi')
+  // Write then reparse: the line still reads back as the requested level.
+  assert.equal(load('MarkdownFormat.js').headingPrefix(result.text).level, 2)
+})
+
+test('hashes without a preceding space are heading content, not a closer', () => {
+  const result = plan('## hi##', 0, 7, 'heading', 0)
+  assert.equal(result.ok, true)
+  assert.equal(result.text, 'hi##')
+})
+
 test('a box without a following space is not a task', () => {
   assert.equal(MarkdownFormat.parseTaskLine('- [x]ylophone'), null)
   assert.deepEqual(plain(MarkdownFormat.parseTaskLine('- [x] done')),

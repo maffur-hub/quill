@@ -780,6 +780,13 @@ function planInline(oldText, mark, start, end, name) {
   }
   if (covered) return removePairs(oldText, [covered], start, end)
   if (enclosing) return removePairs(oldText, [enclosing], start, end)
+  // A paragraph break ends the inline context: the preview renders a marker
+  // pair that straddles one as literal text on each side, so wrapping there
+  // would write Markdown the renderer cannot read back as formatting. Only
+  // the wrap path is guarded: removing markers cannot create that.
+  if (/\n[ \t]*\n/.test(oldText.slice(start, end))) {
+    return fail("Select within one paragraph")
+  }
   if (hasInlineMarker(oldText, mark, start, end)) {
     return fail("Cannot toggle " + String(name || "formatting") + " across existing markers")
   }
@@ -864,6 +871,18 @@ function headingPrefix(rest) {
   return { level: match[1].length, length: match[0].length, text: match[0] }
 }
 
+// CommonMark's optional ATX closing sequence: hashes at the end of the line,
+// preceded by at least one space or tab and followed only by spaces or tabs.
+// The hashes in "## hi##" have no space before them, so they stay content.
+// The check runs on the line's content, after the opening prefix: a line that
+// is nothing but hashes ("### ###") has no closer in CommonMark either.
+function headingClosing(content) {
+  var match = String(content === undefined || content === null ? "" : content)
+    .match(/[ \t]+#+[ \t]*$/)
+  if (!match) return null
+  return { start: match.index, length: match[0].length }
+}
+
 function planList(oldText, start, end, kind) {
   var chosen = selectedLines(oldText, start, end)
   var lines = chosen.lines
@@ -928,7 +947,16 @@ function planHeading(oldText, start, end, level) {
     indices.push(i)
   }
   if (indices.length === 0) return finish(oldText, oldText, start, end)
-  var allowed = indices.every(function(index) {
+  // A line that still carries an ATX closing sequence is rewritten to the
+  // canonical form rather than toggled off: re-applying the same level on
+  // "## hi ##" would otherwise drop the prefix and leave the hashes behind.
+  var carriesClosing = indices.some(function(index) {
+    var parts = lineParts(lines[index])
+    var heading = headingPrefix(parts.rest)
+    if (!heading) return false
+    return headingClosing(parts.rest.slice(heading.length)) !== null
+  })
+  var allowed = !carriesClosing && indices.every(function(index) {
     var parts = lineParts(lines[index])
     var heading = headingPrefix(parts.rest)
     return heading && heading.level === level
@@ -943,6 +971,13 @@ function planHeading(oldText, start, end, level) {
     var replacement = allowed || level === 0 ? "" : repeat("#", level) + " "
     var at = line.start + parts.indent.length
     edits.push({ start: at, end: at + removeLength, text: replacement })
+    if (heading) {
+      var closing = headingClosing(parts.rest.slice(heading.length))
+      if (closing) {
+        var closeAt = at + heading.length + closing.start
+        edits.push({ start: closeAt, end: closeAt + closing.length, text: "" })
+      }
+    }
   }
   var newText = applyEdits(oldText, edits)
   return finish(oldText, newText, mapOffset(edits, start, "end"), mapOffset(edits, end, "end"))

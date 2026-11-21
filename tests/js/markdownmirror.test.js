@@ -131,3 +131,86 @@ test('every colour comes from the supplied palette', () => {
   assert.match(html, /color:#040506/)
   assert.match(html, /color:#010203/)
 })
+
+// --------------------------------------------------- inline marks over a break
+//
+// A soft line break stays inside one paragraph, and the preview renders these
+// marks across it. The underlay has to paint the same state on both lines or
+// the styled text and the caret disagree about what is emphasised.
+// (The preview does not render ==highlight== across a soft break, so the
+// mirror keeps it per-line; the row below pins that agreement.)
+
+test('italic carries across a soft line break', () => {
+  assert.equal(highlight('*alpha\nbeta*'),
+    MUTED + '*</span><i>alpha<br/>beta</i>' + MUTED + '*</span>')
+})
+
+test('bold carries across a soft line break, even mid-line', () => {
+  assert.equal(highlight('one **alpha\nbeta** two'),
+    'one ' + MUTED + '**</span><b>alpha<br/>beta</b>' + MUTED + '**</span> two')
+})
+
+test('strike and code carry across a soft line break', () => {
+  assert.equal(highlight('~~alpha\nbeta~~'),
+    MUTED + '~~</span><s>alpha<br/>beta</s>' + MUTED + '~~</span>')
+  assert.equal(highlight('`alpha\nbeta`'),
+    ACCENT + '`alpha<br/>beta`</span>')
+})
+
+test('the tag marks carry across a soft line break', () => {
+  assert.equal(highlight('<u>alpha\nbeta</u>'),
+    MUTED + '&lt;u&gt;</span><u>alpha<br/>beta</u>' + MUTED + '&lt;/u&gt;</span>')
+  assert.equal(highlight('<sup>alpha\nbeta</sup>'),
+    MUTED + '&lt;sup&gt;</span><sup>alpha<br/>beta</sup>'
+    + MUTED + '&lt;/sup&gt;</span>')
+})
+
+test('a highlight does not carry across a soft line break', () => {
+  // The preview leaves the markers literal here, so the underlay must too.
+  assert.equal(highlight('==alpha\nbeta=='), '==alpha<br/>beta==')
+})
+
+test('a blank line ends the carried state', () => {
+  assert.equal(highlight('*alpha\n\nbeta*'), '*alpha<br/><br/>beta*')
+})
+
+test('carried state never leaks into or out of a fenced block', () => {
+  const html = highlight('**open\n```\nclose**\n```')
+  assert.doesNotMatch(html, /<b>/)
+  assert.match(html, /close\*\*/)
+})
+
+// ------------------------------------------------------------ span font size
+//
+// MarkdownFormat stores a size as font-size on the span; the underlay painted
+// the colour and dropped the size, so S/L/XL read differently in the editor
+// and the preview.
+
+test('a span font-size reaches the painted style', () => {
+  const html = highlight('<span style="color: rgb(224, 62, 45); font-size: 18px;">big</span>')
+  assert.match(html, /<span style="color:#e03e2d; font-size: 18px;">big<\/span>/)
+})
+
+test('the painted font-size comes from the span, not a size table', () => {
+  const html = highlight('<span style="font-size: 17px;">big</span>')
+  assert.match(html, /font-size: 17px/)
+  assert.doesNotMatch(html, /font-size: 18px/)
+})
+
+test('an out-of-range font-size is still dropped', () => {
+  const html = highlight('<span style="font-size: 999px;">big</span>')
+  // The span is not whitelisted, so its tag text stays literal (escaped) and
+  // no painted span carries the size.
+  assert.doesNotMatch(html, /<span style="[^"]*font-size:\s*999px/)
+})
+
+test('the painted span style reads back through the same validator', () => {
+  const html = highlight('<span style="color: rgb(224, 62, 45); font-size: 18px;">big</span>')
+  const painted = html.match(/<span style="(color:[^"]*font-size:[^"]*)">/)
+  assert.ok(painted, html)
+  const props = plain(mirror.safeInlineSpanStyle(' style="' + painted[1] + '"'))
+  assert.deepEqual(props, [
+    { key: 'color', value: '#e03e2d' },
+    { key: 'font-size', value: '18px' }
+  ])
+})

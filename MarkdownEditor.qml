@@ -2607,6 +2607,14 @@ TextArea {
     if (control && (event.key === Qt.Key_V || event.key === Qt.Key_Z)) event.accepted = true
   }
 
+  // xkb maps Shift+Tab to ISO_Left_Tab, which Qt reports as Key_Backtab, so
+  // the outdent path has to accept both spellings.
+  function isOutdentEvent(event) {
+    if (!event) return false
+    if (event.key === Qt.Key_Backtab) return true
+    return event.key === Qt.Key_Tab && (event.modifiers & Qt.ShiftModifier) !== 0
+  }
+
   Keys.onPressed: function(event) {
     var control = (event.modifiers & Qt.ControlModifier) !== 0
     // AltGr reaches Qt as Ctrl+Alt (or Ctrl+GroupSwitch) on most European
@@ -2614,13 +2622,13 @@ TextArea {
     var command = control
       && (event.modifiers & Qt.AltModifier) === 0
       && (event.modifiers & Qt.GroupSwitchModifier) === 0
-    if (event.key === Qt.Key_Tab) {
-      var shift = (event.modifiers & Qt.ShiftModifier) !== 0
-      if (shift) {
-        // With nothing selected Shift+Tab still walks back out of the editor.
-        if (root.selectionStart === root.selectionEnd) return
-        root.outdentSelection()
-      } else if (root.selectionStart !== root.selectionEnd) {
+    if (isOutdentEvent(event)) {
+      // With nothing selected Shift+Tab still walks back out of the editor.
+      if (root.selectionStart === root.selectionEnd) return
+      root.outdentSelection()
+      event.accepted = true
+    } else if (event.key === Qt.Key_Tab) {
+      if (root.selectionStart !== root.selectionEnd) {
         root.indentSelection()
       } else {
         insert(cursorPosition, "  ")

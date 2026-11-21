@@ -239,11 +239,15 @@ function protectInlineHtml(source, palette, replacements) {
     } else if (tag.name === "span") {
       var colour = null
       var background = null
+      var fontSize = null
       for (var p = 0; p < tag.props.length; p++) {
         if (tag.props[p].key === "color") colour = tag.props[p].value
         else if (tag.props[p].key === "background-color") background = tag.props[p].value
+        // Re-run the same validator the span was read with, so the painted
+        // size can only be one the note is allowed to carry.
+        else if (tag.props[p].key === "font-size") fontSize = safeHtmlFontSize(tag.props[p].value)
       }
-      if (colour !== null || background !== null) {
+      if (colour !== null || background !== null || fontSize !== null) {
         var styles = []
         if (colour !== null) styles.push("color:" + colour + ";")
         if (background !== null) {
@@ -251,6 +255,7 @@ function protectInlineHtml(source, palette, replacements) {
           // Paint the contrast colour without storing it in the note.
           if (colour === null) styles.push("color:" + contrastHtmlColour(background, palette) + ";")
         }
+        if (fontSize !== null) styles.push("font-size: " + fontSize + ";")
         openHtml += '<span style="' + styles.join(" ") + '">'
         closeHtml = "</span>" + closeHtml
       }
@@ -285,27 +290,32 @@ function headingSize(level, base) {
   return base > 0 ? base : 14
 }
 
-function inlineHtml(value, palette) {
+function inlineHtml(value, palette, multiline) {
   var source = String(value || "")
   var replacements = []
   var accent = palette.accent
   var muted = palette.muted
   var foreground = palette.foreground
   source = protectInlineHtml(source, palette, replacements)
+  // A plain paragraph is rendered in one pass so an inline mark stays open
+  // across a soft line break, which is what the preview does for these
+  // families. On one line the classes also exclude "\n", so a marker can
+  // never reach past its line.
+  var eol = multiline ? "" : "\\n"
   var tagPrefix = "(^|[\\s(\\[{>,;:.!?])"
   var pattern = new RegExp(
-    "`[^`\\n]+`"
+    "`[^`" + eol + "]+`"
     + "|\\[\\[[^\\]\\n]+\\]\\]"
     + "|" + tagPrefix + "#[A-Za-z0-9_/-]+"
     + "|\\[[^\\]\\n]+\\]\\([^\\s()\\n]+\\)"
-    + "|\\*\\*\\*(?!\\s)[^*\\n]*[^*\\s\\n]\\*\\*\\*"
-    + "|___(?!\\s)[^_\\n]*[^_\\s\\n]___"
-    + "|\\*\\*(?!\\s)[^*\\n]*[^*\\s\\n]\\*\\*"
-    + "|__(?!\\s)[^_\\n]*[^_\\s\\n]__"
-    + "|~~(?!\\s)[^~\\n]*[^~\\s\\n]~~"
+    + "|\\*\\*\\*(?!\\s)[^*" + eol + "]*[^*\\s" + eol + "]\\*\\*\\*"
+    + "|___(?!\\s)[^_" + eol + "]*[^_\\s" + eol + "]___"
+    + "|\\*\\*(?!\\s)[^*" + eol + "]*[^*\\s" + eol + "]\\*\\*"
+    + "|__(?!\\s)[^_" + eol + "]*[^_\\s" + eol + "]__"
+    + "|~~(?!\\s)[^~" + eol + "]*[^~\\s" + eol + "]~~"
     + "|==(?!\\s)[^=\\n]*[^=\\s\\n]=="
-    + "|\\*(?!\\s)[^*\\n]*[^*\\s\\n]\\*"
-    + "|_(?!\\s)[^_\\n]*[^_\\s\\n]_"
+    + "|\\*(?!\\s)[^*" + eol + "]*[^*\\s" + eol + "]\\*"
+    + "|_(?!\\s)[^_" + eol + "]*[^_\\s" + eol + "]_"
     + "|https?:\\/\\/[^\\s<>()]+",
     "g")
 
@@ -374,21 +384,52 @@ function inlineHtml(value, palette) {
     cursor = index + token.length
   }
   output += escapeHtml(source.slice(cursor))
-  return preserveSpaces(restoreInlineHtml(output, replacements))
+  var html = restoreInlineHtml(output, replacements)
+  if (multiline) return html
+  return preserveSpaces(html)
+}
+
+// A plain paragraph goes through one inline pass, so an inline mark that opens
+// on one line and closes on the next paints across both lines, agreeing with
+// the preview. The HTML is then split back onto the source lines and joined
+// with <br/> for the underlay: every source character still appears exactly
+// once, so the caret and selection keep lining up with the painted text.
+function paragraphHtml(value, palette) {
+  var html = inlineHtml(String(value || ""), palette, true)
+  var lines = html.split("\n")
+  for (var i = 0; i < lines.length; i++) lines[i] = preserveSpaces(lines[i])
+  return lines.join("<br/>")
 }
 
 function highlighted(value, palette) {
   var lines = String(value || "").split("\n")
   var output = []
+  var paragraph = []
   var inCode = false
   var accent = palette.accent
   var muted = palette.code
   var foreground = palette.foreground
 
+  // Consecutive plain lines are one paragraph. Rendering them together is what
+  // lets an inline mark stay open across a soft line break.
+  function flushParagraph() {
+    if (paragraph.length === 0) return
+    output.push(paragraphHtml(paragraph.join("\n"), palette))
+    paragraph = []
+  }
+
   for (var i = 0; i < lines.length; i++) {
     var line = lines[i]
+    if (line.trim() === "") {
+      // A blank line ends the paragraph: open marks do not carry across it,
+      // which is how the preview renders a pair split by a paragraph break.
+      flushParagraph()
+      output.push(inlineHtml(line, palette))
+      continue
+    }
     var fence = line.match(/^(\s*)(```|~~~)/)
     if (fence) {
+      flushParagraph()
       output.push(preserveSpaces(escapeHtml(fence[1]))
         + "<span style=\"color:" + accent + ";\">" + escapeHtml(line.slice(fence[1].length)) + "</span>")
       inCode = !inCode
@@ -401,6 +442,7 @@ function highlighted(value, palette) {
 
     var heading = line.match(/^(\s{0,3})(#{1,6})(\s+)(.*)$/)
     if (heading) {
+      flushParagraph()
       output.push(preserveSpaces(escapeHtml(heading[1]))
         + "<span style=\"color:" + accent + ";\">" + escapeHtml(heading[2]) + "</span>"
         + preserveSpaces(escapeHtml(heading[3]))
@@ -410,6 +452,7 @@ function highlighted(value, palette) {
 
     var task = line.match(/^(\s*[-*+]\s+)(\[[ xX]\])(?=\s|$)(\s*)/)
     if (task) {
+      flushParagraph()
       var taskLength = task[1].length + task[2].length + task[3].length
       output.push(preserveSpaces(escapeHtml(task[1]))
         + "<span style=\"color:" + accent + "; font-weight:600;\">" + escapeHtml(task[2]) + "</span>"
@@ -419,6 +462,7 @@ function highlighted(value, palette) {
 
     var quote = line.match(/^(\s*>+\s?)(.*)$/)
     if (quote) {
+      flushParagraph()
       output.push("<span style=\"color:" + accent + ";\">" + escapeHtml(quote[1]) + "</span>"
         + "<span style=\"color:" + muted + "; font-style:italic;\">" + inlineHtml(quote[2], palette) + "</span>")
       continue
@@ -426,6 +470,7 @@ function highlighted(value, palette) {
 
     var marker = line.match(/^(\s*)([-*+]|\d+[.)])(\s+)/)
     if (marker) {
+      flushParagraph()
       var markerLength = marker[1].length + marker[2].length + marker[3].length
       output.push(preserveSpaces(escapeHtml(marker[1]))
         + "<span style=\"color:" + accent + ";\">" + escapeHtml(marker[2]) + "</span>"
@@ -433,7 +478,8 @@ function highlighted(value, palette) {
       continue
     }
 
-    output.push(inlineHtml(line, palette))
+    paragraph.push(line)
   }
+  flushParagraph()
   return output.join("<br/>")
 }

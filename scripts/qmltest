@@ -37,6 +37,7 @@ cases=(
   tests/qml/tablegrid.qml
   tests/qml/preview-table.qml
   tests/qml/editor-underlay.qml
+  tests/qml/editor-keys.qml
   tests/qml/formatbar.qml
 )
 
