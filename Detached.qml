@@ -111,7 +111,7 @@ ShellRoot {
   // Crash-draft recovery, mirroring Library.qml for a single note.
   property bool draftPending: false
   property string draftText: ""
-  property int draftModified: 0
+  property double draftModified: 0
 
   Component.onCompleted: {
     // The per-launch production opt-in is part of allowRealData's binding

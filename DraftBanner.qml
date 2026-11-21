@@ -9,7 +9,9 @@ import qs.Ui
 BorderSurface {
   id: root
 
-  property int draftModified: 0
+  // Millisecond mtime: a 32-bit int would truncate it negative and hide the
+  // timestamp the banner exists to show.
+  property double draftModified: 0
 
   signal recoverRequested()
   signal discardRequested()

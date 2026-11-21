@@ -30,6 +30,7 @@ cases=(
   tests/qml/library-draft.qml
   tests/qml/library-external-change.qml
   tests/qml/library-inflight-save.qml
+  tests/qml/library-save-guard.qml
   tests/qml/library-large-note.qml
   tests/qml/library-long-note.qml
   tests/qml/tablegrid.qml

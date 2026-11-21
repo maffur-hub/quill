@@ -139,7 +139,7 @@ Item {
   // note stays on screen and editing is disabled until Recover or Discard.
   property bool draftPending: false
   property string draftText: ""
-  property int draftModified: 0
+  property double draftModified: 0
   property string draftNoteId: ""
 
   property string mode: "split"
@@ -1587,7 +1587,9 @@ Item {
       property string targetNoteId: ""
       property int targetVersion: 0
       property int targetGeneration: 0
-      property int targetGuard: 0
+      // A millisecond mtime: an int would truncate it to 32 bits, which lands
+      // negative and silently drops the guard in bufferSaved.
+      property double targetGuard: 0
       // True when the guard could not be baked in because a save of ours was
       // still in flight. The runner binds it to the mtime that save returned.
       property bool targetLateGuard: false
@@ -1752,7 +1754,7 @@ Item {
     var savedText = String(view.targetText || "")
     view.destroy()
     var writeArgs = ["write", noteId, "--content-file", contentPath]
-    if (guard > 0) writeArgs.push("--if-mtime", String(guard))
+    if (guard > 0) writeArgs.push("--if-mtime", String(Math.round(guard)))
     enqueue({
       args: writeArgs,
       silent: true,
@@ -1843,7 +1845,7 @@ Item {
     root.savedTextById[noteId] = savedText
 
     if (noteId === selectedId) {
-      loadedModified = Number(result.modified || Date.now())
+      loadedModified = Number(result.modified || 0)
       if (editVersion === version) {
         // The store removed the equal adjacent draft. Stop a debounce that
         // would recreate it, and forget queued writes for this path. A newer
@@ -1851,7 +1853,9 @@ Item {
         draftTimer.stop()
         draftWriter.drop(root.draftPath(noteId))
         dirty = false
-        saveState = "Saved " + Qt.formatTime(new Date(loadedModified), "HH:mm")
+        saveState = loadedModified > 0
+          ? "Saved " + Qt.formatTime(new Date(loadedModified), "HH:mm")
+          : "Saved"
         if (root.tableSavePending) {
           root.tableSavePending = false
           statusText = "Table saved"
@@ -2153,13 +2157,18 @@ Item {
     root.editVersion = 0
     root.diskChangePending = false
     root.diskChangeText = ""
-    root.loadedModified = Number(modified || Date.now())
+    root.loadedModified = Number(modified || 0)
     // A late-bound guard may only name a version the caller actually reported.
     // Without one, forget the older stamp instead of inventing a guard that
     // would refuse the next save of our own.
     if (Number(modified || 0) > 0) root.modifiedById[id] = Number(modified)
     // A clean external reload is a saved state: there is nothing to write.
-    root.saveState = "Saved " + Qt.formatTime(new Date(root.loadedModified), "HH:mm")
+    // Only a caller that reported a real mtime can name a time; the watcher
+    // and the conflict reload have none, and formatting epoch 0 would claim a
+    // 1970 save.
+    root.saveState = root.loadedModified > 0
+      ? "Saved " + Qt.formatTime(new Date(root.loadedModified), "HH:mm")
+      : "Reloaded"
     root.statusText = message || "Reloaded from disk"
     saveTimer.stop()
     draftTimer.stop()
