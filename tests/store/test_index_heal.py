@@ -66,6 +66,35 @@ class TestIndexHeal(StoreTestCase):
         self.index_path().write_bytes(b"")
         self.assert_list_sees(identifiers)
 
+    def test_garbage_index_heals_on_write(self):
+        # A save writes the body before it touches the index. When the index
+        # is garbage the write has already succeeded on disk, so reporting an
+        # index error would be a lie; the write path must heal like the reads.
+        identifiers = self.seed_notes()
+        identifier = sorted(identifiers)[0]
+        index = self.index_path()
+        index.write_bytes(b"NOT A DATABASE AT ALL")
+        (self.root / "index.db-wal").write_bytes(b"stale wal")
+        (self.root / "index.db-shm").write_bytes(b"stale shm")
+        body = "# Heal Write\n\ntungsten\n"
+        result = self.success("write", identifier, "--stdin", stdin=body)
+        self.assertIn("modified", result)
+        self.assertIsInstance(result["modified"], int)
+        self.assertEqual(
+            self.note_path(identifier).read_text(encoding="utf-8"), body,
+            "the write reported success but the body is not on disk",
+        )
+        listing = self.success("list")
+        self.assertTrue(
+            identifiers <= {note["id"] for note in listing["notes"]},
+            "the rebuilt index is missing seeded notes",
+        )
+        found = self.success("search", "tungsten")
+        self.assertIn(
+            identifier, {note["id"] for note in found["results"]},
+            "the rebuilt index does not carry the new body",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

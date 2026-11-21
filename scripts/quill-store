@@ -64,6 +64,13 @@ VERSION_THROTTLE_DEFAULT = 60.0
 
 VERSION_FILENAME_RE = re.compile(r"^(\d{8}T\d{6}Z)-([0-9a-f]{16})(?:-(\d+))?\.md$")
 
+# Crash debris lives in the store's reserved `.quill-` namespace: the
+# `.quill-tmp-*` files atomic_write renames into place, and the `.quill-save-*`
+# buffers the UI hands to a save. A live writer can own a fresh one, so a
+# sweep only touches files older than the age floor.
+ORPHAN_PREFIXES = (".quill-tmp-", ".quill-save-")
+ORPHAN_MAX_AGE_SECONDS = 3600
+
 # Latin-1/Extended-A accents folded to ASCII, mirroring TagSuggest.js ACCENTS
 # so `#naïve` and `#naive` are one tag in storage and in the index. Other
 # scripts are left for the sanitiser below (they normalise to `-` and drop).
@@ -231,6 +238,10 @@ def locked():
     fd = os.open(str(LOCK), os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
+        # Sweeping under the lock keeps a live atomic_write's temp file safe;
+        # the age floor covers the UI's handoff buffer, which is written
+        # outside this lock.
+        sweep_orphans()
         yield
     finally:
         try:
@@ -263,10 +274,46 @@ def atomic_write(path: Path, data: bytes) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+        # The rename is only durable once the directory entry is on disk; a
+        # filesystem that cannot fsync a directory must not fail the write.
+        with contextlib.suppress(OSError):
+            dir_fd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
     finally:
         with contextlib.suppress(OSError):
             if os.path.exists(temporary):
                 os.unlink(temporary)
+
+
+def sweep_orphans() -> int:
+    """Delete stale temp files left behind by a crashed writer.
+
+    A SIGKILL between mkstemp and rename leaves a `.quill-tmp-*` beside the
+    target, and a killed UI leaves its `.quill-save-*` handoff buffer in the
+    data root. Both are crash debris, so the next locked command removes
+    them — but only past ORPHAN_MAX_AGE_SECONDS: the caller holds the store
+    lock (so no in-process writer is live) and the UI writes its handoff
+    buffer outside that lock, so the age floor is what keeps a live handoff
+    safe. Returns the number of files removed.
+    """
+    removed = 0
+    deadline = time.time() - ORPHAN_MAX_AGE_SECONDS
+    for base, _folders, names in os.walk(str(ROOT)):
+        for name in names:
+            if not name.startswith(ORPHAN_PREFIXES):
+                continue
+            path = Path(base) / name
+            try:
+                if path.stat().st_mtime >= deadline:
+                    continue
+                path.unlink()
+                removed += 1
+            except OSError:
+                continue
+    return removed
 
 
 def safe_relative(raw: str) -> str:
@@ -1969,7 +2016,10 @@ def write_note(args, content_path: Path | None) -> dict:
             # Draft cleanup is best-effort; it must never fail the note write.
             pass
         stat = path.stat()
-        conn = index_connect()
+        # The body is already safely on disk, so a corrupt index must heal
+        # here too instead of reporting a save that did land as an error:
+        # with_index's full resync indexes the bytes just written.
+        conn = with_index()
         try:
             index_and_resolve(conn, path)
             conn.commit()
