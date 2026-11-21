@@ -516,22 +516,36 @@ function splitSpanText(text, span, start, end, key, value) {
   }
 }
 
-function spanCount(text, pattern) {
-  var matches = text.match(pattern)
-  return matches === null ? 0 : matches.length
+// Well-formedness of the inline tags the planner itself emits: span, u, sup
+// and sub. A stack keeps openers and closers in order, so a pair that crosses
+// another pair is rejected. Any other "<" is plain text. Escape sequences are
+// deliberately not handled, matching the blindness of the count-based check
+// this replaces.
+function inlineWellFormed(text) {
+  var pattern = /<(\/?)(span|u|sup|sub)\b[^>]*>/gi
+  var stack = []
+  var match
+  while ((match = pattern.exec(text)) !== null) {
+    var name = match[2].toLowerCase()
+    if (match[1] === "") {
+      stack.push(name)
+    } else if (stack.length === 0 || stack[stack.length - 1] !== name) {
+      return false
+    } else {
+      stack.pop()
+    }
+  }
+  return stack.length === 0
 }
 
-function spansBalanced(text) {
-  return spanCount(text, /<span\b/gi) === spanCount(text, /<\/span\s*>/gi)
-}
-
-// Refuse output that creates a malformed close-tag run or breaks span
-// balance that used to be intact. Texts that were already unbalanced (for
-// example a code sample showing literal tags) are left alone.
+// Refuse output that creates a malformed close-tag run or breaks inline tag
+// nesting that used to be intact. Texts that were already unbalanced (for
+// example a code sample showing literal tags, or a note written before this
+// guard existed) are left alone.
 function spanEditIsSafe(oldText, newText) {
   if (newText.indexOf("<<") >= 0 && oldText.indexOf("<<") < 0) return false
   if (newText.indexOf("<</span>") >= 0 && oldText.indexOf("<</span>") < 0) return false
-  if (spansBalanced(oldText) && !spansBalanced(newText)) return false
+  if (inlineWellFormed(oldText) && !inlineWellFormed(newText)) return false
   return true
 }
 
@@ -776,8 +790,14 @@ function planInline(oldText, mark, start, end, name) {
     || oldText.charAt(start - 1) === char || oldText.charAt(end) === char)) {
     return fail("Cannot toggle " + String(name || "formatting") + " next to existing markers")
   }
-  return finish(oldText, oldText.slice(0, start) + mark.open + oldText.slice(start, end)
-    + mark.close + oldText.slice(end), start + mark.open.length, end + mark.open.length)
+  var carried = oldText.slice(0, start) + mark.open + oldText.slice(start, end)
+    + mark.close + oldText.slice(end)
+  var wrappedStart = start + mark.open.length
+  var wrappedEnd = end + mark.open.length
+  // A tag mark (underline, sup, sub) wraps with real tags, so it can cross a
+  // tag pair on either side of the selection. Marker marks cannot.
+  if (mark.kind === "tag") return finishSpan(oldText, carried, wrappedStart, wrappedEnd)
+  return finish(oldText, carried, wrappedStart, wrappedEnd)
 }
 
 
@@ -1391,7 +1411,7 @@ function planClear(oldText, start, end) {
   if (result.text.indexOf(SEL_OPEN) >= 0 || result.text.indexOf(SEL_CLOSE) >= 0) {
     return fail("Select within the formatted text")
   }
-  return finish(oldText, result.text, result.selectionStart, result.selectionEnd)
+  return finishSpan(oldText, result.text, result.selectionStart, result.selectionEnd)
 }
 
 // --------------------------------------------------------------------- plan

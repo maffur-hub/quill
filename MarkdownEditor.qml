@@ -480,22 +480,6 @@ TextArea {
     return MarkdownMirror.highlighted(value, root.mirrorPalette())
   }
 
-  function wrapSelection(marker) {
-    var start = Math.min(selectionStart, selectionEnd)
-    var end = Math.max(selectionStart, selectionEnd)
-    if (start === end) {
-      insert(cursorPosition, marker + marker)
-      cursorPosition = Math.max(0, cursorPosition - marker.length)
-      return
-    }
-    var selection = text.slice(start, end)
-    text = text.slice(0, start) + marker + selection + marker + text.slice(end)
-    root.resetFormatHistory()
-    // Keep the original text selected between the new markers so a second
-    // Ctrl+B/Ctrl+I (or typing) applies to the same span.
-    select(start + marker.length, end + marker.length)
-  }
-
   function currentLinkURL() {
     return MarkdownFormat.currentLinkURL(root.text, root.selectionStart, root.selectionEnd)
   }
