@@ -1125,6 +1125,26 @@ function planSpan(oldText, start, end, key, value) {
       edits.push({ start: current.closeStart, end: current.closeEnd, text: "" })
     }
   }
+  // A new span cannot straddle a paragraph break: the editor underlay renders
+  // one as escaped raw markup. A span that already crosses the break is left
+  // alone, the same good-to-bad-only rule spanEditIsSafe applies to broken
+  // markup, so legacy notes stay editable.
+  var breakMatch = value === "" ? null : /\n[ \t]*\n/.exec(oldText.slice(start, end))
+  if (breakMatch) {
+    var breakStart = start + breakMatch.index
+    var breakEnd = breakStart + breakMatch[0].length
+    var existing = collectSpans(oldText)
+    var alreadyCrossing = false
+    for (var b = 0; b < existing.length; b++) {
+      var crosser = existing[b]
+      if (!hasProp(crosser, key)) continue
+      if (crosser.openEnd <= breakStart && crosser.closeStart >= breakEnd) {
+        alreadyCrossing = true
+        break
+      }
+    }
+    if (!alreadyCrossing) return fail("Select within one paragraph")
+  }
   var next = applyEdits(marked, edits)
   if (value !== "") next = insertWrapped(next, open, "</span>")
   var result = extractSelection(next)

@@ -249,6 +249,93 @@ test('switching an inline mark off across a paragraph break stays allowed', () =
   assert.equal(result.text, 'alpha\n\nbeta')
 })
 
+// Colour and size spans are paragraph-scoped for the same reason: the editor
+// underlay renders a span that straddles a paragraph break as escaped raw
+// markup, so a wrap that would write one is refused like an inline mark.
+// Spans that already cross a break (written before this refusal existed) stay
+// editable: only the good-to-bad transition is refused, mirroring
+// spanEditIsSafe's leave-alone rule for broken markup.
+
+const COLOUR = 'rgb(224, 62, 45)'
+const CROSSING = '<span style="color: ' + COLOUR + ';">alpha\n\nbeta</span>'
+
+test('a colour span refuses to wrap a selection across a paragraph break', () => {
+  // RED before this fix: returned ok with a span around the whole selection.
+  const result = plan('alpha\n\nbeta', 0, 11, 'color', COLOUR)
+  assert.equal(result.ok, false)
+  assert.equal(result.error, 'Select within one paragraph')
+  assert.equal('text' in result, false)
+  assert.equal('edits' in result, false)
+})
+
+test('a size span refuses to wrap a selection across a paragraph break', () => {
+  // RED before this fix: returned ok with a span around the whole selection.
+  const result = plan('alpha\n\nbeta', 0, 11, 'size', 'large')
+  assert.equal(result.ok, false)
+  assert.equal(result.error, 'Select within one paragraph')
+  assert.equal('text' in result, false)
+})
+
+test('a highlight span refuses to wrap a selection across a paragraph break', () => {
+  // RED before this fix: returned ok with a background-colour span.
+  const result = plan('alpha\n\nbeta', 0, 11, 'highlightColor', 'rgb(255, 255, 0)')
+  assert.equal(result.ok, false)
+  assert.equal(result.error, 'Select within one paragraph')
+  assert.equal('text' in result, false)
+})
+
+test('a colour span refuses a break with trailing spaces', () => {
+  // RED before this fix: the loose break matched nothing and a span was written.
+  const result = plan('alpha\n \t\nbeta', 0, 13, 'color', COLOUR)
+  assert.equal(result.ok, false)
+  assert.equal(result.error, 'Select within one paragraph')
+})
+
+test('a colour span still applies within one paragraph', () => {
+  // Pinned: passes before and after the paragraph-break refusal.
+  const result = plan('alpha', 0, 5, 'color', COLOUR)
+  assert.equal(result.ok, true)
+  assert.equal(result.text, '<span style="color: ' + COLOUR + ';">alpha</span>')
+})
+
+test('a colour span still wraps across a soft break', () => {
+  // Pinned: one line ending keeps one paragraph, so the refusal must not fire.
+  const result = plan('alpha\nbeta', 0, 10, 'color', COLOUR)
+  assert.equal(result.ok, true)
+  assert.equal(result.text, '<span style="color: ' + COLOUR + ';">alpha\nbeta</span>')
+})
+
+test('an existing crossing span, fully selected, recolours in place', () => {
+  // Pinned: the leave-alone clause keeps legacy crossing spans editable.
+  const result = plan(CROSSING, 0, CROSSING.length, 'color', 'rgb(0, 0, 255)')
+  assert.equal(result.ok, true)
+  assert.equal(result.text, '<span style="color: rgb(0, 0, 255);">alpha\n\nbeta</span>')
+  assert.equal((result.text.match(/<span /g) || []).length, 1)
+  assert.deepEqual({ start: result.selectionStart, end: result.selectionEnd },
+    { start: 0, end: result.text.length })
+})
+
+test('an existing crossing span, fully selected, clears via No colour', () => {
+  // Pinned: removing a property cannot create an unrenderable span.
+  const result = plan(CROSSING, 0, CROSSING.length, 'noColour', null)
+  assert.equal(result.ok, true)
+  assert.equal(result.text, 'alpha\n\nbeta')
+})
+
+test('turning colour off across a paragraph break stays allowed', () => {
+  // Pinned: value "" never inserts a span, so the guard must skip it entirely.
+  const result = plan('alpha\n\nbeta', 0, 11, 'noColour', null)
+  assert.equal(result.ok, true)
+  assert.equal(result.text, 'alpha\n\nbeta')
+})
+
+test('clear formatting over an existing crossing span still works', () => {
+  // Pinned: planClear is untouched by the span wrap guard.
+  const result = plan(CROSSING, 0, CROSSING.length, 'clear', null)
+  assert.equal(result.ok, true)
+  assert.equal(result.text, 'alpha\n\nbeta')
+})
+
 // ------------------------------------------------------------------ headings
 
 test('heading level 0 strips an ATX closing sequence', () => {
