@@ -33,7 +33,7 @@ product code stays untouched and the failure is reported.
 scripts/test
 ```
 
-This runs both suites and exits non-zero if either fails.
+This runs all four suites and exits non-zero if any fails.
 
 ## JavaScript suite
 

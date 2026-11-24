@@ -582,7 +582,8 @@ printf '%s\n' '{"type":"start","dataRoot":"'"$HOME"'/.local/share/quill"}' \
 Commands: `start`, `sessions`, `new`, `open`, `prompt`, `interrupt`, `rename`,
 `delete`, `context`, `reply`, `stop`. Events: `ready`, `error`, `sessions`,
 `opened`, `history`, `delta`, `text`, `tool`, `status`, `permission`,
-`permission-cleared`, `usage`. This is also the seam the tests drive.
+`permission-cleared`, `usage`. The bridge is driven by hand through these
+commands; there are no automated tests for it yet.
 
 ## Detached note window
 
