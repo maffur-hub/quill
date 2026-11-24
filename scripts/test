@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Run the JavaScript, store and QML loading suites. Always runs all three;
-# exits non-zero when any fails.
+# Run the JavaScript, store, QML loading and QML behaviour suites. Always runs
+# all four; exits non-zero when any fails.
 set -u
 
 cd "$(dirname "$0")/.."
