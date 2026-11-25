@@ -47,6 +47,14 @@ for file in "$plugin_dir"/*.qml "$plugin_dir"/*.js; do
     cp "$file" "$stage/$name"
   fi
 done
+# The loop above only adds and refreshes, so a component deleted or renamed in
+# the plugin would linger in the stage and could still be loaded. Remove
+# whatever the plugin no longer ships.
+for file in "$stage"/*.qml "$stage"/*.js; do
+  [[ -e "$file" ]] || continue
+  name=$(basename "$file")
+  [[ -f "$plugin_dir/$name" ]] || rm -f "$file"
+done
 ln -sfn /usr/share/omarchy/shell/Commons "$stage/Commons"
 ln -sfn /usr/share/omarchy/shell/Ui "$stage/Ui"
 # Maths needs the renderer script and the vendored MathJax tree. Link them

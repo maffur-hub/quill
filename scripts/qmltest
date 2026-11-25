@@ -39,9 +39,89 @@ cases=(
   tests/qml/editor-underlay.qml
   tests/qml/editor-keys.qml
   tests/qml/formatbar.qml
+  tests/qml/detached-save.qml
+  tests/qml/detached-close.qml
 )
 
 status=0
+
+# scripts/quill-window stages the detached window in the cache on every launch.
+# Prove the stage is rebuilt from the plugin and pruned: a component that an
+# older plugin version left behind must not survive to be loaded. Uses a stub
+# quickshell so no real window opens and no real cache dir is touched.
+check_window_stage() {
+  local tmp stage argfile
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/quill-window.XXXXXX")
+  stage="$tmp/cache/quill/detached"
+  argfile="$tmp/argv"
+  mkdir -p "$tmp/bin"
+  cat > "$tmp/bin/quickshell" <<'STUB'
+#!/bin/sh
+printf '%s\n' "$@" > "$QUILL_STUB_ARGV"
+exit 0
+STUB
+  chmod +x "$tmp/bin/quickshell"
+
+  run_window() {
+    PATH="$tmp/bin:$PATH" \
+      QUILL_STUB_ARGV="$argfile" \
+      XDG_CACHE_HOME="$tmp/cache" \
+      QUILL_DATA_DIR="$tmp/data" \
+      "$root/scripts/quill-window" some-note-id "A title" "$tmp/data" >/dev/null 2>&1
+  }
+
+  report() { # name ok [detail]
+    if [[ "$2" == "1" ]]; then
+      echo "ok - window stage: $1"
+    else
+      echo "not ok - window stage: $1${3:+: $3}"
+      status=1
+    fi
+  }
+
+  local rc=0
+  run_window || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    report "quill-window runs against the stub" 0 "exit $rc"
+    rm -rf "$tmp"
+    return
+  fi
+
+  report "the launch stages Detached.qml" \
+    "$([[ -f "$stage/Detached.qml" ]] && echo 1 || echo 0)"
+  local links_ok=1 links_detail="" target expected
+  for target in Commons Ui scripts vendor; do
+    case "$target" in
+      Commons|Ui) expected="/usr/share/omarchy/shell/$target" ;;
+      scripts|vendor) expected="$root/$target" ;;
+    esac
+    if [[ -L "$stage/$target" && "$(readlink "$stage/$target")" == "$expected" ]]; then
+      continue
+    fi
+    links_ok=0
+    links_detail+="$target -> $(readlink "$stage/$target" 2>/dev/null || echo missing), "
+  done
+  report "the stage links the shell modules and plugin dirs" "$links_ok" "${links_detail%, }"
+  report "quickshell is pointed at the staged window" \
+    "$([[ -f "$argfile" ]] && grep -qx -- "-p" "$argfile" && grep -qF -- "$stage" "$argfile" && echo 1 || echo 0)" \
+    "$(tr '\n' ' ' < "$argfile" 2>/dev/null)"
+  report "the staged Library.qml matches the plugin" \
+    "$(cmp -s "$root/Library.qml" "$stage/Library.qml" && echo 1 || echo 0)"
+
+  # A stale component from an older launch must not outlive the next one.
+  printf 'stale\n' > "$stage/Library.qml"
+  printf 'stale\n' > "$stage/Orphan.qml"
+  run_window
+  report "a relaunch restores an overwritten component" \
+    "$(cmp -s "$root/Library.qml" "$stage/Library.qml" && echo 1 || echo 0)"
+  report "a relaunch removes a component the plugin no longer ships" \
+    "$([[ ! -e "$stage/Orphan.qml" ]] && echo 1 || echo 0)"
+
+  rm -rf "$tmp"
+}
+
+check_window_stage
+
 for case in "${cases[@]}"; do
   name=$(basename "$case" .qml)
   stage=$(mktemp -d "${TMPDIR:-/tmp}/quill-qmltest.XXXXXX")
@@ -52,6 +132,9 @@ for case in "${cases[@]}"; do
   export QUILL_TEST_DATA="$stage/data"
   export QUILL_TEST_STORE="$root/scripts/quill-store"
   export QUILL_TEST_NOTE_ID
+  # Detached.qml resolves its identity from the environment only, so a case
+  # that instantiates it needs the same names scripts/quill-window exports.
+  export QUILL_STORE_PATH="$root/scripts/quill-store"
   QUILL_TEST_NOTE_ID=$("$root/scripts/quill-store" create \
     --title "Save harness" \
     --content-stdin <<'NOTE' | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])'
@@ -60,6 +143,7 @@ for case in "${cases[@]}"; do
 original body
 NOTE
   ) || { echo "not ok - $name: could not seed a note"; rm -rf "$stage"; status=1; continue; }
+  export QUILL_NOTE_ID="$QUILL_TEST_NOTE_ID"
 
   cat > "$stage/shell.qml" <<EOF
 import QtQuick
